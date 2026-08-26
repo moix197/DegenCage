@@ -159,4 +159,43 @@ describe('shouldRevokeSession', () => {
       }),
     ).toBe(true);
   });
+
+  /**
+   * `shouldRevokeSession` is the same gate the UI uses to decide whether to show "your
+   * wallet switched accounts" — a normal first sign-in must not trip that message, and a
+   * real switch must.
+   */
+  it('is quiet on a normal first sign-in (no prior session to be stale against)', () => {
+    expect(
+      shouldRevokeSession({
+        ...agreement,
+        trigger: reauthTriggerFor({
+          sessionAddress: null,
+          observedAddress: OTHER_ADDRESS,
+          hasObservedWallet: true,
+        }),
+        sessionAddress: null,
+        observedAddress: OTHER_ADDRESS,
+        signedInAddress: null,
+        isSigningIn: false,
+      }),
+    ).toBe(false);
+  });
+
+  it('speaks up on a real account switch', () => {
+    expect(
+      shouldRevokeSession({
+        ...agreement,
+        trigger: reauthTriggerFor({
+          sessionAddress: SESSION_ADDRESS,
+          observedAddress: OTHER_ADDRESS,
+          hasObservedWallet: true,
+        }),
+        sessionAddress: SESSION_ADDRESS,
+        observedAddress: OTHER_ADDRESS,
+        signedInAddress: null,
+        isSigningIn: false,
+      }),
+    ).toBe(true);
+  });
 });

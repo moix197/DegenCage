@@ -148,12 +148,17 @@ export function useWalletSession(
     };
     const trigger = reauthTriggerFor(agreement);
 
-    setReauthTrigger(trigger);
-
     // Whether this mismatch is real *now*, or is the stale server render of a sign-in that
     // has already succeeded, is `shouldRevokeSession`'s decision — every dependency of it
     // is a dependency of this effect, so a deferral is always re-examined, never dropped.
-    if (!trigger || !shouldRevokeSession({ ...agreement, trigger, isSigningIn, signedInAddress })) {
+    // The on-screen notice shares that gate: a deferred mismatch is not shown as one either,
+    // or a sign-in that just succeeded would flash "switched accounts" at the user.
+    const shouldAct =
+      trigger !== null && shouldRevokeSession({ ...agreement, trigger, isSigningIn, signedInAddress });
+
+    setReauthTrigger(shouldAct ? trigger : null);
+
+    if (!shouldAct) {
       return;
     }
 
