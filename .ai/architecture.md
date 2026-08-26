@@ -17,9 +17,12 @@ apps/web        Next.js App Router — UI + route handlers (Vercel), output: 'st
   src/server/flags/          isFeatureEnabled() — fail-closed kill switches
   src/server/auth/           SIWS verification + sessions; resolveSession() is the only
                              source of caller identity
+  src/server/constitution/   draft -> commit -> activate lifecycle; the commitment window is
+                             measured by Postgres' clock, not this process'
   src/client/wallet/         browser-only wallet code — the extension never reaches the
                              server tree, and identity is still rendered from the session
-packages/rules  the rule engine: pure, I/O-free, the product IP
+packages/rules  the rule engine: pure, I/O-free, the product IP — and the constitution
+                document schema, which is why the shape crosses the boundary but no I/O does
 
 later, only when the need is real:
 packages/db     schema + queries — only once a second consumer needs them

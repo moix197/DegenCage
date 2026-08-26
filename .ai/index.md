@@ -10,11 +10,12 @@ anywhere real.
 | Module / package | Responsibility (one line) | Path | Decisions / patterns |
 | ---------------- | ------------------------- | ---- | -------------------- |
 | `@degencage/web` | Next.js App Router UI + route handlers; owns everything server-side that isn't the rule engine | `apps/web` ([README](../apps/web/README.md)) | [hosting-and-growth-path](decisions/hosting-and-growth-path.md) |
-| `@degencage/rules` | The rule engine — pure, I/O-free, the product IP | `packages/rules` | [monorepo-package-shape](decisions/monorepo-package-shape.md) |
+| `@degencage/rules` | The rule engine — pure, I/O-free, the product IP; owns the constitution document schema | `packages/rules` | [monorepo-package-shape](decisions/monorepo-package-shape.md), [constitution-schema](decisions/constitution-schema.md) |
 | db | Drizzle schema, migrations, and the one pooled Postgres handle (`getDb()`) | `apps/web/src/server/db` | [migration-and-test-tooling](decisions/migration-and-test-tooling.md), [single-source-of-truth-database](decisions/single-source-of-truth-database.md) |
 | flags | `isFeatureEnabled()` — the single fail-closed kill-switch read path | `apps/web/src/server/flags` | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
 | observability | `logger` + `captureError` — the only import points for pino and Sentry | `apps/web/src/observability` | [observability-stack](decisions/observability-stack.md) |
 | auth | SIWS sign-in, rate-limited nonce issuance, session issue/revoke/`resolveSession()`, and the client wallet account watcher | `apps/web/src/server/auth` ([README](../apps/web/src/server/auth/README.md)), `apps/web/src/client/wallet` | [rate-limit-forwarded-header-trust](decisions/rate-limit-forwarded-header-trust.md), [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md), [wallet-standard-ui-dependency](decisions/wallet-standard-ui-dependency.md) |
+| constitution | Draft → commit → activate lifecycle of a trading constitution, and the 20-minute commitment window | `apps/web/src/server/constitution` ([README](../apps/web/src/server/constitution/README.md)) | [commitment-window-server-clock](decisions/commitment-window-server-clock.md), [constitution-schema](decisions/constitution-schema.md), [guarded-state-transition](patterns/guarded-state-transition.md) |
 
 > Add a row when a module lands. Don't pre-populate rows for paths that don't exist.
 
@@ -26,6 +27,8 @@ anywhere real.
 | Package layout | pnpm workspace; `apps/web` + `packages/rules`, not split further yet | [monorepo-package-shape](decisions/monorepo-package-shape.md) |
 | Data store | one Postgres = source of truth; Redis / event store are never a copy of it | [single-source-of-truth-database](decisions/single-source-of-truth-database.md) |
 | Rule enforcement | server-side only, server-authored timestamps | [server-side-rule-evaluation](decisions/server-side-rule-evaluation.md) |
+| Rule state transitions | one `UPDATE … WHERE <precondition> … RETURNING`, never SELECT-then-UPDATE; zero rows means the precondition failed, not that the request did | [guarded-state-transition](patterns/guarded-state-transition.md) |
+| Rule deadlines & timelocks | written and compared with the **database's** `now()` — an app-server `Date` drifts by inter-instance clock skew. Client countdowns are display only | [commitment-window-server-clock](decisions/commitment-window-server-clock.md) |
 | Time & history | `occurred_at` (block) vs `observed_at` (detection); stats derived, never counters | [event-time-vs-observation-time](decisions/event-time-vs-observation-time.md) |
 | Product vision & phases | CLAUDE.md → *What we're building*; `roadmap__small.pdf` | not duplicated here |
 | Observability | events → Postgres; errors → Sentry; logs → pino/stdout; traces deferred | [observability-stack](decisions/observability-stack.md); rules in CLAUDE.md |
@@ -33,4 +36,5 @@ anywhere real.
 | Schema / migrations / tests / DB host | Drizzle + drizzle-kit, Vitest, Neon (pooled WebSocket driver) | [migration-and-test-tooling](decisions/migration-and-test-tooling.md) |
 | Caller identity | `resolveSession()` is the **only** answer to "which wallet is this request for" — no route reads an address from a request body; single-use nonce, supersede+consume+insert in one transaction, 30-day sliding expiry inside a 90-day absolute cap | [auth README](../apps/web/src/server/auth/README.md) |
 | Unauthenticated write surfaces | `/api/auth/nonce` is throttled by counting its own rows in Postgres (10 / 5 min, keyed by a hashed client address) and reaped opportunistically — no scheduler and no Redis before the Phase 4 worker. The key is an **unverified forwarded header**: a deployment trust assumption, not a bug | [auth README](../apps/web/src/server/auth/README.md), [rate-limit-forwarded-header-trust](decisions/rate-limit-forwarded-header-trust.md) |
+| Authenticated write surfaces | constitution event *writes* are throttled per `userId` against `events` — a **deliberate second copy** of the challenge limiter's shape (its query is bound to `siws_challenges`), sharing only its constants. Extract it if a third consumer appears | [constitution README](../apps/web/src/server/constitution/README.md) |
 | Wallet identity | session identity can lag the wallet's active account after an in-extension switch — **accepted limitation**, read before using `resolveSession()` without a fresh signature | [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md) |
