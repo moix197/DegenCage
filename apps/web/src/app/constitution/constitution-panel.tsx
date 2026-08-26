@@ -42,7 +42,12 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
   const [maxUsd, setMaxUsd] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
-  const limitIdRef = useRef<string>(crypto.randomUUID());
+  // Seeded from the stored limit's id when one already exists — Phase 8's pending-change
+  // mechanism keys a loosening/tightening off this id, so minting a fresh one on every
+  // mount would silently detach a draft edit from the limit it is meant to describe.
+  const limitIdRef = useRef<string>(
+    initial?.document.limits.find((limit) => limit.type === 'daily_notional_usd')?.id ?? crypto.randomUUID(),
+  );
 
   const refresh = useCallback(async () => {
     const response = await fetch('/api/constitution', { cache: 'no-store' });

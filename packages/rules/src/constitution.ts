@@ -58,13 +58,20 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-/** A decimal string, strictly greater than zero. Exact-decimal math itself is Phase 4+'s concern. */
+/**
+ * A decimal string, strictly greater than zero. Exact-decimal math itself is Phase 4+'s
+ * concern, but "greater than zero" is decided here without ever parsing to a float: an
+ * arbitrarily long digit string rounds to `Infinity` under `parseFloat`, and `Infinity > 0`
+ * would pass regardless of what the digits actually say. The regex above has already
+ * proven the string is only digits and at most one decimal point, so "greater than zero"
+ * is exactly "contains a non-zero digit" — checked digit-by-digit, immune to magnitude.
+ */
 function isPositiveDecimalString(value: unknown): value is string {
   if (typeof value !== 'string' || !/^\d+(\.\d+)?$/.test(value)) {
     return false;
   }
 
-  return Number.parseFloat(value) > 0;
+  return /[1-9]/.test(value);
 }
 
 function isPositiveFiniteNumber(value: unknown): value is number {

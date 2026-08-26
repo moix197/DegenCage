@@ -1,10 +1,12 @@
 import { migrateConstitution, parseConstitution, type Constitution } from '@degencage/rules';
-import { and, eq, lte } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
+import { captureError } from '../../observability/error-tracking';
 import { recordEvent } from '../../observability/events';
 import { resolveSession } from '../auth/session';
 import { getDb } from '../db/client';
 import { constitutions, type ConstitutionRow, type ConstitutionStatus } from '../db/schema';
+import { assertWithinConstitutionActionRateLimit, ConstitutionActionRateLimited } from './rate-limit';
 
 /**
  * Authoring, committing and activating a trading constitution.
@@ -100,6 +102,65 @@ async function requireSession() {
 }
 
 /**
+ * Records an event, but never faster than that event type's per-user rate limit allows
+ * (`./rate-limit.ts`). Guards the WRITE only, never the action it describes — a session
+ * looping `/activate` before the deadline still gets its (correct) rejection every time;
+ * only the audit trail stops growing once it has enough rows to prove the pattern. A
+ * rate-limit-check failure — throttled or not — never turns a successful user action into
+ * a 503: it just skips the write, the same way `recordSignInRejection` fails closed on its
+ * own bookkeeping without failing the sign-in it describes.
+ */
+async function recordEventWithinRateLimit(
+  eventType: string,
+  userId: string,
+  correlationId: string,
+  occurredAt: Date,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await assertWithinConstitutionActionRateLimit(userId, eventType, correlationId, occurredAt);
+  } catch (error) {
+    if (error instanceof ConstitutionActionRateLimited) {
+      return;
+    }
+
+    captureError(error, { correlationId, operation: 'constitutionActionRateLimit', eventType });
+
+    return;
+  }
+
+  await recordEvent({ eventType, occurredAt, correlationId, userId, payload });
+}
+
+/**
+ * The TOCTOU-safe half of `saveDraftConstitution`'s write: the WHERE carries the
+ * precondition, not a preceding SELECT, exactly like `verifyWalletSignIn`'s nonce-consume
+ * guard in `server/auth/solana-siws.ts`. Closes the race where `startCommitment` (or a
+ * concurrent save) flips this row to `committing` between the read above and this write —
+ * without this guard the UPDATE would match on `id` alone and silently overwrite the
+ * document, and reset nothing about the clock, on a constitution the caller no longer has
+ * open authoring rights over.
+ */
+async function updateExistingDraft(
+  constitutionId: string,
+  values: { document: Constitution; schemaVersion: number },
+): Promise<ConstitutionRow> {
+  const updated = await getDb()
+    .update(constitutions)
+    .set(values)
+    .where(and(eq(constitutions.id, constitutionId), eq(constitutions.status, 'draft')))
+    .returning();
+
+  const row = updated[0];
+
+  if (!row) {
+    throw new ConstitutionActionRejected('not_editable');
+  }
+
+  return row;
+}
+
+/**
  * Creates or updates the caller's draft constitution.
  *
  * Validated against `parseConstitution` before it ever reaches the database — the server
@@ -132,13 +193,7 @@ export async function saveDraftConstitution(
   };
 
   const row = existing
-    ? (
-        await getDb()
-          .update(constitutions)
-          .set(values)
-          .where(eq(constitutions.id, existing.id))
-          .returning()
-      )[0]!
+    ? await updateExistingDraft(existing.id, values)
     : (
         await getDb()
           .insert(constitutions)
@@ -146,12 +201,9 @@ export async function saveDraftConstitution(
           .returning()
       )[0]!;
 
-  await recordEvent({
-    eventType: 'constitution.drafted',
-    occurredAt: new Date(),
-    correlationId,
-    userId: session.userId,
-    payload: { constitutionId: row.id, limitTypes: parsed.constitution.limits.map((limit) => limit.type) },
+  await recordEventWithinRateLimit('constitution.drafted', session.userId, correlationId, new Date(), {
+    constitutionId: row.id,
+    limitTypes: parsed.constitution.limits.map((limit) => limit.type),
   });
 
   return toRecord(row);
@@ -180,18 +232,19 @@ export async function loadCurrentConstitution(): Promise<ConstitutionRecord | nu
 export async function startCommitment(correlationId: string): Promise<ConstitutionRecord> {
   const session = await requireSession();
 
-  const now = new Date();
-
+  // Written as the database's own `now()`, not this process' `Date`: `activateConstitution`
+  // compares this column against the database's clock too, so the 20-minute window is
+  // measured entirely by one clock, regardless of which app instance answers either request.
   const started = await getDb()
     .update(constitutions)
-    .set({ status: 'committing', commitmentStartedAt: now })
+    .set({ status: 'committing', commitmentStartedAt: sql`now()` })
     .where(and(eq(constitutions.userId, session.userId), eq(constitutions.status, 'draft')))
     .returning();
 
   if (started[0]) {
     await recordEvent({
       eventType: 'constitution.commitment_started',
-      occurredAt: now,
+      occurredAt: started[0].commitmentStartedAt ?? new Date(),
       correlationId,
       userId: session.userId,
       payload: { constitutionId: started[0].id },
@@ -213,21 +266,24 @@ export async function startCommitment(correlationId: string): Promise<Constituti
 
 /**
  * Attempts the activation write atomically: it only ever matches a row that is still
- * `committing` *and* whose commitment period has actually elapsed, exactly as
- * `verifyWalletSignIn`'s nonce-consume guards a single-use row. This is what makes two
- * concurrent activation attempts safe — at most one flips the row.
+ * `committing`, belongs to this user, *and* whose commitment period has actually elapsed —
+ * exactly as `verifyWalletSignIn`'s nonce-consume guards a single-use row. This is what
+ * makes two concurrent activation attempts safe — at most one flips the row.
+ *
+ * The deadline is computed by the database's own `now()`, never this process' `Date`:
+ * `commitment_started_at` was written by whichever app instance handled `startCommitment`,
+ * so comparing it against *this* instance's clock would let the 20-minute window drift by
+ * however far the two instances' clocks disagree. One clock, in Postgres, on both sides.
  */
-async function attemptAtomicActivation(userId: string, now: Date): Promise<ConstitutionRow | undefined> {
-  const deadline = new Date(now.getTime() - COMMITMENT_PERIOD_MS);
-
+async function attemptAtomicActivation(userId: string): Promise<ConstitutionRow | undefined> {
   const rows = await getDb()
     .update(constitutions)
-    .set({ status: 'active', activatedAt: now })
+    .set({ status: 'active', activatedAt: sql`now()` })
     .where(
       and(
         eq(constitutions.userId, userId),
         eq(constitutions.status, 'committing'),
-        lte(constitutions.commitmentStartedAt, deadline),
+        sql`${constitutions.commitmentStartedAt} <= now() - interval '1 millisecond' * ${COMMITMENT_PERIOD_MS}`,
       ),
     )
     .returning();
@@ -248,13 +304,12 @@ async function attemptAtomicActivation(userId: string, now: Date): Promise<Const
 export async function activateConstitution(correlationId: string): Promise<ConstitutionRecord> {
   const session = await requireSession();
 
-  const now = new Date();
-  const activated = await attemptAtomicActivation(session.userId, now);
+  const activated = await attemptAtomicActivation(session.userId);
 
   if (activated) {
     await recordEvent({
       eventType: 'constitution.activated',
-      occurredAt: now,
+      occurredAt: activated.activatedAt ?? new Date(),
       correlationId,
       userId: session.userId,
       payload: { constitutionId: activated.id },
@@ -264,6 +319,7 @@ export async function activateConstitution(correlationId: string): Promise<Const
   }
 
   const current = await loadConstitutionForUser(session.userId);
+  const now = new Date();
 
   if (!current || current.status === 'draft') {
     throw new ConstitutionActionRejected('no_committing_constitution');
@@ -275,16 +331,27 @@ export async function activateConstitution(correlationId: string): Promise<Const
     return toRecord(current);
   }
 
+  if (current.commitmentStartedAt === null) {
+    // Should be unreachable: `commitmentStartedAt` is only nullable in the type because the
+    // column is, but every row this branch can see has `status = 'committing'`, which only
+    // `startCommitment` sets, and it always sets both together. Never trust that invariant
+    // with a non-null assertion on a money-adjacent path — fail closed and make it visible.
+    captureError(new Error('constitution is committing with no commitmentStartedAt'), {
+      correlationId,
+      constitutionId: current.id,
+    });
+
+    throw new ConstitutionActionRejected('no_committing_constitution');
+  }
+
   // Still committing, and the atomic update above proves the deadline has not passed —
   // otherwise it would have matched. This is the early/forged/replayed activation case.
-  const elapsedMs = now.getTime() - current.commitmentStartedAt!.getTime();
+  const elapsedMs = now.getTime() - current.commitmentStartedAt.getTime();
 
-  await recordEvent({
-    eventType: 'constitution.activation_rejected_early',
-    occurredAt: now,
-    correlationId,
-    userId: session.userId,
-    payload: { constitutionId: current.id, elapsedMs, requiredMs: COMMITMENT_PERIOD_MS },
+  await recordEventWithinRateLimit('constitution.activation_rejected_early', session.userId, correlationId, now, {
+    constitutionId: current.id,
+    elapsedMs,
+    requiredMs: COMMITMENT_PERIOD_MS,
   });
 
   throw new ConstitutionActionRejected('commitment_not_elapsed');

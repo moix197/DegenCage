@@ -1,0 +1,1 @@
+CREATE INDEX "events_user_id_event_type_occurred_at_idx" ON "events" USING btree ("user_id","event_type","occurred_at");

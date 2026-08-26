@@ -144,15 +144,24 @@ export type SiwsChallengeRow = typeof siwsChallenges.$inferSelect;
  * actions); `observed_at` is when we wrote it down. Never conflated, never client-supplied
  * (`.ai/decisions/event-time-vs-observation-time.md`).
  */
-export const events = pgTable('events', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
-  observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
-  eventType: text('event_type').notNull(),
-  correlationId: text('correlation_id').notNull(),
-  userId: uuid('user_id').references(() => users.id),
-  payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
-});
+export const events = pgTable(
+  'events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+    eventType: text('event_type').notNull(),
+    correlationId: text('correlation_id').notNull(),
+    userId: uuid('user_id').references(() => users.id),
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+  },
+  (table) => [
+    // The per-user, per-event-type rate limiter's predicate
+    // (`server/constitution/rate-limit.ts`): how many of this event has this user recorded
+    // inside the current window.
+    index('events_user_id_event_type_occurred_at_idx').on(table.userId, table.eventType, table.occurredAt),
+  ],
+);
 
 export type EventRow = typeof events.$inferSelect;
 

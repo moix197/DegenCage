@@ -1,3 +1,4 @@
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Constitution } from '@degencage/rules';
@@ -71,19 +72,42 @@ function selectReturns(rows: unknown[]) {
   });
 }
 
-/** Mimics drizzle's `update().set().where().returning()` chain, capturing what was set. */
+/**
+ * Mimics drizzle's `update().set().where().returning()` chain, capturing both what was set
+ * AND the WHERE it was set under. Capturing `where` is what makes a test able to fail: the
+ * previous version of this helper discarded it (`where: () => ...`), so deleting a guard
+ * from `commitment.ts`'s WHERE clauses changed nothing this test file could observe.
+ */
 function updateReturns(rows: unknown[]) {
   const setSpy = vi.fn();
+  const whereSpy = vi.fn();
 
   updateMock.mockReturnValue({
     set: (values: unknown) => {
       setSpy(values);
 
-      return { where: () => ({ returning: () => Promise.resolve(rows) }) };
+      return {
+        where: (whereArg: unknown) => {
+          whereSpy(whereArg);
+
+          return { returning: () => Promise.resolve(rows) };
+        },
+      };
     },
   });
 
-  return { setSpy };
+  return { setSpy, whereSpy };
+}
+
+const pgDialect = new PgDialect();
+
+/**
+ * Renders a captured drizzle WHERE expression (an `and(eq(...), ...)` value) to literal SQL
+ * text and its bound params, so a test can assert on the actual predicate rather than only
+ * on the mocked return value the predicate is supposed to gate.
+ */
+function whereSql(whereArg: unknown): { sql: string; params: unknown[] } {
+  return pgDialect.sqlToQuery(whereArg as Parameters<PgDialect['sqlToQuery']>[0]);
 }
 
 /** Mimics drizzle's `insert().values().returning()` chain, capturing what was inserted. */
@@ -163,6 +187,44 @@ describe('saveDraftConstitution', () => {
     );
     expect(insertMock).not.toHaveBeenCalled();
     expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('updates an existing draft in place when the row is still a draft', async () => {
+    selectReturns([row({ status: 'draft' })]);
+    const { whereSpy } = updateReturns([row({ status: 'draft' })]);
+
+    const result = await saveDraftConstitution(constitutionDocument(), 'trade-intent-update');
+
+    expect(result.status).toBe('draft');
+    const { sql: whereClause, params } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('"status" =');
+    expect(params).toContain('draft');
+  });
+
+  /**
+   * The TOCTOU this phase exists to close: the initial read here still sees `draft`,
+   * mimicking another request (`startCommitment`, or a racing save) having already
+   * flipped the real row to `committing` between that read and this write. Only the
+   * UPDATE's own WHERE — never a preceding SELECT — can catch that, so the assertion is on
+   * the captured predicate, not just on the rejection. `updateReturns([])` simulates the
+   * conditional UPDATE matching nothing, which is exactly what happens once the guard is in
+   * place; deleting `eq(constitutions.status, 'draft')` from `updateExistingDraft` would
+   * make the `whereClause` assertion below fail even though the rejection itself still
+   * fires (the mock's return value doesn't change either way).
+   */
+  it('rejects a draft save that raced a commit, without touching the document or the clock', async () => {
+    selectReturns([row({ status: 'draft' })]); // stale read — another request already committed
+    const { whereSpy } = updateReturns([]); // conditional UPDATE ... WHERE status='draft' matches nothing
+
+    await expect(saveDraftConstitution(constitutionDocument(), 'trade-intent-toctou')).rejects.toThrow(
+      ConstitutionActionRejected,
+    );
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(recordEventMock).not.toHaveBeenCalled();
+
+    const { sql: whereClause, params } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('"status" =');
+    expect(params).toContain('draft');
   });
 });
 
@@ -255,7 +317,7 @@ describe('activateConstitution', () => {
   it('activates once the commitment period has elapsed', async () => {
     const startedAt = new Date(Date.now() - COMMITMENT_PERIOD_MS - 1_000);
     const activatedAt = new Date();
-    const { setSpy } = updateReturns([
+    const { setSpy, whereSpy } = updateReturns([
       row({ status: 'active', commitmentStartedAt: startedAt, activatedAt }),
     ]);
 
@@ -267,6 +329,22 @@ describe('activateConstitution', () => {
       eventType: 'constitution.activated',
       correlationId: 'trade-intent-14',
     });
+
+    /**
+     * The atomic UPDATE's WHERE is the entire security boundary for activation: it must
+     * scope to this user (or a race with another account's row could flip this one) AND
+     * require the 20-minute deadline to have passed by the database's own clock (or a
+     * forged/replayed request could activate early). Asserting on the captured predicate —
+     * not just on the mocked return value — is what makes this test able to fail: deleting
+     * either guard from `attemptAtomicActivation` leaves every other assertion in this file
+     * green, which is exactly the bug this test exists to close.
+     */
+    const { sql: whereClause, params } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('"user_id" =');
+    expect(whereClause).toContain('"status" =');
+    expect(whereClause).toContain('"commitment_started_at" <=');
+    expect(params).toContain(SESSION_USER_ID);
+    expect(params).toContain('committing');
   });
 
   /** Re-clicking "Activate" after it already succeeded must not error or re-record anything. */

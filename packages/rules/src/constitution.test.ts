@@ -79,6 +79,26 @@ describe('parseConstitution', () => {
     expect(parseConstitution(notANumber)).toEqual({ ok: false, reason: 'invalid_max_usd' });
   });
 
+  /**
+   * Regression for a `parseFloat`-based positivity check: a long all-zero digit string
+   * must stay rejected rather than underflowing to a float that rounds oddly, and an
+   * arbitrarily large digit string must not lean on `parseFloat` rounding it to `Infinity`
+   * to decide "greater than zero" — the digits themselves decide it.
+   */
+  it('decides positivity from the digits, never from float rounding', () => {
+    const allZeros = {
+      schemaVersion: CONSTITUTION_SCHEMA_VERSION,
+      limits: [{ id: 'limit-1', type: 'daily_notional_usd', maxUsd: '0.' + '0'.repeat(400), windowHours: 24 }],
+    };
+    const hugeButPositive = {
+      schemaVersion: CONSTITUTION_SCHEMA_VERSION,
+      limits: [{ id: 'limit-1', type: 'daily_notional_usd', maxUsd: '1' + '0'.repeat(400), windowHours: 24 }],
+    };
+
+    expect(parseConstitution(allZeros)).toEqual({ ok: false, reason: 'invalid_max_usd' });
+    expect(parseConstitution(hugeButPositive).ok).toBe(true);
+  });
+
   it('rejects a non-positive windowHours', () => {
     const doc = {
       schemaVersion: CONSTITUTION_SCHEMA_VERSION,
