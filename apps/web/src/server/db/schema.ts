@@ -1,4 +1,16 @@
-import { boolean, index, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import type { Constitution } from '@degencage/rules';
+import {
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgEnum,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
 
 /**
  * Scope narrows a flag below "global". Absent/empty `userIds` means the flag's
@@ -143,3 +155,43 @@ export const events = pgTable('events', {
 });
 
 export type EventRow = typeof events.$inferSelect;
+
+/**
+ * `draft` → `committing` → `active`, per `apps/web/src/server/constitution/commitment.ts`.
+ * A decrease/increase/removal *after* activation is Phase 8's pending-change row on top of
+ * this table, not a new status here (decision 12).
+ */
+export const CONSTITUTION_STATUSES = ['draft', 'committing', 'active'] as const;
+export type ConstitutionStatus = (typeof CONSTITUTION_STATUSES)[number];
+export const constitutionStatus = pgEnum('constitution_status', CONSTITUTION_STATUSES);
+
+/**
+ * The trading constitution — one row per user in Phase 0 (`constitutions_user_id_idx`
+ * enforces it; Phase 8 adds edit history via a pending-change row on top of this table,
+ * not a second constitution per user).
+ *
+ * `document` is the versioned `Constitution` object from `@degencage/rules`; `schema_version`
+ * is duplicated as a plain column so a later migration can filter/query by version without
+ * unpacking jsonb.
+ */
+export const constitutions = pgTable(
+  'constitutions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    walletId: uuid('wallet_id')
+      .notNull()
+      .references(() => wallets.id),
+    status: constitutionStatus('status').notNull().default('draft'),
+    document: jsonb('document').$type<Constitution>().notNull(),
+    schemaVersion: integer('schema_version').notNull(),
+    commitmentStartedAt: timestamp('commitment_started_at', { withTimezone: true }),
+    activatedAt: timestamp('activated_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('constitutions_user_id_idx').on(table.userId)],
+);
+
+export type ConstitutionRow = typeof constitutions.$inferSelect;
