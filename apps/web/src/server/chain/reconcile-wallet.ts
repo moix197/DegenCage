@@ -278,6 +278,14 @@ async function persistBatch(
   correlationId: string,
   pricedBatch: PricedSwap[],
   isBaseline: boolean,
+  /**
+   * Non-null only for the final batch of a baseline run: folds `baseline_completed_at`
+   * into this batch's own cursor-advance UPDATE so the two commit or fail together. A
+   * separate statement issued after the transaction commits would leave a window where the
+   * cursor has moved but the baseline is still unmarked — a crash there makes the retry
+   * misclassify genuinely live trades as baseline (the bug this parameter closes).
+   */
+  baselineCompletedAt: Date | null,
 ): Promise<BatchResult> {
   return getDb().transaction(async (tx) => {
     await tx.select().from(wallets).where(eq(wallets.id, walletId)).for('update').limit(1);
@@ -295,9 +303,14 @@ async function persistBatch(
 
     // GREATEST, not a blind SET: a concurrent run's batch may have already advanced the
     // cursor past this batch's own highest slot, and the cursor must never move backward.
+    // `baselineCompletedAt` (when present) rides in this same statement — same transaction,
+    // same UPDATE, so it is all-or-nothing with the cursor advance.
     await tx
       .update(wallets)
-      .set({ reconciledThroughSlot: sql`GREATEST(COALESCE(${wallets.reconciledThroughSlot}, 0), ${highestSlot})` })
+      .set({
+        reconciledThroughSlot: sql`GREATEST(COALESCE(${wallets.reconciledThroughSlot}, 0), ${highestSlot})`,
+        ...(baselineCompletedAt ? { baselineCompletedAt } : {}),
+      })
       .where(eq(wallets.id, walletId));
 
     return { tradesPersisted, excludedPersisted, highestSlot };
@@ -347,15 +360,28 @@ async function runReconciliation(
     .sort((a, b) => a.slot - b.slot || a.transactionIndex - b.transactionIndex);
 
   const constitution = isBaseline ? null : await loadActiveConstitution(userId);
+  const batches = chunk(derivedInOrder, PERSIST_BATCH_SIZE);
+  // Computed once, before persistence starts, so the final batch's in-transaction write and
+  // this run's completion event agree on exactly when "done" was.
+  const completedAt = new Date();
 
   let tradesPersisted = 0;
   let excludedPersisted = 0;
   let reconciledThroughSlot = cursor;
 
   try {
-    for (const batch of chunk(derivedInOrder, PERSIST_BATCH_SIZE)) {
-      const pricedBatch = await priceBatch(batch);
-      const result = await persistBatch(walletId, constitution, userId, correlationId, pricedBatch, isBaseline);
+    for (let index = 0; index < batches.length; index += 1) {
+      const isFinalBatch = index === batches.length - 1;
+      const pricedBatch = await priceBatch(batches[index]!);
+      const result = await persistBatch(
+        walletId,
+        constitution,
+        userId,
+        correlationId,
+        pricedBatch,
+        isBaseline,
+        isBaseline && isFinalBatch ? completedAt : null,
+      );
       tradesPersisted += result.tradesPersisted;
       excludedPersisted += result.excludedPersisted;
       reconciledThroughSlot = Math.max(reconciledThroughSlot ?? 0, result.highestSlot);
@@ -365,11 +391,13 @@ async function runReconciliation(
     throw error;
   }
 
-  const completedAt = new Date();
-
   await setReconciliationState(walletId, 'current');
 
-  if (isBaseline) {
+  // Zero-transaction case: no batch ever ran (an empty backfill, or an incremental run
+  // with nothing new), so there was no transaction to fold this write into. A baseline run
+  // finding genuinely zero trades still needs to be marked done, or the next open would
+  // retry the whole 90-day pull as baseline again.
+  if (isBaseline && batches.length === 0) {
     await markBaselineCompleted(walletId, completedAt);
   }
 

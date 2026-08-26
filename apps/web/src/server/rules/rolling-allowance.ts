@@ -6,10 +6,13 @@ import { getDb } from '../db/client';
 import { trades } from '../db/schema';
 
 /**
- * The generic "sum `usd_value` of a wallet's live trades in the last N hours, compare to a
- * limit" helper. Parameterized by `windowHours` and `mint`/predicate so Phases 5/6 can reuse
- * it for per-tier acquisition windows and the rolling-loss window rather than reimplementing
- * this windowed-sum logic — the `daily_notional_usd` case is the first, not the only, caller.
+ * The generic "a wallet's live trades in the last N hours, compared to a limit" helper.
+ * Parameterized by `windowHours` and `mint`/predicate so Phases 5/6 can reuse it for
+ * per-tier acquisition windows and the rolling-loss window rather than reimplementing this
+ * windowed-query logic — the `daily_notional_usd` case is the first, not the only, caller.
+ * The summation itself is `@degencage/rules`' `sumTradeUsd`, imported directly rather than
+ * wrapped here: `evaluate.ts` needs the identical "sum usd_value, null propagates" logic for
+ * a limit's prior-window total, so it lives in one place, not two.
  *
  * Used two ways: `loadWindowedTrades` builds the `windowedHistory` argument
  * `packages/rules`' `evaluateTrade` needs (`server/chain/reconcile-wallet.ts`), and
@@ -66,17 +69,6 @@ export async function loadWindowedTrades(
   return rows;
 }
 
-/**
- * Sums `usdValue`. `null` (never `0`) the moment any trade in the window is unpriced.
- *
- * A thin re-export of `@degencage/rules`' `sumTradeUsd` under this module's established
- * name — `evaluate.ts` needs the identical logic for a limit's prior-window total, so the
- * summation itself lives there once, not twice.
- */
-export function sumWindowedUsd(windowedTrades: WindowedTrade[]): string | null {
-  return sumTradeUsd(windowedTrades);
-}
-
 export interface RollingAllowance {
   trades: WindowedTrade[];
   totalUsd: string | null;
@@ -91,7 +83,7 @@ export async function computeRollingAllowance(
   executor: DatabaseExecutor = getDb(),
 ): Promise<RollingAllowance> {
   const windowedTrades = await loadWindowedTrades(params, executor);
-  const totalUsd = sumWindowedUsd(windowedTrades);
+  const totalUsd = sumTradeUsd(windowedTrades);
 
   return {
     trades: windowedTrades,

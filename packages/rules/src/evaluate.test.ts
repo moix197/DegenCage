@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CONSTITUTION_SCHEMA_VERSION, type Constitution } from './constitution';
-import { addUsd, compareUsd, evaluateTrade, type EvaluableTrade } from './evaluate';
+import { addUsd, compareUsd, evaluateTrade, sumTradeUsd, type EvaluableTrade } from './evaluate';
 
 const NOW = new Date('2026-08-26T12:00:00Z');
 
@@ -34,6 +34,20 @@ describe('compareUsd', () => {
     expect(compareUsd('100', '100.00')).toBe(0);
     expect(compareUsd('99.99', '100')).toBe(-1);
     expect(compareUsd('100.01', '100')).toBe(1);
+  });
+});
+
+describe('sumTradeUsd', () => {
+  it('sums exact decimal strings without floating point', () => {
+    expect(sumTradeUsd([{ occurredAt: NOW, usdValue: '0.1' }, { occurredAt: NOW, usdValue: '0.2' }])).toBe('0.3');
+  });
+
+  it('is $0 for an empty list', () => {
+    expect(sumTradeUsd([])).toBe('0');
+  });
+
+  it('is null — never $0 — the moment any trade in the list is unpriced', () => {
+    expect(sumTradeUsd([{ occurredAt: NOW, usdValue: '10' }, { occurredAt: NOW, usdValue: null }])).toBeNull();
   });
 });
 

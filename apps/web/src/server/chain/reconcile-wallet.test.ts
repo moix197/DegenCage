@@ -93,7 +93,13 @@ const ALREADY_BASELINED: WalletFixture = { reconciledThroughSlot: 50, reconcilia
  * dedup, row-lock acquisition per batch, `baseline_completed_at` bookkeeping) without a
  * real database.
  */
-function fakeDatabase(initial: WalletFixture = NEVER_RECONCILED, { hasActiveConstitution = true }: { hasActiveConstitution?: boolean } = {}) {
+function fakeDatabase(
+  initial: WalletFixture = NEVER_RECONCILED,
+  {
+    hasActiveConstitution = true,
+    failFinalBatchUpdate = false,
+  }: { hasActiveConstitution?: boolean; failFinalBatchUpdate?: boolean } = {},
+) {
   const wallet = { ...initial };
   const persistedSignatures = new Set<string>();
   const lockCalls: string[] = [];
@@ -159,9 +165,22 @@ function fakeDatabase(initial: WalletFixture = NEVER_RECONCILED, { hasActiveCons
         }),
       }),
       update: () => ({
-        set: (values: unknown) => {
+        set: (values: { reconciledThroughSlot?: unknown; baselineCompletedAt?: Date }) => {
           cursorAdvanceSetCalls.push(values);
-          return { where: async () => undefined };
+          return {
+            where: async () => {
+              if (failFinalBatchUpdate) {
+                throw new Error('connection lost mid-commit');
+              }
+              // Mirrors what a real committed UPDATE would do — this is what proves the
+              // cursor advance and `baselineCompletedAt` land together, in one statement,
+              // when it succeeds (and neither lands, per the branch above, when it fails).
+              if (values.baselineCompletedAt) {
+                wallet.baselineCompletedAt = values.baselineCompletedAt;
+              }
+              return undefined;
+            },
+          };
         },
       }),
     };
@@ -260,6 +279,44 @@ describe('reconcileWallet', () => {
     expect(retry.isBaseline).toBe(true);
     expect(recordEventMock).not.toHaveBeenCalledWith(expect.objectContaining({ eventType: 'rule.decision_recorded' }), expect.anything());
     expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'wallet.backfill_started' }));
+    expect(wallet.baselineCompletedAt).not.toBeNull();
+  });
+
+  /**
+   * The narrower version of the same invariant: `baseline_completed_at` must not be a
+   * separate statement issued after the final batch's transaction commits — a crash in that
+   * window would leave the cursor advanced but the baseline still unmarked. Proven two ways:
+   * the cursor advance and `baselineCompletedAt` are pushed to `cursorAdvanceSetCalls` in the
+   * very same `.set(...)` call (one statement), and when that statement itself fails,
+   * neither actually lands on the wallet.
+   */
+  it('cursor advance and baseline_completed_at are written in the same statement — a crash there leaves both unset', async () => {
+    const { wallet, cursorAdvanceSetCalls } = fakeDatabase(NEVER_RECONCILED, { failFinalBatchUpdate: true });
+    getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-crash', 100)]);
+
+    await expect(reconcileWallet('cid-atomic-crash')).rejects.toThrow('connection lost mid-commit');
+
+    // Same `.set(...)` call carried both fields — proof they are one statement, not two.
+    const values = cursorAdvanceSetCalls[0] as { reconciledThroughSlot: unknown; baselineCompletedAt?: Date };
+    expect(values.reconciledThroughSlot).toBeDefined();
+    expect(values.baselineCompletedAt).toBeInstanceOf(Date);
+
+    // And since that one statement failed, neither actually committed.
+    expect(wallet.baselineCompletedAt).toBeNull();
+    expect(wallet.reconciliationState).toBe('failed');
+  });
+
+  it('a baseline run with more than one batch only folds baseline_completed_at into the final batch', async () => {
+    const { wallet, cursorAdvanceSetCalls } = fakeDatabase(NEVER_RECONCILED);
+    const signatures = Array.from({ length: 101 }, (_, index) => `sig-multi-${index}`);
+    getTransactionsForAddressMock.mockResolvedValue(signatures.map((sig, index) => heliusTx(sig, 100 + index)));
+
+    const result = await reconcileWallet('cid-multi-batch');
+
+    expect(result.isBaseline).toBe(true);
+    expect(cursorAdvanceSetCalls).toHaveLength(2); // two batches, 100 + 1
+    expect((cursorAdvanceSetCalls[0] as { baselineCompletedAt?: Date }).baselineCompletedAt).toBeUndefined();
+    expect((cursorAdvanceSetCalls[1] as { baselineCompletedAt?: Date }).baselineCompletedAt).toBeInstanceOf(Date);
     expect(wallet.baselineCompletedAt).not.toBeNull();
   });
 
