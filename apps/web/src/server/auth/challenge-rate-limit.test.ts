@@ -73,6 +73,41 @@ describe('clientKeyForRequest', () => {
     expect(proxied).toBe(direct);
   });
 
+  /**
+   * Vercel overwrites plain `x-forwarded-for`, but documents that a proxy layered in front
+   * of it may rewrite that header again. `x-vercel-forwarded-for` is the one Vercel sets
+   * for itself, so it wins wherever both are present.
+   */
+  it('prefers the vercel-specific forwarded header over x-forwarded-for', () => {
+    const key = clientKeyForRequest(
+      requestWith({
+        'x-vercel-forwarded-for': '203.0.113.7',
+        'x-forwarded-for': '198.51.100.4',
+        'x-real-ip': '198.51.100.9',
+      }),
+    );
+
+    expect(key).toBe(clientKeyForRequest(requestWith({ 'x-forwarded-for': '203.0.113.7' })));
+  });
+
+  it('keys on the first hop of the vercel header too', () => {
+    const proxied = clientKeyForRequest(
+      requestWith({ 'x-vercel-forwarded-for': '203.0.113.7, 10.0.0.1' }),
+    );
+
+    expect(proxied).toBe(clientKeyForRequest(requestWith({ 'x-vercel-forwarded-for': '203.0.113.7' })));
+  });
+
+  it('falls back to x-forwarded-for where the vercel header is absent or empty', () => {
+    const expected = clientKeyForRequest(requestWith({ 'x-forwarded-for': '203.0.113.7' }));
+
+    expect(
+      clientKeyForRequest(
+        requestWith({ 'x-vercel-forwarded-for': '  ', 'x-forwarded-for': '203.0.113.7' }),
+      ),
+    ).toBe(expected);
+  });
+
   it('falls back to x-real-ip', () => {
     const key = clientKeyForRequest(requestWith({ 'x-real-ip': '203.0.113.7' }));
 

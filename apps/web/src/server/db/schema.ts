@@ -94,6 +94,15 @@ export const siwsChallenges = pgTable(
      * the limit existed have no key; such a row simply counts towards nobody.
      */
     clientKey: text('client_key'),
+    /**
+     * When this challenge's one `auth.sign_in_rejected` event was written, if it ever was.
+     *
+     * `verify` is unauthenticated and unthrottled, so a caller may resubmit one nonce
+     * forever; without this column each replay wrote another append-only `events` row.
+     * Claiming it is what makes the rejection audit trail one row per challenge issued —
+     * and issuance is what the rate limit actually caps.
+     */
+    rejectionRecordedAt: timestamp('rejection_recorded_at', { withTimezone: true }),
   },
   (table) => [
     // The reaper's predicate.

@@ -33,6 +33,10 @@ async function applyCookie(cookie: SessionCookie): Promise<void> {
  * never *which* of expiry, replay, domain or signature tripped — that distinction is in
  * the logs and the event log, where it is useful, not in the response, where it is a
  * probing oracle.
+ *
+ * The rejection itself is handed to `recordSignInRejection`, not just its reason: the
+ * challenge it was decided against is what bounds the event log against replay, and this
+ * route is unauthenticated and unthrottled.
  */
 export async function POST(request: Request): Promise<Response> {
   const correlationId = randomUUID();
@@ -62,7 +66,7 @@ export async function POST(request: Request): Promise<Response> {
   } catch (error) {
     if (error instanceof SignInRejected) {
       logger.warn('wallet sign-in rejected', { correlationId, reason: error.reason });
-      await recordSignInRejection(correlationId, error.reason);
+      await recordSignInRejection(correlationId, error);
 
       return Response.json({ error: 'sign_in_rejected', correlationId }, { status: 401 });
     }

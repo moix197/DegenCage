@@ -41,6 +41,7 @@ function challenge(overrides: Partial<SiwsChallengeRow>): SiwsChallengeRow {
     expiresAt: new Date(issuedAt.getTime() + CHALLENGE_TTL_MS),
     consumedAt: null,
     clientKey: 'client-key-hash',
+    rejectionRecordedAt: null,
     ...overrides,
   };
 }

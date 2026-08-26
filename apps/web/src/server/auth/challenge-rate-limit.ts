@@ -43,11 +43,35 @@ function hashClientAddress(address: string): string {
   return createHash('sha256').update(address).digest('hex').slice(0, 32);
 }
 
-/** The first hop is the client; the rest of `X-Forwarded-For` is our own proxy chain. */
-function readForwardedAddress(request: Request): string | undefined {
-  const forwarded = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
+/** The first hop is the client; the rest of a forwarded chain is our own proxies. */
+function firstForwardedHop(request: Request, header: string): string | undefined {
+  return request.headers.get(header)?.split(',')[0]?.trim() || undefined;
+}
 
-  return forwarded || request.headers.get('x-real-ip')?.trim() || undefined;
+/**
+ * The caller's address, as the platform in front of us reports it.
+ *
+ * **Deployment trust assumption: this process runs behind a proxy that sets these headers
+ * itself.** Nothing below is verified — a header is only as trustworthy as whoever last
+ * wrote it, and a caller that reaches this process directly writes all three.
+ *
+ * `x-vercel-forwarded-for` is preferred where it exists because it is the narrowest of the
+ * three: Vercel sets it, and it survives a proxy layered in front of Vercel, which Vercel
+ * documents may rewrite plain `x-forwarded-for`. XFF is the fallback for every other
+ * platform, and `x-real-ip` for proxies that only set that.
+ *
+ * Under `output: 'standalone'` with no trusted proxy in front, all three are caller
+ * supplied: the limit then degrades to one bucket per value the caller invents, which is no
+ * limit at all. Do not deploy that way — and note that the limit is defence in depth
+ * regardless, never the thing that makes a sign-in safe.
+ */
+function readForwardedAddress(request: Request): string | undefined {
+  return (
+    firstForwardedHop(request, 'x-vercel-forwarded-for') ||
+    firstForwardedHop(request, 'x-forwarded-for') ||
+    request.headers.get('x-real-ip')?.trim() ||
+    undefined
+  );
 }
 
 export function clientKeyForRequest(request: Request): string {
@@ -91,6 +115,14 @@ async function countRecentChallenges(
  * A database that will not answer throws too, and is deliberately not caught here: the
  * caller turns that into a failed request. Falling through to "issue it anyway" would make
  * the limit disappear at exactly the moment the database is already under load.
+ *
+ * Count and insert are two statements, so simultaneous requests from one client can each
+ * see the same count and a burst can land a few rows over the limit. Left that way on
+ * purpose: the overshoot is bounded by concurrency, costs only reaped rows, and the
+ * alternatives are worse. A single conditional `INSERT ... SELECT WHERE count < max` does
+ * not actually close it under READ COMMITTED, and a `pg_advisory_xact_lock` on the client
+ * key does — by serializing issuance per key, which for `UNIDENTIFIED_CLIENT_KEY` is every
+ * caller at once. This limit protects a table from growth, not a balance from being spent.
  */
 export async function assertWithinChallengeRateLimit(
   executor: DatabaseExecutor,

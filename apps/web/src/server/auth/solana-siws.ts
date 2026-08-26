@@ -89,12 +89,18 @@ export type SignInCheck = { ok: true; address: string } | { ok: false; reason: S
 /**
  * The rejections that were reached by evaluating a challenge we actually issued.
  *
- * The distinction is what makes the rejection audit trail affordable. `verify` is
- * unauthenticated, so anything it records per call is a write an anonymous caller controls
- * the volume of; but to get *past* the nonce lookup a caller has to be holding a nonce we
- * issued, and issuance is rate limited (`challenge-rate-limit`). Everything below is
- * therefore bounded by that limit. The two excluded reasons — a body that is not a proof,
- * and a nonce we never issued — are free to generate and stop at the log.
+ * Reaching a stored challenge is *not* on its own a bound, and an earlier version of this
+ * comment claimed it was. `verify` is unauthenticated and has no throttle of its own;
+ * `challenge-rate-limit` caps issuance on `/api/auth/nonce`, not verification. One nonce
+ * can therefore be resubmitted forever, every replay landing on `nonce_already_consumed`,
+ * so "one event per call that got past the lookup" is still a table an anonymous caller
+ * grows without limit.
+ *
+ * What bounds it is one event per *challenge row*, claimed in SQL by
+ * `claimRejectionEventSlot` — rows being the thing the issuance limit does cap. The set
+ * below is then the set of reasons that have a row to hang that claim on; the excluded
+ * three — a body that is not a proof, a message that is not SIWS, and a nonce we never
+ * issued — have none, are free to generate, and stop at the log.
  */
 const REJECTIONS_AGAINST_A_STORED_CHALLENGE: ReadonlySet<SignInRejection> = new Set([
   'nonce_already_consumed',
@@ -110,11 +116,39 @@ function isRejectionOfAStoredChallenge(reason: SignInRejection): boolean {
 }
 
 /**
- * Records a refused sign-in in the event log.
+ * Takes the single rejection-event slot a challenge has, atomically.
+ *
+ * Same shape as the nonce consume below — `UPDATE ... WHERE <column> IS NULL ... RETURNING`
+ * — and for the same reason: the database, not this process, decides which of N concurrent
+ * replays of one nonce is the first, so N replays produce one event rather than N.
+ *
+ * Runs on the pooled client and never inside the sign-in transaction: that transaction has
+ * already rolled back by the time a rejection is recorded, which would take the claim with
+ * it and hand the replay its slot straight back.
+ *
+ * @returns Whether this caller is the one that may write the event.
+ */
+async function claimRejectionEventSlot(nonce: string, now: Date): Promise<boolean> {
+  const claimed = await getDb()
+    .update(siwsChallenges)
+    .set({ rejectionRecordedAt: now })
+    .where(and(eq(siwsChallenges.nonce, nonce), isNull(siwsChallenges.rejectionRecordedAt)))
+    .returning({ nonce: siwsChallenges.nonce });
+
+  return claimed.length === 1;
+}
+
+/**
+ * Records a refused sign-in in the event log, at most once per challenge.
  *
  * A rejection is a *decision*, and the decisions are what the audit trail is for
  * (CLAUDE.md → Observability): "how often is a sign-in refused, and why" is a question
  * about this product's behaviour, and until now the only trace of it was a log line.
+ *
+ * The first genuine rejection of a challenge is written with its own specific reason. Every
+ * later attempt on that same nonce is a replay of a decision already recorded and is logged
+ * only — which is what keeps `events` bounded by challenges issued (see
+ * `REJECTIONS_AGAINST_A_STORED_CHALLENGE`) at no real cost to the audit trail.
  *
  * Nothing identifying goes in. `userId` is null and the payload carries the reason alone —
  * no address, no public key, no nonce. No signature has proved an identity on this path, an
@@ -122,17 +156,39 @@ function isRejectionOfAStoredChallenge(reason: SignInRejection): boolean {
  * than the server already drew for itself. It adds no oracle either: the HTTP response is
  * uniformly opaque whatever is written here, and nothing here is readable by the caller.
  *
- * Captured, never thrown: telemetry must not convert a rejection into a 503.
+ * Fails closed, and is captured rather than thrown: a claim that cannot be made writes no
+ * event, because the failure mode of guessing is the unbounded table this exists to
+ * prevent — and telemetry must not turn a rejection into a 503 either way.
  */
 export async function recordSignInRejection(
   correlationId: string,
-  reason: SignInRejection,
+  rejection: SignInRejected,
 ): Promise<void> {
+  const { reason, nonce } = rejection;
+
   if (!isRejectionOfAStoredChallenge(reason)) {
     return;
   }
 
+  if (!nonce) {
+    logger.warn('sign-in rejection against a stored challenge arrived without its nonce', {
+      correlationId,
+      reason,
+    });
+
+    return;
+  }
+
   try {
+    if (!(await claimRejectionEventSlot(nonce, new Date()))) {
+      logger.info('sign-in rejection not recorded: challenge already has one, or is gone', {
+        correlationId,
+        reason,
+      });
+
+      return;
+    }
+
     await recordEvent({
       eventType: 'auth.sign_in_rejected',
       occurredAt: new Date(),
@@ -323,7 +379,15 @@ function checkParsedSignIn(
 }
 
 export class SignInRejected extends Error {
-  constructor(readonly reason: SignInRejection) {
+  /**
+   * @param nonce - The challenge the decision was reached against, when it reached one.
+   *   Carried so the rejection can be recorded against that row exactly once. It is a
+   *   lookup key and never an identity, and it does not enter the event payload.
+   */
+  constructor(
+    readonly reason: SignInRejection,
+    readonly nonce: string | null = null,
+  ) {
     super(`sign-in rejected: ${reason}`);
     this.name = 'SignInRejected';
   }
@@ -379,7 +443,7 @@ export async function verifyWalletSignIn(
     const check = checkParsedSignIn(challenge, proof, parsed, new Date(), expectedDomain);
 
     if (!check.ok) {
-      throw new SignInRejected(check.reason);
+      throw new SignInRejected(check.reason, nonce);
     }
 
     // Before anything new is minted: the proof has re-bound identity, so the session the
@@ -397,7 +461,7 @@ export async function verifyWalletSignIn(
       .returning({ nonce: siwsChallenges.nonce });
 
     if (consumed.length !== 1) {
-      throw new SignInRejected('nonce_already_consumed');
+      throw new SignInRejected('nonce_already_consumed', nonce);
     }
 
     return establishSession(tx, check.address, correlationId);

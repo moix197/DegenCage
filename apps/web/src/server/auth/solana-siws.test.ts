@@ -29,6 +29,7 @@ const {
   transactionMock,
   selectMock,
   insertMock,
+  updateMock,
   deleteMock,
   establishSessionMock,
   supersedePreviousSessionMock,
@@ -38,6 +39,7 @@ const {
   transactionMock: vi.fn(),
   selectMock: vi.fn(),
   insertMock: vi.fn(),
+  updateMock: vi.fn(),
   deleteMock: vi.fn(),
   establishSessionMock: vi.fn(),
   supersedePreviousSessionMock: vi.fn(),
@@ -50,6 +52,7 @@ vi.mock('../db/client', () => ({
     transaction: transactionMock,
     select: selectMock,
     insert: insertMock,
+    update: updateMock,
     delete: deleteMock,
   }),
 }));
@@ -93,6 +96,7 @@ function challengeRow(input: StoredSignInInput, consumedAt: Date | null = null):
     expiresAt: new Date(input.expirationTime),
     consumedAt,
     clientKey: 'client-key-hash',
+    rejectionRecordedAt: null,
   };
 }
 
@@ -424,6 +428,22 @@ describe('verifyWalletSignIn', () => {
     expect(establishSessionMock).not.toHaveBeenCalled();
   });
 
+  /**
+   * The nonce is what the rejection event is deduped against, so a replay that does not
+   * carry it back out is a replay that gets a fresh event every time.
+   */
+  it('names the challenge a replay was rejected against', async () => {
+    const proof = signChallenge(wallet, input);
+    fakeChallengeTable(challengeRow(input));
+
+    await verifyWalletSignIn(proof, 'trade-intent-13', null);
+
+    await expect(verifyWalletSignIn(proof, 'trade-intent-14', null)).rejects.toMatchObject({
+      reason: 'nonce_already_consumed',
+      nonce: input.nonce,
+    });
+  });
+
   it('has nothing to supersede when the request carried no session', async () => {
     fakeChallengeTable(challengeRow(input));
 
@@ -529,8 +549,41 @@ describe('recordSignInRejection', () => {
     'signature_invalid',
   ];
 
+  /**
+   * `siws_challenges` as far as the rejection slot is concerned: an update guarded by
+   * `rejection_recorded_at IS NULL`, which the real column enforces in SQL. A second claim
+   * on a row that already has one comes back empty, exactly as Postgres would answer it.
+   */
+  function fakeRejectionSlot(row: SiwsChallengeRow | null, failure?: Error) {
+    updateMock.mockReturnValue({
+      set: (values: { rejectionRecordedAt: Date }) => ({
+        where: () => ({
+          returning: async () => {
+            if (failure) {
+              throw failure;
+            }
+
+            if (!row || row.rejectionRecordedAt !== null) {
+              return [];
+            }
+
+            row.rejectionRecordedAt = values.rejectionRecordedAt;
+
+            return [{ nonce: row.nonce }];
+          },
+        }),
+      }),
+    });
+  }
+
+  function rejection(reason: SignInRejection, nonce: string | null = null): SignInRejected {
+    return new SignInRejected(reason, nonce);
+  }
+
   it.each(AGAINST_A_STORED_CHALLENGE)('records a %s rejection with its reason', async (reason) => {
-    await recordSignInRejection('trade-intent-30', reason);
+    fakeRejectionSlot(challengeRow(input));
+
+    await recordSignInRejection('trade-intent-30', rejection(reason, input.nonce));
 
     expect(recordEventMock).toHaveBeenCalledOnce();
     expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
@@ -543,35 +596,115 @@ describe('recordSignInRejection', () => {
 
   /**
    * The audit trail is not a place to leak. No address, no public key, no nonce — nothing
-   * a signature has not proved, and nothing the uniform 401 does not already concede.
+   * a signature has not proved, and nothing the uniform 401 does not already concede. The
+   * nonce is a lookup key for the dedupe and stops there.
    */
   it('carries the reason and nothing that could identify the caller', async () => {
-    await recordSignInRejection('trade-intent-31', 'signature_invalid');
+    fakeRejectionSlot(challengeRow(input));
+
+    await recordSignInRejection('trade-intent-31', rejection('signature_invalid', input.nonce));
 
     const payload = recordEventMock.mock.calls[0]?.[0].payload as Record<string, unknown>;
     expect(Object.keys(payload)).toEqual(['reason']);
   });
 
   /**
+   * The blocking hole this dedupe exists to close. `/api/auth/verify` is unauthenticated
+   * and unthrottled — the nonce limit caps *issuance*, not verification — so one spent
+   * nonce can be resubmitted forever. Per call, that was one append-only `events` row per
+   * replay: an anonymous caller growing the table without bound. Per challenge, it is one.
+   */
+  it('records one event however many times a consumed nonce is replayed', async () => {
+    const row = challengeRow(input, new Date('2026-08-26T12:00:30Z'));
+    fakeRejectionSlot(row);
+
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      await recordSignInRejection(
+        `trade-intent-replay-${attempt}`,
+        rejection('nonce_already_consumed', input.nonce),
+      );
+    }
+
+    expect(recordEventMock).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * Deduping must not cost the audit trail its content: it is the *first* rejection of each
+   * challenge that survives, with the specific reason that challenge actually failed for.
+   */
+  it('keeps each challenge its own first rejection, with that challenge reason', async () => {
+    const expired = challengeRow(input);
+    fakeRejectionSlot(expired);
+    await recordSignInRejection('trade-intent-34', rejection('challenge_expired', input.nonce));
+
+    const other = buildSignInInput(ISSUED_AT, DOMAIN);
+    fakeRejectionSlot(challengeRow(other));
+    await recordSignInRejection('trade-intent-35', rejection('domain_mismatch', other.nonce));
+
+    expect(recordEventMock.mock.calls.map((call) => call[0].payload)).toEqual([
+      { reason: 'challenge_expired' },
+      { reason: 'domain_mismatch' },
+    ]);
+  });
+
+  /**
+   * Fail closed. A claim that cannot be made is not a licence to write anyway: guessing in
+   * that direction is precisely the unbounded table the claim exists to prevent, and the
+   * database being unable to answer is when a flood is cheapest.
+   */
+  it('writes no event when the slot cannot be claimed', async () => {
+    fakeRejectionSlot(null, new Error('connection terminated'));
+
+    await expect(
+      recordSignInRejection('trade-intent-36', rejection('signature_invalid', input.nonce)),
+    ).resolves.toBeUndefined();
+    expect(recordEventMock).not.toHaveBeenCalled();
+    expect(captureErrorMock).toHaveBeenCalledOnce();
+  });
+
+  /** A reaped challenge has no row left to claim, so there is nothing to attribute. */
+  it('writes no event for a challenge that is no longer stored', async () => {
+    fakeRejectionSlot(null);
+
+    await recordSignInRejection('trade-intent-37', rejection('challenge_expired', input.nonce));
+
+    expect(recordEventMock).not.toHaveBeenCalled();
+  });
+
+  /** Never silently: a stored-challenge reason with no nonce is a bug, and says so. */
+  it('writes no event when a stored-challenge rejection arrives without its nonce', async () => {
+    fakeRejectionSlot(challengeRow(input));
+
+    await recordSignInRejection('trade-intent-38', rejection('address_mismatch'));
+
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(recordEventMock).not.toHaveBeenCalled();
+  });
+
+  /**
    * `events` is append-only product data, and this path is reachable without any identity.
-   * Getting as far as a stored challenge costs a nonce, and nonces are rate limited; the
-   * two rejections that cost nothing to produce stop at the log, or the audit trail becomes
-   * the unbounded table the rate limit exists to deny.
+   * These three cost nothing to produce and have no challenge row to dedupe against, so
+   * they stop at the log — the claim has nothing to hang on.
    */
   it.each<SignInRejection>(['malformed_proof', 'malformed_message', 'unknown_nonce'])(
     'writes no event for a %s rejection, which is free to generate',
     async (reason) => {
-      await recordSignInRejection('trade-intent-32', reason);
+      fakeRejectionSlot(challengeRow(input));
 
+      await recordSignInRejection('trade-intent-32', rejection(reason, input.nonce));
+
+      expect(updateMock).not.toHaveBeenCalled();
       expect(recordEventMock).not.toHaveBeenCalled();
     },
   );
 
   it('never turns a failed event write into a failed rejection', async () => {
+    fakeRejectionSlot(challengeRow(input));
     recordEventMock.mockRejectedValueOnce(new Error('connection terminated'));
 
-    await expect(recordSignInRejection('trade-intent-33', 'challenge_expired')).resolves
-      .toBeUndefined();
+    await expect(
+      recordSignInRejection('trade-intent-33', rejection('challenge_expired', input.nonce)),
+    ).resolves.toBeUndefined();
     expect(captureErrorMock).toHaveBeenCalledOnce();
   });
 });

@@ -1,0 +1,1 @@
+ALTER TABLE "siws_challenges" ADD COLUMN "rejection_recorded_at" timestamp with time zone;
