@@ -189,7 +189,7 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 
 - [x] `pnpm test` passes, including all five negative cases in the SIWS test above
 - [ ] Manual: connect a real Phantom (or Solflare) wallet in a browser, confirm single-prompt flow, reload page without re-prompting, confirm switching the wallet's active account forces re-auth
-- [ ] Manual: flip `auth.wallet_connect` flag off, confirm connect attempts fail closed with a clear message
+- [x] Manual: flip `auth.wallet_connect` flag off, confirm connect attempts fail closed with a clear message
 
 **Phase review:**
 
