@@ -9,10 +9,13 @@ anywhere real.
 
 | Module / package | Responsibility (one line) | Path | Decisions / patterns |
 | ---------------- | ------------------------- | ---- | -------------------- |
-| _none yet_ | _No code has landed; target shape is agreed, not built._ | | [monorepo-package-shape](decisions/monorepo-package-shape.md) |
+| `@degencage/web` | Next.js App Router UI + route handlers; owns everything server-side that isn't the rule engine | `apps/web` ([README](../apps/web/README.md)) | [hosting-and-growth-path](decisions/hosting-and-growth-path.md) |
+| `@degencage/rules` | The rule engine — pure, I/O-free, the product IP | `packages/rules` | [monorepo-package-shape](decisions/monorepo-package-shape.md) |
+| db | Drizzle schema, migrations, and the one pooled Postgres handle (`getDb()`) | `apps/web/src/server/db` | [migration-and-test-tooling](decisions/migration-and-test-tooling.md), [single-source-of-truth-database](decisions/single-source-of-truth-database.md) |
+| flags | `isFeatureEnabled()` — the single fail-closed kill-switch read path | `apps/web/src/server/flags` | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
+| observability | `logger` + `captureError` — the only import points for pino and Sentry | `apps/web/src/server/observability` | [observability-stack](decisions/observability-stack.md) |
 
-> Add the first real row when the first package lands. Don't pre-populate rows for paths
-> that don't exist.
+> Add a row when a module lands. Don't pre-populate rows for paths that don't exist.
 
 ## Cross-cutting
 
@@ -25,4 +28,5 @@ anywhere real.
 | Time & history | `occurred_at` (block) vs `observed_at` (detection); stats derived, never counters | [event-time-vs-observation-time](decisions/event-time-vs-observation-time.md) |
 | Product vision & phases | CLAUDE.md → *What we're building*; `roadmap__small.pdf` | not duplicated here |
 | Observability | events → Postgres; errors → Sentry; logs → pino/stdout; traces deferred | [observability-stack](decisions/observability-stack.md); rules in CLAUDE.md |
-| Kill switches / fail-closed / idempotency | CLAUDE.md → *Safety infrastructure* | not duplicated here |
+| Kill switches / fail-closed / idempotency | `feature_flags` table + `isFeatureEnabled()`; rules in CLAUDE.md → *Safety infrastructure* | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
+| Schema / migrations / tests / DB host | Drizzle + drizzle-kit, Vitest, Neon (pooled WebSocket driver) | [migration-and-test-tooling](decisions/migration-and-test-tooling.md) |

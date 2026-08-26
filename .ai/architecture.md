@@ -3,19 +3,27 @@
 The high-level shape of the system: package boundaries, how data flows, and the
 rules that keep dependencies pointing one direction.
 
-> **No code exists yet.** What follows is the agreed target shape, not a description of
-> a tree on disk. Replace each section with the real thing as packages land.
+> The pnpm workspace, `apps/web`, and `packages/rules` are **built**. Anything marked
+> *later* below is still target shape, not a tree on disk.
 
 ## System shape
 
 ```
-apps/web        Next.js — UI + route handlers (Vercel)
+apps/web        Next.js App Router — UI + route handlers (Vercel), output: 'standalone'
+  src/app/                   routes and pages — entry points only, no business logic
+  src/server/db/             drizzle schema, migrations, seed, the one pooled getDb()
+  src/server/flags/          isFeatureEnabled() — fail-closed kill switches
+  src/server/observability/  logger + captureError — the only pino/Sentry importers
 packages/rules  the rule engine: pure, I/O-free, the product IP
-packages/db     schema + queries — added when a second consumer needs them
 
 later, only when the need is real:
+packages/db     schema + queries — only once a second consumer needs them
 apps/worker     Phase 4 wallet indexer (worker container, not a VPS)
 ```
+
+`packages/db` was deliberately **not** introduced. `apps/web` is still the only consumer
+of the schema and queries, so they live at `apps/web/src/server/db`. The bar for
+extracting it is a second real consumer (`apps/worker`), not anticipation of one.
 
 Deliberately not split further up front — see
 [decisions/monorepo-package-shape](decisions/monorepo-package-shape.md).
@@ -49,6 +57,15 @@ see [decisions/server-side-rule-evaluation](decisions/server-side-rule-evaluatio
 One Postgres is authoritative for constitutions, rule state, allowances, and trade
 history; the web app and any future worker share it — see
 [decisions/single-source-of-truth-database](decisions/single-source-of-truth-database.md).
+It is reached through exactly one handle (`getDb()`, pooled), managed by Drizzle —
+see [decisions/migration-and-test-tooling](decisions/migration-and-test-tooling.md).
+
+Two cross-cutting rules constrain every module above: a feature is gated by
+`isFeatureEnabled()` and fails closed
+([decisions/feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md)),
+and it logs and reports errors through the observability wrappers rather than importing
+pino or Sentry directly
+([decisions/observability-stack](decisions/observability-stack.md)).
 
 Product context, observability requirements, and safety-infrastructure rules (kill
 switches, fail-closed, idempotency) live in **CLAUDE.md** and are not duplicated here.

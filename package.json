@@ -1,0 +1,25 @@
+{
+  "name": "degencage",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.5.2",
+  "scripts": {
+    "dev": "dotenv -e .env -- pnpm --filter @degencage/web dev",
+    "build": "dotenv -e .env -- pnpm --filter @degencage/web build",
+    "start": "dotenv -e .env -- pnpm --filter @degencage/web start",
+    "test": "vitest run",
+    "typecheck": "pnpm -r typecheck",
+    "db:generate": "dotenv -e .env -- pnpm --filter @degencage/web db:generate",
+    "db:migrate": "dotenv -e .env -- pnpm --filter @degencage/web db:migrate",
+    "db:seed": "dotenv -e .env -- pnpm --filter @degencage/web db:seed"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^10.0.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

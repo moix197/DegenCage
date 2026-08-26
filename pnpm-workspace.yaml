@@ -1,0 +1,16 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# Next's `output: 'standalone'` trace step reproduces node_modules symlinks with untyped
+# fs.symlink calls, which Windows refuses outside an elevated/Developer-Mode process.
+# A hoisted (symlink-free) node_modules makes the build portable across our machines.
+# Cost: no phantom-dependency protection — declare every import in the package that uses it.
+nodeLinker: hoisted
+
+# Postinstall scripts are opt-in. esbuild/sharp need theirs to fetch native binaries;
+# @sentry/cli only exists to upload source maps, which we don't do.
+allowBuilds:
+  '@sentry/cli': false
+  esbuild: true
+  sharp: true
