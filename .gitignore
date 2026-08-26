@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# builds
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+
+# env — never commit secrets (Helius / Birdeye / Sentry / database URLs)
+.env
+.env.*
+!.env.example
+
+# test / coverage
+coverage/
+
+# tooling caches
+.turbo/
+.vercel/
+.eslintcache
+
+# local Claude Code tooling (agents, skills, settings)
+.claude/
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
