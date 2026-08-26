@@ -166,16 +166,16 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 
 **Steps:**
 
-- [ ] Add `SIWS_DOMAIN` to `.env.example`; never derive domain from request headers
-- [ ] Migration: `users`, `wallets`, `sessions`, `siws_challenges`, `events` tables
-- [ ] Implement `recordEvent()` — the single write path for the behavioral event log (per `observability-stack.md`: same Postgres, `jsonb` payload, distinct from pino/Sentry)
-- [ ] Implement nonce issuance: build `SolanaSignInInput`, persist keyed by nonce, 5-min TTL, `consumed_at NULL`
-- [ ] Implement verification: `verifySignIn()` for signature+field match, then explicitly check (a) nonce exists and `consumed_at IS NULL`, (b) `now()` within `[issuedAt, expirationTime]`, (c) stored `domain` equals `SIWS_DOMAIN` — reject and fail closed on any single failure, mark nonce consumed only on success, in the same transaction as the session insert (so a crash between "mark consumed" and "create session" can't leave a consumed-but-unauthenticated state)
-- [ ] Upsert `users`/`wallets` (custody = `external`), create `sessions` row, set cookie, `recordEvent('auth.session_created', ...)`
-- [ ] Implement fallback path for wallets without `solana:signIn` (`connect()` + `signMessage()` + manual `verifyMessageSignature`), with a visible error state for wallets that reject arbitrary signing (e.g. some Ledger firmware) instead of hanging
-- [ ] Client: wallet provider wrapper, connect page, account-switch watcher that force-clears session on mismatch
-- [ ] Gate `/api/auth/nonce` behind `isFeatureEnabled('auth.wallet_connect')`; seed that flag enabled
-- [ ] Never re-prompt SIWS on reload — cookie is authoritative; wallet's own reconnect state is cosmetic only
+- [x] Add `SIWS_DOMAIN` to `.env.example`; never derive domain from request headers
+- [x] Migration: `users`, `wallets`, `sessions`, `siws_challenges`, `events` tables
+- [x] Implement `recordEvent()` — the single write path for the behavioral event log (per `observability-stack.md`: same Postgres, `jsonb` payload, distinct from pino/Sentry)
+- [x] Implement nonce issuance: build `SolanaSignInInput`, persist keyed by nonce, 5-min TTL, `consumed_at NULL`
+- [x] Implement verification: `verifySignIn()` for signature+field match, then explicitly check (a) nonce exists and `consumed_at IS NULL`, (b) `now()` within `[issuedAt, expirationTime]`, (c) stored `domain` equals `SIWS_DOMAIN` — reject and fail closed on any single failure, mark nonce consumed only on success, in the same transaction as the session insert (so a crash between "mark consumed" and "create session" can't leave a consumed-but-unauthenticated state)
+- [x] Upsert `users`/`wallets` (custody = `external`), create `sessions` row, set cookie, `recordEvent('auth.session_created', ...)`
+- [x] Implement fallback path for wallets without `solana:signIn` (`connect()` + `signMessage()` + manual `verifyMessageSignature`), with a visible error state for wallets that reject arbitrary signing (e.g. some Ledger firmware) instead of hanging
+- [x] Client: wallet provider wrapper, connect page, account-switch watcher that force-clears session on mismatch
+- [x] Gate `/api/auth/nonce` behind `isFeatureEnabled('auth.wallet_connect')`; seed that flag enabled
+- [x] Never re-prompt SIWS on reload — cookie is authoritative; wallet's own reconnect state is cosmetic only
 
 **Tests:**
 
@@ -187,21 +187,21 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 
 **Verification:**
 
-- [ ] `pnpm test` passes, including all five negative cases in the SIWS test above
+- [x] `pnpm test` passes, including all five negative cases in the SIWS test above
 - [ ] Manual: connect a real Phantom (or Solflare) wallet in a browser, confirm single-prompt flow, reload page without re-prompting, confirm switching the wallet's active account forces re-auth
 - [ ] Manual: flip `auth.wallet_connect` flag off, confirm connect attempts fail closed with a clear message
 
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes above ticked in the plan file
-- [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
-- [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase (flag as security-critical review)
+- [x] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
+- [x] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
+- [x] Code-reviewer agent has verified this phase (flag as security-critical review)
 - [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
+- [x] Tests for this phase written and passing
 - [ ] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: wallet connect via verified SIWS`
+- [x] Changes committed: `feat: wallet connect via verified SIWS`
 - [ ] Phase marked complete
 
 ---
