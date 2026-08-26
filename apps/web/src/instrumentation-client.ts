@@ -10,7 +10,7 @@
 const dsn = process.env.NEXT_PUBLIC_SENTRY_DSN;
 
 if (dsn) {
-  void import('./server/observability/error-tracking').then(({ initErrorTracking }) => {
+  void import('./observability/error-tracking').then(({ initErrorTracking }) => {
     initErrorTracking('browser');
   });
 }

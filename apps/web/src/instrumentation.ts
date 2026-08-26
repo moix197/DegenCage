@@ -1,4 +1,4 @@
-import { initErrorTracking, onRequestError } from './server/observability/error-tracking';
+import { initErrorTracking, onRequestError } from './observability/error-tracking';
 
 /**
  * Next.js runs this once per server runtime, before any request is served — the only

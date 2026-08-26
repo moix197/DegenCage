@@ -2,8 +2,8 @@ import { count, eq } from 'drizzle-orm';
 
 import { getDb } from '../db/client';
 import { featureFlags, type FeatureFlagRow } from '../db/schema';
-import { captureError } from '../observability/error-tracking';
-import { logger } from '../observability/logger';
+import { captureError } from '../../observability/error-tracking';
+import { logger } from '../../observability/logger';
 
 /**
  * The one kill-switch read path. Every gated feature calls `isFeatureEnabled`;

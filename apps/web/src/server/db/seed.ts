@@ -5,8 +5,8 @@ import {
   captureError,
   flushErrorTracking,
   initErrorTracking,
-} from '../observability/error-tracking';
-import { logger } from '../observability/logger';
+} from '../../observability/error-tracking';
+import { logger } from '../../observability/logger';
 
 /**
  * Idempotent flag seed — `pnpm db:seed` from the repo root.

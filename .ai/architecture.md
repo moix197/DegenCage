@@ -11,9 +11,10 @@ rules that keep dependencies pointing one direction.
 ```
 apps/web        Next.js App Router — UI + route handlers (Vercel), output: 'standalone'
   src/app/                   routes and pages — entry points only, no business logic
+  src/observability/         logger + captureError — the only pino/Sentry importers;
+                             shared by server and browser, so not under src/server/
   src/server/db/             drizzle schema, migrations, seed, the one pooled getDb()
   src/server/flags/          isFeatureEnabled() — fail-closed kill switches
-  src/server/observability/  logger + captureError — the only pino/Sentry importers
 packages/rules  the rule engine: pure, I/O-free, the product IP
 
 later, only when the need is real:

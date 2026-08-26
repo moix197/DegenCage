@@ -39,15 +39,15 @@ All commands run from the **repo root**; they inject the root `.env` via `dotenv
 
 Later phases add their vars to `.env.example` as they introduce them.
 
-## Server-side entry points
+## Entry points
 
 - `src/server/db/client.ts` — `getDb()`, the only Postgres handle.
 - `src/server/flags/feature-flags.ts` — `isFeatureEnabled(key, ctx?)`. Every gated
   feature calls this; it fails closed on an unknown key, a disabled row, an out-of-scope
   user, or a database error. Add new flags to `src/server/db/seed.ts` in the same change
   as the feature they guard.
-- `src/server/observability/logger.ts` — `logger`. Import `pino` nowhere else.
-- `src/server/observability/error-tracking.ts` — `captureError`, plus the
+- `src/observability/logger.ts` — `logger`. Import `pino` nowhere else.
+- `src/observability/error-tracking.ts` — `captureError`, plus the
   `initErrorTracking` / `onRequestError` hooks that `src/instrumentation.ts` (server,
   edge) and `src/instrumentation-client.ts` (browser) delegate to. Import
   `@sentry/nextjs` nowhere else. With no DSN, Sentry stays uninitialised on purpose and

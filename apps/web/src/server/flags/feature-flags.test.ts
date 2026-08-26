@@ -13,7 +13,7 @@ const { selectMock, captureErrorMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('../db/client', () => ({ getDb: () => ({ select: selectMock }) }));
-vi.mock('../observability/error-tracking', () => ({ captureError: captureErrorMock }));
+vi.mock('../../observability/error-tracking', () => ({ captureError: captureErrorMock }));
 
 function row(overrides: Partial<FeatureFlagRow> = {}): FeatureFlagRow {
   return {

@@ -13,7 +13,7 @@ anywhere real.
 | `@degencage/rules` | The rule engine — pure, I/O-free, the product IP | `packages/rules` | [monorepo-package-shape](decisions/monorepo-package-shape.md) |
 | db | Drizzle schema, migrations, and the one pooled Postgres handle (`getDb()`) | `apps/web/src/server/db` | [migration-and-test-tooling](decisions/migration-and-test-tooling.md), [single-source-of-truth-database](decisions/single-source-of-truth-database.md) |
 | flags | `isFeatureEnabled()` — the single fail-closed kill-switch read path | `apps/web/src/server/flags` | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
-| observability | `logger` + `captureError` — the only import points for pino and Sentry | `apps/web/src/server/observability` | [observability-stack](decisions/observability-stack.md) |
+| observability | `logger` + `captureError` — the only import points for pino and Sentry | `apps/web/src/observability` | [observability-stack](decisions/observability-stack.md) |
 
 > Add a row when a module lands. Don't pre-populate rows for paths that don't exist.
 
