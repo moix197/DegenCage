@@ -51,7 +51,8 @@ Later phases add their vars to `.env.example` as they introduce them.
   `initErrorTracking` / `onRequestError` hooks that `src/instrumentation.ts` (server,
   edge) and `src/instrumentation-client.ts` (browser) delegate to. Import
   `@sentry/nextjs` nowhere else. With no DSN, Sentry stays uninitialised on purpose and
-  says so once at startup; `captureError` still logs.
+  says so once at startup; `captureError` still logs. A script that calls `process.exit`
+  must `await flushErrorTracking()` first, or its queued report dies with the process.
 
 ## Why `node_modules` is hoisted
 

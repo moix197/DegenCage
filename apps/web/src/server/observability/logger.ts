@@ -24,14 +24,24 @@ export interface AppLogger {
   child(fields: LogFields): AppLogger;
 }
 
-/** Field names whose value is never safe to log, wherever they sit in a payload. */
+/**
+ * Field names whose value is never safe to log, wherever they sit in a payload.
+ *
+ * Every name here has to be credential-shaped *on its own*: redaction is silent, and the
+ * event trail is the product, so an over-matching name destroys audit data without
+ * anyone noticing. Deliberately absent is a bare `token` — in a Solana app that is an SPL
+ * token symbol or mint (`{ trade: { token: 'BONK' } }`), not a credential. Credentials
+ * say which kind of token they are.
+ */
 const CREDENTIAL_FIELDS = [
   'databaseUrl',
   'password',
   'secret',
-  'token',
+  'authToken',
+  'bearerToken',
   'accessToken',
   'refreshToken',
+  'apiToken',
   'apiKey',
   'privateKey',
   'cookie',

@@ -67,5 +67,16 @@ export function captureError(error: unknown, fields: LogFields = {}): void {
   Sentry.captureException(error, { extra: fields });
 }
 
+/**
+ * `captureError` only queues the event; the transport sends it asynchronously. A short-lived
+ * process (a script, a job) must await this before exiting or the report is dropped.
+ * Long-running servers never need it — Sentry drains on its own.
+ *
+ * Resolves `false` if the queue did not drain within `timeoutMs`; with no DSN it is a no-op.
+ */
+export function flushErrorTracking(timeoutMs = 2_000): Promise<boolean> {
+  return Sentry.flush(timeoutMs);
+}
+
 /** Next.js' server-side request-error hook, re-exported from `src/instrumentation.ts`. */
 export const onRequestError = Sentry.captureRequestError;

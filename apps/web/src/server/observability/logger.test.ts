@@ -67,18 +67,31 @@ describe('logger', () => {
     const { logger, lines } = captureLogger();
 
     logger.info('outbound call', {
-      jupiter: { token: 'jup-secret' },
+      jupiter: { apiToken: 'jup-secret' },
       request: { headers: { authorization: 'Bearer abc' } },
       db: { config: { connection: { password: 'hunter2' } } },
       mint: 'So11111111111111111111111111111111111111112',
     });
 
     const line = lines[0] as Record<string, Record<string, Record<string, never>>>;
-    expect(line['jupiter']?.['token']).toBe('[redacted]');
+    expect(line['jupiter']?.['apiToken']).toBe('[redacted]');
     expect(line['request']?.['headers']?.['authorization']).toBe('[redacted]');
     expect(line['db']?.['config']?.['connection']?.['password']).toBe('[redacted]');
     // Non-credential fields still come through: redaction is targeted, not blanket.
     expect(line['mint']).toBe('So11111111111111111111111111111111111111112');
+  });
+
+  it('keeps a nested `token` field carrying an SPL token symbol unredacted', () => {
+    const { logger, lines } = captureLogger();
+
+    logger.info('trade blocked', {
+      trade: { token: 'BONK', authToken: 'session-secret' },
+    });
+
+    const line = lines[0] as Record<string, Record<string, unknown>>;
+    // The audit trail is the product: a token symbol is the whole point of the event.
+    expect(line['trade']?.['token']).toBe('BONK');
+    expect(line['trade']?.['authToken']).toBe('[redacted]');
   });
 
   it('drops lines below the configured level', () => {

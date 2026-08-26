@@ -1,7 +1,11 @@
 import { getDb } from './client';
 import { featureFlags } from './schema';
 import { HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
-import { captureError, initErrorTracking } from '../observability/error-tracking';
+import {
+  captureError,
+  flushErrorTracking,
+  initErrorTracking,
+} from '../observability/error-tracking';
 import { logger } from '../observability/logger';
 
 /**
@@ -41,6 +45,8 @@ async function main(): Promise<never> {
     await seedFeatureFlags();
   } catch (error) {
     captureError(error, { script: 'db:seed' });
+    // `process.exit` kills the transport mid-flight, so the report has to be drained first.
+    await flushErrorTracking();
     process.exit(1);
   }
 

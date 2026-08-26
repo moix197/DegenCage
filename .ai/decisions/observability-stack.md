@@ -64,5 +64,22 @@ standing rule we knowingly violate.
   `error-tracking.ts`'s `initErrorTracking(runtime)`, keeping `@sentry/nextjs` to exactly
   one import site. Without a DSN, Sentry stays uninitialised and the wrapper emits one
   startup warning — a no-op that is visible rather than silent.
+- **The browser SDK loads behind a DSN gate, via a dynamic `import()`.**
+  `src/instrumentation-client.ts` reads `NEXT_PUBLIC_SENTRY_DSN` — the browser bundle
+  cannot see the server-only `SENTRY_DSN` — and only then `import()`s the wrapper. A
+  static import pulls `@sentry/nextjs`'s browser build into first-load JS for every
+  visitor: **103 kB → 184 kB (~81 kB)**, paid on Phase 0's single static page even with
+  Sentry switched off. The gate keeps the default build at 103 kB and costs nothing when
+  the DSN is set. **Consequence:** `NEXT_PUBLIC_*` is inlined at build time, so turning
+  browser reporting on or off requires a rebuild, not a restart — unlike `SENTRY_DSN`,
+  which the server reads at startup. That asymmetry is the price of the size saving.
+- **Short-lived processes must flush before exiting.** `captureError` only queues the
+  event; `process.exit` kills the transport mid-flight, so a script's error would never
+  reach Sentry. `error-tracking.ts` exports `flushErrorTracking(timeoutMs)` for that, and
+  `src/server/db/seed.ts` awaits it in its catch. Long-running servers do not need it.
 - A correlation id (the trade-intent id) appears on every log line and event belonging to
   one user action.
+- **Redaction names must be credential-shaped on their own.** The logger blanks a fixed
+  field-name list at every nesting level, and redaction is silent — so an over-matching
+  name deletes audit data invisibly. A bare `token` is excluded on purpose: in a Solana
+  app that is an SPL symbol or mint, and the trade events Phase 5 reads are built from it.
