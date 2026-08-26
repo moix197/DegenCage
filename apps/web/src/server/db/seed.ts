@@ -1,6 +1,7 @@
 import { getDb } from './client';
 import { featureFlags } from './schema';
 import { HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
+import { captureError, initErrorTracking } from '../observability/error-tracking';
 import { logger } from '../observability/logger';
 
 /**
@@ -29,5 +30,21 @@ async function seedFeatureFlags(): Promise<void> {
   logger.info('feature flags seeded', { seeded: SEED_FLAGS.map((flag) => flag.key) });
 }
 
-await seedFeatureFlags();
-process.exit(0);
+/**
+ * The script runs outside Next.js, so it initialises error tracking itself; a failed seed
+ * must surface as a reported error and a non-zero exit, never a raw unhandled rejection.
+ */
+async function main(): Promise<never> {
+  initErrorTracking('nodejs');
+
+  try {
+    await seedFeatureFlags();
+  } catch (error) {
+    captureError(error, { script: 'db:seed' });
+    process.exit(1);
+  }
+
+  process.exit(0);
+}
+
+await main();

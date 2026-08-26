@@ -58,5 +58,11 @@ standing rule we knowingly violate.
 - **All logging goes through one internal module.** No scattered `console.log`, no vendor
   SDK imported at call sites. That wrapper is what makes adding OTel later a one-file
   change instead of a sweep.
+- **Sentry's *initialisation* lives in that same wrapper, not in the Next.js
+  instrumentation files.** `apps/web/src/instrumentation.ts` (server, edge) and
+  `src/instrumentation-client.ts` (browser) only call
+  `error-tracking.ts`'s `initErrorTracking(runtime)`, keeping `@sentry/nextjs` to exactly
+  one import site. Without a DSN, Sentry stays uninitialised and the wrapper emits one
+  startup warning — a no-op that is visible rather than silent.
 - A correlation id (the trade-intent id) appears on every log line and event belonging to
   one user action.

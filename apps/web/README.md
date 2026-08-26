@@ -33,7 +33,8 @@ All commands run from the **repo root**; they inject the root `.env` via `dotenv
 | --- | -------- | ------- |
 | `DATABASE_URL` | yes | drizzle-kit `generate`/`migrate` — **direct** Neon connection |
 | `DATABASE_URL_POOLED` | yes | the app at runtime — **pooled** connection; `getDb()` throws without it |
-| `SENTRY_DSN` | no | unset means Sentry no-ops; errors are still logged |
+| `SENTRY_DSN` | no | server + edge Sentry init; unset logs one startup warning, errors are logged only |
+| `NEXT_PUBLIC_SENTRY_DSN` | no | browser Sentry init; inlined at build time, so setting it needs a rebuild. Unset means the ~80 kB browser SDK is never fetched |
 | `LOG_LEVEL` | no | pino level, defaults to `info` |
 
 Later phases add their vars to `.env.example` as they introduce them.
@@ -46,8 +47,11 @@ Later phases add their vars to `.env.example` as they introduce them.
   user, or a database error. Add new flags to `src/server/db/seed.ts` in the same change
   as the feature they guard.
 - `src/server/observability/logger.ts` — `logger`. Import `pino` nowhere else.
-- `src/server/observability/error-tracking.ts` — `captureError`. Import
-  `@sentry/nextjs` nowhere else.
+- `src/server/observability/error-tracking.ts` — `captureError`, plus the
+  `initErrorTracking` / `onRequestError` hooks that `src/instrumentation.ts` (server,
+  edge) and `src/instrumentation-client.ts` (browser) delegate to. Import
+  `@sentry/nextjs` nowhere else. With no DSN, Sentry stays uninitialised on purpose and
+  says so once at startup; `captureError` still logs.
 
 ## Why `node_modules` is hoisted
 

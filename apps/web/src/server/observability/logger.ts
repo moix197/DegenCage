@@ -24,13 +24,41 @@ export interface AppLogger {
   child(fields: LogFields): AppLogger;
 }
 
+/** Field names whose value is never safe to log, wherever they sit in a payload. */
+const CREDENTIAL_FIELDS = [
+  'databaseUrl',
+  'password',
+  'secret',
+  'token',
+  'accessToken',
+  'refreshToken',
+  'apiKey',
+  'privateKey',
+  'cookie',
+  'authorization',
+] as const;
+
+/**
+ * pino's redactor (fast-redact) has no recursive wildcard, so every nesting level is
+ * spelled out. Four covers the depth a log payload realistically reaches — e.g.
+ * `{ request: { headers: { authorization } } }`.
+ */
+const REDACT_DEPTH = 4;
+
+function credentialRedactPaths(): string[] {
+  return Array.from({ length: REDACT_DEPTH }, (_, depth) => '*.'.repeat(depth)).flatMap((prefix) =>
+    CREDENTIAL_FIELDS.map((field) => `${prefix}${field}`),
+  );
+}
+
 function baseOptions(): LoggerOptions {
   return {
     level: process.env.LOG_LEVEL ?? 'info',
     base: { service: 'degencage-web' },
-    // Money-adjacent app: never let a URL with credentials or a cookie reach a log line.
+    // Money-adjacent app: never let a URL with credentials or a cookie reach a log line,
+    // including when it arrives nested inside a context object rather than top level.
     redact: {
-      paths: ['databaseUrl', 'password', 'secret', 'token', 'cookie', '*.authorization'],
+      paths: credentialRedactPaths(),
       censor: '[redacted]',
     },
   };

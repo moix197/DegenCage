@@ -63,6 +63,24 @@ describe('logger', () => {
     expect(lines[0]?.['databaseUrl']).toBe('[redacted]');
   });
 
+  it('redacts credential-shaped fields nested inside a context object', () => {
+    const { logger, lines } = captureLogger();
+
+    logger.info('outbound call', {
+      jupiter: { token: 'jup-secret' },
+      request: { headers: { authorization: 'Bearer abc' } },
+      db: { config: { connection: { password: 'hunter2' } } },
+      mint: 'So11111111111111111111111111111111111111112',
+    });
+
+    const line = lines[0] as Record<string, Record<string, Record<string, never>>>;
+    expect(line['jupiter']?.['token']).toBe('[redacted]');
+    expect(line['request']?.['headers']?.['authorization']).toBe('[redacted]');
+    expect(line['db']?.['config']?.['connection']?.['password']).toBe('[redacted]');
+    // Non-credential fields still come through: redaction is targeted, not blanket.
+    expect(line['mint']).toBe('So11111111111111111111111111111111111111112');
+  });
+
   it('drops lines below the configured level', () => {
     const { logger, lines } = captureLogger();
 
