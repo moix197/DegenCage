@@ -103,16 +103,16 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 
 **Steps:**
 
-- [ ] Init pnpm workspace, root configs, shared `tsconfig.base.json` (strict mode on)
-- [ ] Scaffold `apps/web` with Next.js App Router, set `output: 'standalone'`, confirm route handlers default to Node runtime
-- [ ] Provision a Neon Postgres project (or confirm the user already has one), wire `DATABASE_URL` through `apps/web/src/server/db/client.ts` using Neon's serverless driver (pooled, not direct connection)
-- [ ] Choose and install Drizzle ORM + drizzle-kit; write the `feature_flags` schema; generate and apply the first migration
-- [ ] Implement `isFeatureEnabled()` fail-closed helper; seed one `feature_flags` row via a seed script for the home page to read
-- [ ] Implement the pino logger wrapper and the Sentry error-tracking wrapper as the only two observability entry points
-- [ ] Scaffold `packages/rules` with one placeholder pure function (e.g. `identityDecision()`) and a passing test, proving the package has zero DB/fetch/`next/*` imports
-- [ ] Wire root `pnpm test` to run Vitest across both workspaces
-- [ ] Home page (`apps/web/src/app/page.tsx`) reads the seeded flag through the DB client and renders connection + flag status
-- [ ] Add `.env.example` documenting `DATABASE_URL` and `SENTRY_DSN`
+- [x] Init pnpm workspace, root configs, shared `tsconfig.base.json` (strict mode on)
+- [x] Scaffold `apps/web` with Next.js App Router, set `output: 'standalone'`, confirm route handlers default to Node runtime
+- [x] Provision a Neon Postgres project (or confirm the user already has one), wire `DATABASE_URL` through `apps/web/src/server/db/client.ts` using Neon's serverless driver (pooled, not direct connection)
+- [x] Choose and install Drizzle ORM + drizzle-kit; write the `feature_flags` schema; generate and apply the first migration
+- [x] Implement `isFeatureEnabled()` fail-closed helper; seed one `feature_flags` row via a seed script for the home page to read
+- [x] Implement the pino logger wrapper and the Sentry error-tracking wrapper as the only two observability entry points
+- [x] Scaffold `packages/rules` with one placeholder pure function (e.g. `identityDecision()`) and a passing test, proving the package has zero DB/fetch/`next/*` imports
+- [x] Wire root `pnpm test` to run Vitest across both workspaces
+- [x] Home page (`apps/web/src/app/page.tsx`) reads the seeded flag through the DB client and renders connection + flag status
+- [x] Add `.env.example` documenting `DATABASE_URL` and `SENTRY_DSN`
 
 **Tests:**
 
@@ -124,21 +124,21 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 
 **Verification:**
 
-- [ ] `pnpm test` passes for both workspaces
-- [ ] `pnpm dev` → `/` shows "DB: connected" and the seeded flag value
-- [ ] `pnpm build` succeeds with `output: 'standalone'`
+- [x] `pnpm test` passes for both workspaces
+- [x] `pnpm dev` → `/` shows "DB: connected" and the seeded flag value
+- [x] `pnpm build` succeeds with `output: 'standalone'`
 
 **Phase review:**
 
-- [ ] All Steps and Verification checkboxes above ticked in the plan file
+- [x] All Steps and Verification checkboxes above ticked in the plan file
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase
+- [x] Code-reviewer agent has verified this phase
 - [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
-- [ ] Documentation updated (see Documentation section)
+- [x] Tests for this phase written and passing
+- [x] Documentation updated (see Documentation section)
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `chore: scaffold pnpm monorepo, Postgres, and observability spine`
+- [x] Changes committed: `chore: scaffold pnpm monorepo, Postgres, and observability spine`
 - [ ] Phase marked complete
 
 ---
