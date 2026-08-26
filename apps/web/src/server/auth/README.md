@@ -110,11 +110,15 @@ entitled to ask for, never invent one into the audit trail.
   `siws_challenges` — the rows we already write are their own counter. In-process memory
   would be per-instance, and the thing being protected *is* the shared table. No Redis:
   that arrives with the Phase 4 worker.
-- **Keyed by `sha256(first X-Forwarded-For hop)`** (falling back to `x-real-ip`),
-  truncated, stored in `client_key`. A raw IP is personal data with no purpose here — the
-  limit only asks "same caller as a moment ago". A request with no forwarded address goes
-  in one shared `unidentified` bucket; a per-caller allowance for callers we cannot tell
-  apart would be no limit at all.
+- **Keyed by `sha256(first forwarded hop)`** — `x-vercel-forwarded-for`, falling back to
+  `x-forwarded-for` then `x-real-ip` — truncated, stored in `client_key`. A raw IP is
+  personal data with no purpose here; the limit only asks "same caller as a moment ago".
+  A request with no forwarded address goes in one shared `unidentified` bucket; a
+  per-caller allowance for callers we cannot tell apart would be no limit at all.
+  **None of those headers is verified**, so this limit is only as good as the proxy in
+  front of the process — a deployment trust assumption, recorded in
+  [`.ai/decisions/rate-limit-forwarded-header-trust.md`](../../../../../.ai/decisions/rate-limit-forwarded-header-trust.md).
+  Read it before changing where this deploys.
 - **Enforced inside `issueSignInChallenge()`, not in the route,** so the check and the
   write it guards cannot drift apart. The route only translates
   `ChallengeRateLimited` into `429` + `Retry-After`.
