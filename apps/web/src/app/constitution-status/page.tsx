@@ -142,10 +142,17 @@ export default async function ConstitutionStatusPage() {
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Constitution status</h1>
 
       {allowance ? (
-        <p>
-          Today&apos;s notional: {formatUsd(allowance.totalUsd)} of ${allowance.maxUsd}
-          {!allowance.withinLimit ? ' — over limit' : ''}
-        </p>
+        allowance.totalUsd === null ? (
+          <p>
+            Today&apos;s notional: unknown of ${allowance.maxUsd} — some trades in the window could not be priced, so the
+            limit status is unknown (never assumed clean, never assumed over).
+          </p>
+        ) : (
+          <p>
+            Today&apos;s notional: {formatUsd(allowance.totalUsd)} of ${allowance.maxUsd}
+            {!allowance.withinLimit ? ' — over limit' : ''}
+          </p>
+        )
       ) : (
         <p>No daily notional limit set on your active constitution.</p>
       )}

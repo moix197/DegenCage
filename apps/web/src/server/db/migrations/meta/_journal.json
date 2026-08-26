@@ -50,6 +50,13 @@
       "when": 1787783275436,
       "tag": "0006_silent_newton_destine",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1787784181388,
+      "tag": "0007_spotty_sunfire",
+      "breakpoints": true
     }
   ]
 }

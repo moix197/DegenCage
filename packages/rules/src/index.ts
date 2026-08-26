@@ -30,6 +30,7 @@ export {
   addUsd,
   compareUsd,
   evaluateTrade,
+  sumTradeUsd,
   type Decision,
   type EvaluableTrade,
   type LimitEvaluation,

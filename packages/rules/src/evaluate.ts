@@ -88,8 +88,12 @@ function unevaluable(limit: LimitRule, reason: string): LimitEvaluation {
  * Sums `trades`' `usdValue`. Returns `null` (never `0`) the moment any trade in the window
  * is unpriced — a limit cannot be honestly compared against a total that is known to be an
  * undercount, and CLAUDE.md forbids ever showing a false "$0 spent today".
+ *
+ * Exported and reused as-is by `server/rules/rolling-allowance.ts`'s `sumWindowedUsd` — the
+ * same "sum usd_value, null propagates" logic, needed both here (a limit's prior-window
+ * total) and there (the status page's live total). One implementation, not two.
  */
-function sumPriorUsd(trades: EvaluableTrade[]): string | null {
+export function sumTradeUsd(trades: EvaluableTrade[]): string | null {
   let total = '0';
 
   for (const trade of trades) {
@@ -123,7 +127,7 @@ function evaluateDailyNotional(
     return unevaluable(limit, 'trade_unpriced');
   }
 
-  const priorUsd = sumPriorUsd(withinWindow(windowedHistory, limit.windowHours, trade.occurredAt));
+  const priorUsd = sumTradeUsd(withinWindow(windowedHistory, limit.windowHours, trade.occurredAt));
 
   if (priorUsd === null) {
     return unevaluable(limit, 'history_contains_unpriced_trade');

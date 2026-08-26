@@ -20,7 +20,7 @@ export const LST_MINTS: ReadonlySet<string> = new Set([
   'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn', // jitoSOL (Jito)
   'bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1', // bSOL (BlazeStake)
   '7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj', // stSOL (Lido)
-  'Jupi75mSAcm5DxCzBBdVL3E5W7VuY5aUp6Kbg1EFYuq', // JupSOL (Jupiter)
+  'jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v', // JupSOL (Jupiter) — verified against docs.jup.ag/user-docs/earn/stake-sol/jupsol
   '5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm', // INF (Sanctum infinity LST)
 ]);
 

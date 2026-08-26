@@ -6,7 +6,7 @@ import { recordEvent, type DatabaseExecutor } from '../../observability/events';
 import { logger } from '../../observability/logger';
 import { resolveSession } from '../auth/session';
 import { getDb } from '../db/client';
-import { constitutions, trades, wallets, type NewTradeRow, type ReconciliationState } from '../db/schema';
+import { constitutions, trades, wallets, type NewTradeRow } from '../db/schema';
 import { deriveSwapFromTransaction, type DerivedSwap } from './derive-swaps';
 import { getTransactionsForAddress, type HeliusTransaction } from './helius-client';
 import { priceTrade } from '../pricing/price-trade';
@@ -17,10 +17,13 @@ import { loadWindowedTrades } from '../rules/rolling-allowance';
  * price (SOL/stablecoin leg) → evaluate (`daily_notional_usd` only) → persist, one page at
  * a time, each page in its own row-locked transaction.
  *
- * First connect (`reconciled_through_slot IS NULL`) pulls the 90-day baseline
- * (decision 9) and tags every row `is_baseline: true`; those rows are never passed to
- * `evaluateTrade()` and never emit `trade.excluded`/`rule.decision_recorded` — a private
- * behavioral record, not live enforcement. Subsequent runs are incremental from the cursor.
+ * First connect pulls the 90-day baseline (decision 9) and tags every row `is_baseline:
+ * true`; those rows are never passed to `evaluateTrade()` and never emit
+ * `trade.excluded`/`rule.decision_recorded` — a private behavioral record, not live
+ * enforcement. Subsequent runs are incremental from the cursor.
+ *
+ * "Is this the baseline pull" is decided by `wallets.baseline_completed_at`, not by
+ * `reconciliation_state` or the cursor — see `loadWalletReconciliationInfo` for why.
  *
  * Wallet identity always comes from `resolveSession()` — no function below this line takes
  * a wallet id as a parameter from anything a caller supplies.
@@ -61,12 +64,20 @@ function chunk<T>(items: T[], size: number): T[][] {
 
 interface WalletReconciliationInfo {
   reconciledThroughSlot: number | null;
-  reconciliationState: ReconciliationState;
+  baselineCompletedAt: Date | null;
 }
 
+/**
+ * `reconciliation_state` alone cannot answer "has the 90-day baseline ever finished":
+ * `in_progress`/`failed` are both reachable mid-baseline, and a failed first run must still
+ * be retried *as* a baseline pull — otherwise a Helius outage on first connect (the common
+ * failure path) silently reclassifies the backfill as live on retry, feeding pre-commitment
+ * history straight into `evaluateTrade()`. `baseline_completed_at` is written exactly once,
+ * only on a successful baseline completion, and is the sole source of truth for `isBaseline`.
+ */
 async function loadWalletReconciliationInfo(walletId: string): Promise<WalletReconciliationInfo> {
   const rows = await getDb()
-    .select({ reconciledThroughSlot: wallets.reconciledThroughSlot, reconciliationState: wallets.reconciliationState })
+    .select({ reconciledThroughSlot: wallets.reconciledThroughSlot, baselineCompletedAt: wallets.baselineCompletedAt })
     .from(wallets)
     .where(eq(wallets.id, walletId))
     .limit(1);
@@ -93,6 +104,11 @@ function maxWindowHours(constitution: Constitution): number {
 
 async function setReconciliationState(walletId: string, state: 'in_progress' | 'current' | 'failed'): Promise<void> {
   await getDb().update(wallets).set({ reconciliationState: state }).where(eq(wallets.id, walletId));
+}
+
+/** Marks the baseline as done, once, on a successful baseline run only — never on a live run and never on failure. */
+async function markBaselineCompleted(walletId: string, completedAt: Date): Promise<void> {
+  await getDb().update(wallets).set({ baselineCompletedAt: completedAt }).where(eq(wallets.id, walletId));
 }
 
 async function failReconciliation(walletId: string, userId: string, correlationId: string, error: unknown): Promise<void> {
@@ -131,16 +147,53 @@ function toNewTradeRow(walletId: string, swap: DerivedSwap, priced: { usdValue: 
   };
 }
 
+interface PricedSwap {
+  swap: DerivedSwap;
+  usdValue: string | null;
+  priceSource: string | null;
+}
+
 /**
- * Persists one derived swap and, for a live (non-baseline) real trade, evaluates and
+ * Prices every real (non-excluded) swap in `batch` — the slow, external-HTTP part
+ * (`priceTrade` calls Binance, with its own timeout) — deliberately *outside* any database
+ * transaction, so a row lock is never held across a network round trip. `persistBatch`
+ * consumes the result and does only DB work under the lock.
+ */
+async function priceBatch(batch: DerivedSwap[]): Promise<PricedSwap[]> {
+  const priced: PricedSwap[] = [];
+
+  for (const swap of batch) {
+    if (swap.excludedReason !== null) {
+      priced.push({ swap, usdValue: null, priceSource: null });
+      continue;
+    }
+
+    const result = await priceTrade({
+      soldMint: swap.soldMint!,
+      boughtMint: swap.boughtMint!,
+      soldAmountBaseUnits: swap.soldAmountBaseUnits!,
+      boughtAmountBaseUnits: swap.boughtAmountBaseUnits!,
+      soldDecimals: swap.soldDecimals!,
+      boughtDecimals: swap.boughtDecimals!,
+      occurredAt: swap.occurredAt,
+    });
+
+    priced.push({ swap, usdValue: result.usdValue, priceSource: result.priceSource });
+  }
+
+  return priced;
+}
+
+/**
+ * Persists one already-priced swap and, for a live (non-baseline) real trade, evaluates and
  * records its decision — inside `tx`, so it commits atomically with everything else in
- * this page.
+ * this page. Pricing itself already happened in `priceBatch`, before `tx` was opened.
  *
  * The windowed history is read *before* this trade is inserted, so it can never include
- * itself (see `loadWindowedTrades`'s exclusive upper bound). `ON CONFLICT (signature) DO
- * NOTHING` returning no row means this exact trade was already persisted by an earlier or
- * concurrent run — skip both the exclusion event and re-evaluation so a re-run never
- * double-records anything.
+ * itself (see `loadWindowedTrades`'s exclusive upper bound). `ON CONFLICT (wallet_id,
+ * signature) DO NOTHING` returning no row means this exact trade was already persisted by
+ * an earlier or concurrent run — skip both the exclusion event and re-evaluation so a
+ * re-run never double-records anything.
  */
 async function persistOneSwap(
   tx: DatabaseExecutor,
@@ -148,21 +201,10 @@ async function persistOneSwap(
   constitution: Constitution | null,
   userId: string,
   correlationId: string,
-  swap: DerivedSwap,
+  priced: PricedSwap,
   isBaseline: boolean,
 ): Promise<{ tradePersisted: boolean; excludedPersisted: boolean }> {
-  const priced =
-    swap.excludedReason === null
-      ? await priceTrade({
-          soldMint: swap.soldMint!,
-          boughtMint: swap.boughtMint!,
-          soldAmountBaseUnits: swap.soldAmountBaseUnits!,
-          boughtAmountBaseUnits: swap.boughtAmountBaseUnits!,
-          soldDecimals: swap.soldDecimals!,
-          boughtDecimals: swap.boughtDecimals!,
-          occurredAt: swap.occurredAt,
-        })
-      : { usdValue: null, priceSource: null };
+  const { swap } = priced;
 
   const windowedHistory =
     !isBaseline && constitution && swap.excludedReason === null
@@ -172,7 +214,7 @@ async function persistOneSwap(
   const inserted = await tx
     .insert(trades)
     .values(toNewTradeRow(walletId, swap, priced, isBaseline))
-    .onConflictDoNothing()
+    .onConflictDoNothing({ target: [trades.walletId, trades.signature] })
     .returning({ id: trades.id });
 
   if (inserted.length === 0) {
@@ -223,13 +265,18 @@ interface BatchResult {
   highestSlot: number;
 }
 
-/** One row-locked transaction per batch — the row lock (`SELECT ... FOR UPDATE`) is what serializes concurrent reconciliation runs' writes against this wallet. */
+/**
+ * One row-locked transaction per already-priced batch — the row lock (`SELECT ... FOR
+ * UPDATE`) is what serializes concurrent reconciliation runs' writes against this wallet.
+ * Everything inside is DB-only (no `priceTrade` HTTP calls — those already happened in
+ * `priceBatch`), so the lock is held only as long as the actual writes take.
+ */
 async function persistBatch(
   walletId: string,
   constitution: Constitution | null,
   userId: string,
   correlationId: string,
-  batch: DerivedSwap[],
+  pricedBatch: PricedSwap[],
   isBaseline: boolean,
 ): Promise<BatchResult> {
   return getDb().transaction(async (tx) => {
@@ -238,13 +285,13 @@ async function persistBatch(
     let tradesPersisted = 0;
     let excludedPersisted = 0;
 
-    for (const swap of batch) {
-      const result = await persistOneSwap(tx, walletId, constitution, userId, correlationId, swap, isBaseline);
+    for (const priced of pricedBatch) {
+      const result = await persistOneSwap(tx, walletId, constitution, userId, correlationId, priced, isBaseline);
       tradesPersisted += result.tradePersisted ? 1 : 0;
       excludedPersisted += result.excludedPersisted ? 1 : 0;
     }
 
-    const highestSlot = Math.max(...batch.map((swap) => swap.slot));
+    const highestSlot = Math.max(...pricedBatch.map(({ swap }) => swap.slot));
 
     // GREATEST, not a blind SET: a concurrent run's batch may have already advanced the
     // cursor past this batch's own highest slot, and the cursor must never move backward.
@@ -265,10 +312,7 @@ async function runReconciliation(
 ): Promise<ReconcileResult> {
   const info = await loadWalletReconciliationInfo(walletId);
   const cursor = info.reconciledThroughSlot;
-  // First-ever run, decided by state, never by the cursor alone: a baseline run that finds
-  // zero transactions leaves the cursor null too, and re-deriving "is this the first run"
-  // from a still-null cursor on the *next* open would re-run the 90-day backfill forever.
-  const isBaseline = info.reconciliationState === 'never';
+  const isBaseline = info.baselineCompletedAt === null;
   const startedAt = new Date();
 
   await recordEvent({
@@ -310,7 +354,8 @@ async function runReconciliation(
 
   try {
     for (const batch of chunk(derivedInOrder, PERSIST_BATCH_SIZE)) {
-      const result = await persistBatch(walletId, constitution, userId, correlationId, batch, isBaseline);
+      const pricedBatch = await priceBatch(batch);
+      const result = await persistBatch(walletId, constitution, userId, correlationId, pricedBatch, isBaseline);
       tradesPersisted += result.tradesPersisted;
       excludedPersisted += result.excludedPersisted;
       reconciledThroughSlot = Math.max(reconciledThroughSlot ?? 0, result.highestSlot);
@@ -320,11 +365,17 @@ async function runReconciliation(
     throw error;
   }
 
+  const completedAt = new Date();
+
   await setReconciliationState(walletId, 'current');
+
+  if (isBaseline) {
+    await markBaselineCompleted(walletId, completedAt);
+  }
 
   await recordEvent({
     eventType: isBaseline ? 'wallet.backfill_completed' : 'wallet.reconciliation_completed',
-    occurredAt: new Date(),
+    occurredAt: completedAt,
     correlationId,
     userId,
     payload: { walletId, tradesPersisted, excludedPersisted },

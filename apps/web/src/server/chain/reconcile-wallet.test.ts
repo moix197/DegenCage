@@ -70,11 +70,6 @@ function derivedSwap(signature: string, slot: number, overrides: Record<string, 
   };
 }
 
-/**
- * A shared, mutable fake `wallets` row plus a signature-deduplicating `trades` table —
- * enough to exercise reconcile-wallet.ts's real logic (cursor-advance SQL, ON CONFLICT
- * dedup, row-lock acquisition per batch) without a real database.
- */
 /** Well past any test trade's `usdValue`, so evaluation resolves `allow` and `rule.decision_recorded` actually fires. */
 function activeConstitutionRow() {
   return {
@@ -83,14 +78,27 @@ function activeConstitutionRow() {
   };
 }
 
-function fakeDatabase(
-  initial: { reconciledThroughSlot: number | null; reconciliationState: string } = { reconciledThroughSlot: null, reconciliationState: 'never' },
-  { hasActiveConstitution = true }: { hasActiveConstitution?: boolean } = {},
-) {
+interface WalletFixture {
+  reconciledThroughSlot: number | null;
+  reconciliationState: string;
+  baselineCompletedAt: Date | null;
+}
+
+const NEVER_RECONCILED: WalletFixture = { reconciledThroughSlot: null, reconciliationState: 'never', baselineCompletedAt: null };
+const ALREADY_BASELINED: WalletFixture = { reconciledThroughSlot: 50, reconciliationState: 'current', baselineCompletedAt: new Date('2026-08-01T00:00:00Z') };
+
+/**
+ * A shared, mutable fake `wallets` row plus a signature-deduplicating `trades` table —
+ * enough to exercise reconcile-wallet.ts's real logic (cursor-advance SQL, ON CONFLICT
+ * dedup, row-lock acquisition per batch, `baseline_completed_at` bookkeeping) without a
+ * real database.
+ */
+function fakeDatabase(initial: WalletFixture = NEVER_RECONCILED, { hasActiveConstitution = true }: { hasActiveConstitution?: boolean } = {}) {
   const wallet = { ...initial };
   const persistedSignatures = new Set<string>();
   const lockCalls: string[] = [];
   const cursorAdvanceSetCalls: unknown[] = [];
+  const conflictTargets: unknown[] = [];
 
   // `loadWalletReconciliationInfo` selects a *projection* (an object arg to `.select()`);
   // `loadActiveConstitution` selects the whole row (`.select()`, no arg) — that's the only
@@ -100,7 +108,7 @@ function fakeDatabase(
       where: () => ({
         limit: async () =>
           projection
-            ? [{ reconciledThroughSlot: wallet.reconciledThroughSlot, reconciliationState: wallet.reconciliationState }]
+            ? [{ reconciledThroughSlot: wallet.reconciledThroughSlot, baselineCompletedAt: wallet.baselineCompletedAt }]
             : hasActiveConstitution
               ? [activeConstitutionRow()]
               : [],
@@ -109,10 +117,13 @@ function fakeDatabase(
   }));
 
   updateMock.mockImplementation(() => ({
-    set: (values: { reconciliationState?: string }) => ({
+    set: (values: { reconciliationState?: string; baselineCompletedAt?: Date }) => ({
       where: async () => {
         if (values.reconciliationState) {
           wallet.reconciliationState = values.reconciliationState;
+        }
+        if (values.baselineCompletedAt) {
+          wallet.baselineCompletedAt = values.baselineCompletedAt;
         }
         return undefined;
       },
@@ -133,15 +144,18 @@ function fakeDatabase(
       }),
       insert: () => ({
         values: (row: { signature: string; slot: number }) => ({
-          onConflictDoNothing: () => ({
-            returning: async () => {
-              if (persistedSignatures.has(row.signature)) {
-                return [];
-              }
-              persistedSignatures.add(row.signature);
-              return [{ id: row.signature }];
-            },
-          }),
+          onConflictDoNothing: (target: unknown) => {
+            conflictTargets.push(target);
+            return {
+              returning: async () => {
+                if (persistedSignatures.has(row.signature)) {
+                  return [];
+                }
+                persistedSignatures.add(row.signature);
+                return [{ id: row.signature }];
+              },
+            };
+          },
         }),
       }),
       update: () => ({
@@ -155,7 +169,7 @@ function fakeDatabase(
 
   transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback(tx()));
 
-  return { wallet, persistedSignatures, lockCalls, cursorAdvanceSetCalls };
+  return { wallet, persistedSignatures, lockCalls, cursorAdvanceSetCalls, conflictTargets };
 }
 
 beforeEach(() => {
@@ -186,7 +200,7 @@ describe('reconcileWallet', () => {
   });
 
   it('tags trades is_baseline on first connect and never evaluates or excludes them as live', async () => {
-    fakeDatabase({ reconciledThroughSlot: null, reconciliationState: 'never' });
+    fakeDatabase(NEVER_RECONCILED);
     getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-a', 100)]);
 
     const result = await reconcileWallet('cid-3');
@@ -198,26 +212,67 @@ describe('reconcileWallet', () => {
     expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'wallet.backfill_completed' }));
   });
 
+  it('marks baseline_completed_at on a successful baseline run, and only then treats later runs as live', async () => {
+    const { wallet } = fakeDatabase(NEVER_RECONCILED);
+    getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-a', 100)]);
+
+    await reconcileWallet('cid-baseline-1');
+
+    expect(wallet.baselineCompletedAt).not.toBeNull();
+
+    const second = await reconcileWallet('cid-baseline-2');
+    expect(second.isBaseline).toBe(false);
+  });
+
   it('does not re-run the baseline forever when the first run finds zero transactions', async () => {
-    const { wallet } = fakeDatabase({ reconciledThroughSlot: null, reconciliationState: 'never' });
+    const { wallet } = fakeDatabase(NEVER_RECONCILED);
     getTransactionsForAddressMock.mockResolvedValue([]);
 
     const first = await reconcileWallet('cid-4a');
     expect(first.isBaseline).toBe(true);
     expect(wallet.reconciliationState).toBe('current');
+    expect(wallet.baselineCompletedAt).not.toBeNull();
 
-    // The cursor is still null (nothing was ever found), but state is no longer 'never'.
+    // The cursor is still null (nothing was ever found), but the baseline is marked done.
     const second = await reconcileWallet('cid-4b');
     expect(second.isBaseline).toBe(false);
   });
 
-  it('re-running over the same range does not double-insert — the unique signature constraint is honored', async () => {
-    const { persistedSignatures } = fakeDatabase({ reconciledThroughSlot: 50, reconciliationState: 'current' });
+  /**
+   * The BLOCKING regression: `reconciliation_state` alone cannot express "baseline
+   * finished" — a failed first run must still be retried as baseline. Before
+   * `baseline_completed_at`, a failed first connect (the common Helius-outage path) would
+   * have the *retry* see `reconciliation_state: 'failed'` and wrongly persist the 90-day
+   * backfill as live trades, feeding pre-commitment history into `evaluateTrade()`.
+   */
+  it('first run fails → second run still treats the pull as baseline and still emits no rule decisions', async () => {
+    const { wallet } = fakeDatabase(NEVER_RECONCILED);
+    getTransactionsForAddressMock.mockRejectedValueOnce(new Error('helius unavailable'));
+
+    await expect(reconcileWallet('cid-fail-1')).rejects.toThrow('helius unavailable');
+
+    expect(wallet.reconciliationState).toBe('failed');
+    expect(wallet.baselineCompletedAt).toBeNull();
+
+    getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-retry', 100)]);
+    const retry = await reconcileWallet('cid-fail-2');
+
+    expect(retry.isBaseline).toBe(true);
+    expect(recordEventMock).not.toHaveBeenCalledWith(expect.objectContaining({ eventType: 'rule.decision_recorded' }), expect.anything());
+    expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'wallet.backfill_started' }));
+    expect(wallet.baselineCompletedAt).not.toBeNull();
+  });
+
+  it('re-running over the same range does not double-insert — the (wallet_id, signature) constraint is honored', async () => {
+    const { persistedSignatures, conflictTargets } = fakeDatabase(ALREADY_BASELINED);
     getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-dup', 100)]);
 
     const firstRun = await reconcileWallet('cid-5a');
     expect(firstRun.tradesPersisted).toBe(1);
     expect(persistedSignatures.size).toBe(1);
+    // (walletId, signature) — a composite conflict target, not a single global-unique column.
+    const conflictOptions = conflictTargets[0] as { target: unknown[] };
+    expect(conflictOptions.target).toHaveLength(2);
 
     const secondRun = await reconcileWallet('cid-5b');
     expect(secondRun.tradesPersisted).toBe(0); // ON CONFLICT DO NOTHING — already there
@@ -225,7 +280,7 @@ describe('reconcileWallet', () => {
   });
 
   it('advances the cursor via GREATEST(...) so a concurrent run can never move it backward', async () => {
-    const { cursorAdvanceSetCalls } = fakeDatabase({ reconciledThroughSlot: 50, reconciliationState: 'current' });
+    const { cursorAdvanceSetCalls } = fakeDatabase(ALREADY_BASELINED);
     getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-cursor', 100)]);
 
     await reconcileWallet('cid-cursor');
@@ -238,7 +293,7 @@ describe('reconcileWallet', () => {
   });
 
   it("records trade.excluded, not rule.decision_recorded, for a live run's excluded trade", async () => {
-    fakeDatabase({ reconciledThroughSlot: 50, reconciliationState: 'current' });
+    fakeDatabase(ALREADY_BASELINED);
     getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-live', 100)]);
     deriveSwapFromTransactionMock.mockReturnValueOnce(
       derivedSwap('sig-live', 100, { excludedReason: 'pure_receive', soldMint: null, soldAmountBaseUnits: null, soldDecimals: null }),
@@ -255,13 +310,40 @@ describe('reconcileWallet', () => {
   });
 
   /**
+   * The row lock must cover only the DB writes, not `priceTrade`'s HTTP round trips.
+   * `transactionMock` is only ever invoked by `persistBatch`, *after* `priceBatch` has
+   * already awaited every `priceTrade` call for the batch — so if pricing happened while a
+   * transaction was already open, `priceTradeMock` would be called with `transactionMock`
+   * already having been invoked at least once for this batch. It never is: this test
+   * asserts pricing is fully done before the first transaction (and thus the first lock)
+   * for this batch opens.
+   */
+  it('prices the batch before opening the locked transaction — the lock never spans a priceTrade call', async () => {
+    fakeDatabase(ALREADY_BASELINED);
+    getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-price', 100)]);
+
+    let transactionOpenedBeforePricing = false;
+    priceTradeMock.mockImplementation(async () => {
+      if (transactionMock.mock.calls.length > 0) {
+        transactionOpenedBeforePricing = true;
+      }
+      return { usdValue: '10', priceSource: 'stablecoin' };
+    });
+
+    await reconcileWallet('cid-lock-scope');
+
+    expect(priceTradeMock).toHaveBeenCalledTimes(1);
+    expect(transactionOpenedBeforePricing).toBe(false);
+  });
+
+  /**
    * 101 trades forces two persistence batches (`PERSIST_BATCH_SIZE` is 100). Only the
    * 101st (alone in batch two) fails, so batch one's 100 trades — each already committed
    * in its own transaction — must still be there afterward, and the wallet must read
    * `failed`, never a false `current`.
    */
   it('marks reconciliation_state failed, not current, on a mid-run failure, and preserves an earlier batch\'s progress', async () => {
-    const { wallet, persistedSignatures } = fakeDatabase({ reconciledThroughSlot: 50, reconciliationState: 'current' });
+    const { wallet, persistedSignatures } = fakeDatabase(ALREADY_BASELINED);
 
     const signatures = Array.from({ length: 101 }, (_, index) => `sig-${index}`);
     getTransactionsForAddressMock.mockResolvedValue(signatures.map((sig, index) => heliusTx(sig, 100 + index)));
@@ -281,7 +363,7 @@ describe('reconcileWallet', () => {
   });
 
   it('serializes two concurrent reconciliation runs via the row lock and produces no duplicate trades', async () => {
-    const { persistedSignatures, lockCalls } = fakeDatabase({ reconciledThroughSlot: 50, reconciliationState: 'current' });
+    const { persistedSignatures, lockCalls } = fakeDatabase(ALREADY_BASELINED);
     getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-race', 100)]);
 
     const [a, b] = await Promise.all([reconcileWallet('cid-8a'), reconcileWallet('cid-8b')]);

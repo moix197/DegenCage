@@ -75,6 +75,16 @@ export const wallets = pgTable('wallets', {
   /** Highest finalized slot fully persisted by reconciliation; null until the first run. */
   reconciledThroughSlot: bigint('reconciled_through_slot', { mode: 'number' }),
   reconciliationState: reconciliationState('reconciliation_state').notNull().default('never'),
+  /**
+   * When the 90-day baseline backfill (decision 9) last finished successfully — set once,
+   * never touched again. `reconciliation_state` alone cannot express "backfill finished":
+   * a failed first run also leaves it `failed` (or `in_progress`, mid-crash), and deriving
+   * "is this the baseline pull" from state or from `reconciled_through_slot` would then
+   * treat the retry as a live run, feeding pre-commitment history to `evaluateTrade()`. This
+   * column is null until a baseline run completes, so a failed-and-retried first connect is
+   * still recognized as baseline.
+   */
+  baselineCompletedAt: timestamp('baseline_completed_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -243,6 +253,11 @@ export type ConstitutionRow = typeof constitutions.$inferSelect;
  * both sides (a pure receive has no sold leg at all), so `soldMint`/`boughtMint` and their
  * amount columns are nullable — populated whenever `derive-swaps.ts` could identify that
  * side, `null` otherwise. A real (non-excluded) trade always has both.
+ *
+ * `signature` is unique *per wallet*, not globally: a signature is only actually unique
+ * across a whole transaction, and a transaction can reference more than one wallet we track
+ * (e.g. two of our users appear in the same swap). A single global unique constraint would
+ * let `ON CONFLICT DO NOTHING` silently drop the second wallet's row.
  */
 export const trades = pgTable(
   'trades',
@@ -251,7 +266,7 @@ export const trades = pgTable(
     walletId: uuid('wallet_id')
       .notNull()
       .references(() => wallets.id),
-    signature: text('signature').notNull().unique(),
+    signature: text('signature').notNull(),
     slot: bigint('slot', { mode: 'number' }).notNull(),
     transactionIndex: integer('transaction_index').notNull(),
     /** Chain time — when the swap happened, never conflated with `observedAt`. */
@@ -270,6 +285,9 @@ export const trades = pgTable(
   (table) => [
     // The rolling-window sum's predicate: one wallet's live trades in a time range.
     index('trades_wallet_id_occurred_at_idx').on(table.walletId, table.occurredAt),
+    // `ON CONFLICT (wallet_id, signature) DO NOTHING` — idempotent re-reconciliation, scoped
+    // per wallet (see the table comment above).
+    uniqueIndex('trades_wallet_id_signature_idx').on(table.walletId, table.signature),
   ],
 );
 

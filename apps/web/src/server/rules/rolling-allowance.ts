@@ -1,4 +1,4 @@
-import { addUsd, compareUsd } from '@degencage/rules';
+import { compareUsd, sumTradeUsd } from '@degencage/rules';
 import { and, eq, gte, isNull, lt } from 'drizzle-orm';
 
 import type { DatabaseExecutor } from '../../observability/events';
@@ -66,19 +66,15 @@ export async function loadWindowedTrades(
   return rows;
 }
 
-/** Pure: sums `usdValue`. `null` (never `0`) the moment any trade in the window is unpriced. */
+/**
+ * Sums `usdValue`. `null` (never `0`) the moment any trade in the window is unpriced.
+ *
+ * A thin re-export of `@degencage/rules`' `sumTradeUsd` under this module's established
+ * name — `evaluate.ts` needs the identical logic for a limit's prior-window total, so the
+ * summation itself lives there once, not twice.
+ */
 export function sumWindowedUsd(windowedTrades: WindowedTrade[]): string | null {
-  let total = '0';
-
-  for (const trade of windowedTrades) {
-    if (trade.usdValue === null) {
-      return null;
-    }
-
-    total = addUsd(total, trade.usdValue);
-  }
-
-  return total;
+  return sumTradeUsd(windowedTrades);
 }
 
 export interface RollingAllowance {
