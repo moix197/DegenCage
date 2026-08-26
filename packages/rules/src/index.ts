@@ -25,3 +25,13 @@ export {
   type LimitId,
   type LimitRule,
 } from './constitution';
+
+export {
+  addUsd,
+  compareUsd,
+  evaluateTrade,
+  type Decision,
+  type EvaluableTrade,
+  type LimitEvaluation,
+  type LimitVerdict,
+} from './evaluate';

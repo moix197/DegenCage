@@ -43,6 +43,13 @@
       "when": 1787776839440,
       "tag": "0005_gifted_annihilus",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1787783275436,
+      "tag": "0006_silent_newton_destine",
+      "breakpoints": true
     }
   ]
 }

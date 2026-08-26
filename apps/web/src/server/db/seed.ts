@@ -1,8 +1,11 @@
 import { getDb } from './client';
 import { featureFlags } from './schema';
 import { WALLET_CONNECT_FLAG } from '../auth/solana-siws';
+import { CHAIN_HELIUS_FLAG } from '../chain/helius-client';
+import { CHAIN_HELIUS_RECONCILE_FLAG } from '../chain/reconcile-wallet';
 import { CONSTITUTION_AUTHOR_FLAG } from '../constitution/commitment';
 import { HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
+import { PRICING_BINANCE_FLAG } from '../pricing/binance-klines';
 import {
   captureError,
   flushErrorTracking,
@@ -20,6 +23,9 @@ const SEED_FLAGS: { key: string; enabled: boolean }[] = [
   { key: HOME_STATUS_PANEL_FLAG, enabled: true },
   { key: WALLET_CONNECT_FLAG, enabled: true },
   { key: CONSTITUTION_AUTHOR_FLAG, enabled: true },
+  { key: CHAIN_HELIUS_FLAG, enabled: true },
+  { key: CHAIN_HELIUS_RECONCILE_FLAG, enabled: true },
+  { key: PRICING_BINANCE_FLAG, enabled: true },
 ];
 
 async function seedFeatureFlags(): Promise<void> {

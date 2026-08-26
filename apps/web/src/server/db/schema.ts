@@ -1,11 +1,14 @@
 import type { Constitution } from '@degencage/rules';
 import {
+  bigint,
   boolean,
   index,
   integer,
   jsonb,
+  numeric,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -51,6 +54,16 @@ export const users = pgTable('users', {
  */
 export const walletCustody = pgEnum('wallet_custody', ['external', 'embedded']);
 
+/**
+ * `never` → `in_progress` → `current` | `failed`, driven entirely by `reconcile-wallet.ts`
+ * (`apps/web/src/server/chain/reconcile-wallet.ts`). Distinct from "zero trades": a wallet
+ * that has never been reconciled must never be read as clean — the survivorship-bias
+ * constraint in `.ai/decisions/event-time-vs-observation-time.md`.
+ */
+export const RECONCILIATION_STATES = ['never', 'in_progress', 'current', 'failed'] as const;
+export type ReconciliationState = (typeof RECONCILIATION_STATES)[number];
+export const reconciliationState = pgEnum('reconciliation_state', RECONCILIATION_STATES);
+
 export const wallets = pgTable('wallets', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id')
@@ -59,6 +72,9 @@ export const wallets = pgTable('wallets', {
   /** Base58, derived server-side from the signing public key — never taken from a request body. */
   address: text('address').notNull().unique(),
   custody: walletCustody('custody').notNull().default('external'),
+  /** Highest finalized slot fully persisted by reconciliation; null until the first run. */
+  reconciledThroughSlot: bigint('reconciled_through_slot', { mode: 'number' }),
+  reconciliationState: reconciliationState('reconciliation_state').notNull().default('never'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -204,3 +220,78 @@ export const constitutions = pgTable(
 );
 
 export type ConstitutionRow = typeof constitutions.$inferSelect;
+
+/**
+ * One derived on-chain swap, from `server/chain/reconcile-wallet.ts`. `signature` is
+ * unique so `INSERT ... ON CONFLICT (signature) DO NOTHING` makes re-running reconciliation
+ * over an already-swept range a no-op rather than a duplicate row
+ * (`.ai/decisions/event-time-vs-observation-time.md`'s "resumable and idempotent").
+ *
+ * Tier/loss columns (`acquired_tier`, `is_acquisition`, `is_round_trip_close`,
+ * `realized_loss_usd`) are Phase 5/6 additions, deliberately not here — this migration is
+ * scoped to exactly what Phase 4 evaluates (`daily_notional_usd` only).
+ *
+ * `usd_value` is nullable and must never be coerced to `0`: an unpriceable trade is
+ * unpriced, not free (CLAUDE.md → fail closed). `is_baseline` marks a trade from the
+ * 90-day backfill on first connect (decision 9) — baseline trades are a private behavioral
+ * record and are never passed to `evaluateTrade()`.
+ *
+ * A row is written for *every* candidate `derive-swaps.ts` looks at, not only real trades:
+ * an excluded candidate (self-transfer, pure receive/send, SOL↔wSOL wrap, an LST swap) gets
+ * `excludedReason` set instead, so the status page can list exclusions with their reason
+ * (this phase's success criteria). Not every exclusion reason has an identifiable leg on
+ * both sides (a pure receive has no sold leg at all), so `soldMint`/`boughtMint` and their
+ * amount columns are nullable — populated whenever `derive-swaps.ts` could identify that
+ * side, `null` otherwise. A real (non-excluded) trade always has both.
+ */
+export const trades = pgTable(
+  'trades',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    walletId: uuid('wallet_id')
+      .notNull()
+      .references(() => wallets.id),
+    signature: text('signature').notNull().unique(),
+    slot: bigint('slot', { mode: 'number' }).notNull(),
+    transactionIndex: integer('transaction_index').notNull(),
+    /** Chain time — when the swap happened, never conflated with `observedAt`. */
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+    soldMint: text('sold_mint'),
+    boughtMint: text('bought_mint'),
+    /** Raw base units (pre-decimals), as a decimal-digit string — never a float. */
+    soldAmountBaseUnits: text('sold_amount_base_units'),
+    boughtAmountBaseUnits: text('bought_amount_base_units'),
+    usdValue: numeric('usd_value', { precision: 38, scale: 12 }),
+    priceSource: text('price_source'),
+    isBaseline: boolean('is_baseline').notNull().default(false),
+    excludedReason: text('excluded_reason'),
+  },
+  (table) => [
+    // The rolling-window sum's predicate: one wallet's live trades in a time range.
+    index('trades_wallet_id_occurred_at_idx').on(table.walletId, table.occurredAt),
+  ],
+);
+
+export type TradeRow = typeof trades.$inferSelect;
+export type NewTradeRow = typeof trades.$inferInsert;
+
+/**
+ * Shared 1-minute USD OHLCV cache for majors (SOL, stablecoins), from
+ * `server/pricing/binance-klines.ts`. Keyed by `(mint, minuteBucketUtc)` — one row serves
+ * every user's trade priced in that minute, so the cache is populated once regardless of
+ * how many wallets reconcile through it.
+ */
+export const tokenPrices = pgTable(
+  'token_prices',
+  {
+    mint: text('mint').notNull(),
+    minuteBucketUtc: timestamp('minute_bucket_utc', { withTimezone: true }).notNull(),
+    usdPrice: numeric('usd_price', { precision: 38, scale: 12 }).notNull(),
+    source: text('source').notNull(),
+    fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.mint, table.minuteBucketUtc] })],
+);
+
+export type TokenPriceRow = typeof tokenPrices.$inferSelect;
