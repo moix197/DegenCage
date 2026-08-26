@@ -15,8 +15,8 @@ export const dynamic = 'force-dynamic';
 
 /**
  * Activates the caller's constitution. This is the server-side gate a replayed or forged
- * "activate now" request cannot get past: `activateConstitution` recomputes elapsed time
- * from `commitment_started_at` against its own `new Date()` and rejects
+ * "activate now" request cannot get past: `activateConstitution` re-checks
+ * `commitment_started_at` against Postgres' own `now()` and rejects
  * (`commitment_not_elapsed`, 425) regardless of what the client claims. Re-activating an
  * already-active constitution is a no-op, not an error.
  */

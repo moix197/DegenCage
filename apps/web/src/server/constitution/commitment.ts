@@ -14,8 +14,10 @@ import { assertWithinConstitutionActionRateLimit, ConstitutionActionRateLimited 
  * `resolveSession()` is the only source of caller identity here, exactly as in
  * `server/auth/session.ts` — no function in this module takes a wallet or user id as a
  * parameter, so a forged `wallet_id` in a request body has nothing to attach to. The
- * 20-minute commitment period is enforced against `commitment_started_at` compared to a
- * server `Date`, never a client-claimed elapsed time.
+ * 20-minute commitment period is enforced entirely by Postgres' own `now()`:
+ * `commitment_started_at` is written with it and compared against it again at activation,
+ * so the window can't be shortened by a client-claimed elapsed time or drift with clock
+ * skew between app instances.
  */
 
 /** The commitment period a drafted constitution must sit through before it can activate. */
@@ -340,11 +342,13 @@ async function attemptAtomicActivation(userId: string): Promise<ConstitutionRow 
  * Activates the caller's constitution — the server-side gate a replayed or forged
  * "activate now" request cannot get past.
  *
- * Elapsed time is computed entirely from `commitment_started_at` (set by `startCommitment`)
- * against `new Date()` on this server; nothing about the request body factors in. Idempotent:
- * re-activating an already-active constitution is a no-op, not an error, and a race between
- * two activation attempts after the deadline never produces a false
- * `activation_rejected_early` for the request that merely lost the race.
+ * Elapsed time is gated entirely inside `attemptAtomicActivation`'s WHERE, comparing
+ * `commitment_started_at` against Postgres' `now()` — nothing about the request body
+ * factors in. The `elapsedMs` computed below (against this process' `Date`) only runs after
+ * that comparison already lost; it's diagnostic payload for the rejection event, not part of
+ * the gate. Idempotent: re-activating an already-active constitution is a no-op, not an
+ * error, and a race between two activation attempts after the deadline never produces a
+ * false `activation_rejected_early` for the request that merely lost the race.
  */
 export async function activateConstitution(correlationId: string): Promise<ConstitutionRecord> {
   const session = await requireSession();
