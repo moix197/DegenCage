@@ -96,3 +96,33 @@ export function shouldRevokeSession({
 
   return !(awaitingRefresh && observedAddress === signedInAddress);
 }
+
+/** What one observation of the wallet means, and whether it may be acted on yet. */
+export interface ReauthDecision {
+  trigger: ReauthTrigger | null;
+  /**
+   * Whether the session must die *now*. This also gates the on-screen notice: a deferred
+   * mismatch is not shown as one, or a sign-in that just succeeded would flash
+   * "switched accounts" at the user.
+   */
+  shouldRevoke: boolean;
+}
+
+/**
+ * The whole watcher decision for a single observation — what the mismatch is, and whether
+ * it is real yet — composed from the two halves above so every caller reaches the same
+ * verdict from the same inputs.
+ *
+ * It is composed rather than inlined because that verdict is now reached from more than
+ * one place: the effect that renders and acts on it, and the tests that drive a wallet
+ * `change` event through to the revoke. A second copy of "trigger, then gate" is a second
+ * chance to get the gate wrong.
+ */
+export function decideReauth(observation: Omit<ReauthAction, 'trigger'>): ReauthDecision {
+  const trigger = reauthTriggerFor(observation);
+
+  return {
+    trigger,
+    shouldRevoke: trigger !== null && shouldRevokeSession({ ...observation, trigger }),
+  };
+}

@@ -1,12 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
 import { getBase58Decoder } from '@solana/kit';
 import type { ClientWithWallet } from '@solana/kit-plugin-wallet';
 import {
   useConnect,
-  useConnectedWallet,
   useIsWalletReady,
   useSignIn,
   useSignMessage,
@@ -16,7 +15,7 @@ import type { SolanaSignInOutput } from '@solana/wallet-standard-features';
 import { createSignInMessage, verifySignIn } from '@solana/wallet-standard-util';
 import { useRouter } from 'next/navigation';
 
-import { reauthTriggerFor, shouldRevokeSession, type ReauthTrigger } from './account-switch';
+import { decideReauth, type ReauthTrigger } from './account-switch';
 import {
   fetchChallenge,
   postProof,
@@ -24,6 +23,7 @@ import {
   type SignInChallenge,
   type SignInProofWire,
 } from './session-api';
+import { readActiveAddress, subscribeToWalletAccountChanges } from './wallet-account-watch';
 
 /**
  * Owns the whole client side of "who is signed in".
@@ -36,10 +36,12 @@ import {
  * 2. **The wallet and the session must agree.** Switching the active account in the
  *    extension without disconnecting leaves a session bound to the *previous* address.
  *    That session is revoked the moment the mismatch is seen — better a forced re-auth
- *    than acting under an identity the user is no longer using. The decision itself lives
- *    in `reauthTriggerFor`, and whether it is safe to act on it yet in
- *    `shouldRevokeSession`; this hook only feeds them what the extension reports and acts
- *    on the answer. Revocation is server-side — the session row dies — never client state.
+ *    than acting under an identity the user is no longer using. Seeing it requires being
+ *    *told*: the address is read through `subscribeToWalletAccountChanges`, not sampled on
+ *    whatever render happens next, or a switch stays invisible until the next page load
+ *    while every request is served as the old address. The decision itself lives in
+ *    `decideReauth`; this hook only feeds it what the extension reports and acts on the
+ *    answer. Revocation is server-side — the session row dies — never client state.
  */
 
 type DiscoveredWallet = ReturnType<ClientWithWallet['wallet']['getState']>['wallets'][number];
@@ -116,13 +118,37 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : 'Wallet sign-in failed.';
 }
 
+/**
+ * The wallet's active address, as a subscription rather than a sample.
+ *
+ * `useSyncExternalStore` is what makes the account-switch watcher a watcher: React
+ * re-reads on every notification from any of the channels and re-renders only when the
+ * address actually differs, so the effect below runs on the switch itself instead of on
+ * some unrelated render. It also owns the teardown — the subscription is dropped on
+ * unmount, and `subscribe` is memoised on the client so a re-render never re-subscribes.
+ *
+ * The server snapshot is `null`: there is no extension there, and the session — not the
+ * wallet — is what the server renders identity from.
+ */
+function useObservedWalletAddress(client: ClientWithWallet): string | null {
+  const subscribe = useCallback(
+    (notify: () => void) => subscribeToWalletAccountChanges(client, notify),
+    [client],
+  );
+
+  return useSyncExternalStore(
+    subscribe,
+    () => readActiveAddress(client),
+    () => null,
+  );
+}
+
 export function useWalletSession(
   client: ClientWithWallet,
   sessionAddress: string | null,
 ): WalletSessionState {
   const router = useRouter();
   const wallets = useWallets(client);
-  const connected = useConnectedWallet(client);
   const isReady = useIsWalletReady(client);
   const signInAction = useSignIn(client);
   const connectAction = useConnect(client);
@@ -134,31 +160,27 @@ export function useWalletSession(
   /** The address the server said it issued a session for, once a sign-in has succeeded. */
   const [signedInAddress, setSignedInAddress] = useState<string | null>(null);
 
-  const connectedAddress = connected?.account.address ?? null;
+  const connectedAddress = useObservedWalletAddress(client);
   /** Latches: has the extension reported an account at any point on this page? */
   const hasObservedWallet = useRef(false);
 
   useEffect(() => {
     hasObservedWallet.current ||= connectedAddress !== null;
 
-    const agreement = {
+    // Whether this mismatch is real *now*, or is the stale server render of a sign-in that
+    // has already succeeded, is `decideReauth`'s call — every input it reads is a dependency
+    // of this effect, so a deferral is always re-examined, never dropped.
+    const { trigger, shouldRevoke } = decideReauth({
       sessionAddress,
       observedAddress: connectedAddress,
       hasObservedWallet: hasObservedWallet.current,
-    };
-    const trigger = reauthTriggerFor(agreement);
+      isSigningIn,
+      signedInAddress,
+    });
 
-    // Whether this mismatch is real *now*, or is the stale server render of a sign-in that
-    // has already succeeded, is `shouldRevokeSession`'s decision — every dependency of it
-    // is a dependency of this effect, so a deferral is always re-examined, never dropped.
-    // The on-screen notice shares that gate: a deferred mismatch is not shown as one either,
-    // or a sign-in that just succeeded would flash "switched accounts" at the user.
-    const shouldAct =
-      trigger !== null && shouldRevokeSession({ ...agreement, trigger, isSigningIn, signedInAddress });
+    setReauthTrigger(shouldRevoke ? trigger : null);
 
-    setReauthTrigger(shouldAct ? trigger : null);
-
-    if (!shouldAct) {
+    if (!shouldRevoke || !trigger) {
       return;
     }
 

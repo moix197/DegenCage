@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { cookies } from 'next/headers';
 
 import { captureError } from '@/observability/error-tracking';
+import { recordEvent } from '@/observability/events';
 import { logger } from '@/observability/logger';
 import {
   buildClearedSessionCookie,
@@ -65,6 +66,50 @@ export async function POST(request: Request): Promise<Response> {
 }
 
 /**
+ * Records that the *client* watcher saw the wallet move off this session's account.
+ *
+ * `supersedePreviousSession` writes the same event type when a later sign-in proves the
+ * switch server-side — but that only happens if the user signs in again. The watcher gets
+ * there first, and until now its detection left nothing behind but a `session_revoked`
+ * row, so the one decision this whole path exists to make was invisible. Both halves
+ * writing `auth.wallet_account_switched` makes "how often does a switch actually happen"
+ * one query instead of two, over the audit trail Phase 5 reads.
+ *
+ * Everything in the payload is server-derived. The address comes from the session the
+ * cookie resolves to, never from the caller, and the account the wallet moved *to* is
+ * deliberately absent: no signature has proved one, and an unproven address does not enter
+ * the audit trail.
+ *
+ * Runs before the revoke, or there is no session left to name. A failed write is captured,
+ * never thrown: telemetry must not turn a revoke that succeeded into a sign-out reported
+ * as failed.
+ */
+async function recordSwitchDetectedByWatcher(correlationId: string): Promise<void> {
+  try {
+    const previous = await resolveSession(undefined, { slideExpiry: false });
+
+    if (!previous) {
+      return;
+    }
+
+    logger.warn('wallet account switch detected by client watcher', {
+      correlationId,
+      previousAddress: previous.walletAddress,
+    });
+
+    await recordEvent({
+      eventType: 'auth.wallet_account_switched',
+      occurredAt: new Date(),
+      correlationId,
+      userId: previous.userId,
+      payload: { previousAddress: previous.walletAddress, detectedBy: 'client_watcher' },
+    });
+  } catch (error) {
+    captureError(error, { correlationId, route: 'auth.verify.delete', step: 'record_switch' });
+  }
+}
+
+/**
  * Kills the current session. Called by the account-switch watcher: the moment the wallet
  * points at a different account — or stops reporting one at all — the session bound to
  * the old account must stop resolving.
@@ -86,6 +131,10 @@ export async function DELETE(request: Request): Promise<Response> {
   const reason = parseRevocationReason(new URL(request.url).searchParams.get('reason'));
 
   try {
+    if (reason === 'account_switch') {
+      await recordSwitchDetectedByWatcher(correlationId);
+    }
+
     await revokeSession(correlationId, reason);
 
     return Response.json({ correlationId });
