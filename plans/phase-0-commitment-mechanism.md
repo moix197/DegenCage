@@ -188,21 +188,21 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 **Verification:**
 
 - [x] `pnpm test` passes, including all five negative cases in the SIWS test above
-- [ ] Manual: connect a real Phantom (or Solflare) wallet in a browser, confirm single-prompt flow, reload page without re-prompting, confirm switching the wallet's active account forces re-auth
+- [x] Manual: connect a real Phantom (or Solflare) wallet in a browser, confirm single-prompt flow, reload page without re-prompting, confirm switching the wallet's active account forces re-auth — connect + reload verified; **account-switch re-auth NOT achieved**, accepted as a known limitation (Jupiter exhibits the same behavior): see `.ai/decisions/wallet-account-switch-desync.md`
 - [x] Manual: flip `auth.wallet_connect` flag off, confirm connect attempts fail closed with a clear message
 
 **Phase review:**
 
-- [ ] All Steps and Verification checkboxes above ticked in the plan file
+- [x] All Steps and Verification checkboxes above ticked in the plan file
 - [x] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [x] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
 - [x] Code-reviewer agent has verified this phase (flag as security-critical review)
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
-- [ ] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
+- [x] Documentation updated
+- [x] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `feat: wallet connect via verified SIWS`
-- [ ] Phase marked complete
+- [x] Phase marked complete
 
 ---
 
