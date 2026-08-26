@@ -1,4 +1,4 @@
-import { boolean, jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
+import { boolean, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * Scope narrows a flag below "global". Absent/empty `userIds` means the flag's
@@ -23,3 +23,98 @@ export const featureFlags = pgTable('feature_flags', {
 });
 
 export type FeatureFlagRow = typeof featureFlags.$inferSelect;
+
+/**
+ * A person. Deliberately empty beyond identity: Phase 0 has no email, no invite, no
+ * profile (decision 11 — open connect). One user owns one wallet for now.
+ */
+export const users = pgTable('users', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * `embedded` is unused in Phase 0 but exists from day 1 (decision 2): retrofitting a
+ * custody distinction after wallets have history is a migration nobody wants.
+ */
+export const walletCustody = pgEnum('wallet_custody', ['external', 'embedded']);
+
+export const wallets = pgTable('wallets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id')
+    .notNull()
+    .references(() => users.id),
+  /** Base58, derived server-side from the signing public key — never taken from a request body. */
+  address: text('address').notNull().unique(),
+  custody: walletCustody('custody').notNull().default('external'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * Opaque, revocable sessions (decision 15) — not a JWT, so a compromised or switched
+ * wallet can be cut off server-side without waiting for a token to expire.
+ *
+ * Only the SHA-256 hash of the session id is stored: a database leak must not hand the
+ * reader a working cookie.
+ */
+export const sessions = pgTable('sessions', {
+  idHash: text('id_hash').primaryKey(),
+  walletAddress: text('wallet_address')
+    .notNull()
+    .references(() => wallets.address),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type SessionRow = typeof sessions.$inferSelect;
+
+/**
+ * One issued `SolanaSignInInput`, keyed by its nonce.
+ *
+ * `verifySignIn` from `@solana/wallet-standard-util` checks the signature and that the
+ * signed text matches the input we hand it — nothing more (decision 16). Replay, expiry
+ * and domain binding are ours, and they are enforced against *this stored row*, never
+ * against fields echoed back by the client.
+ */
+export const siwsChallenges = pgTable('siws_challenges', {
+  nonce: text('nonce').primaryKey(),
+  input: jsonb('input').$type<StoredSignInInput>().notNull(),
+  issuedAt: timestamp('issued_at', { withTimezone: true }).notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  /** Non-null means this challenge has already bought a session. Single use, forever. */
+  consumedAt: timestamp('consumed_at', { withTimezone: true }),
+});
+
+/** The subset of `SolanaSignInInput` we issue, stored verbatim so verification re-reads our copy. */
+export interface StoredSignInInput {
+  domain: string;
+  statement: string;
+  nonce: string;
+  issuedAt: string;
+  expirationTime: string;
+}
+
+export type SiwsChallengeRow = typeof siwsChallenges.$inferSelect;
+
+/**
+ * The behavioral event log — product data, append-only, in the same Postgres as
+ * everything else (`.ai/decisions/observability-stack.md`). No update, no delete: a
+ * correction is a new row.
+ *
+ * `occurred_at` is when the thing happened (chain time, or a server clock for our own
+ * actions); `observed_at` is when we wrote it down. Never conflated, never client-supplied
+ * (`.ai/decisions/event-time-vs-observation-time.md`).
+ */
+export const events = pgTable('events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  occurredAt: timestamp('occurred_at', { withTimezone: true }).notNull(),
+  observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+  eventType: text('event_type').notNull(),
+  correlationId: text('correlation_id').notNull(),
+  userId: uuid('user_id').references(() => users.id),
+  payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+});
+
+export type EventRow = typeof events.$inferSelect;

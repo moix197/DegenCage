@@ -1,5 +1,6 @@
 import { getDb } from './client';
 import { featureFlags } from './schema';
+import { WALLET_CONNECT_FLAG } from '../auth/solana-siws';
 import { HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
 import {
   captureError,
@@ -16,6 +17,7 @@ import { logger } from '../../observability/logger';
  */
 const SEED_FLAGS: { key: string; enabled: boolean }[] = [
   { key: HOME_STATUS_PANEL_FLAG, enabled: true },
+  { key: WALLET_CONNECT_FLAG, enabled: true },
 ];
 
 async function seedFeatureFlags(): Promise<void> {
