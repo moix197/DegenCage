@@ -95,8 +95,8 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 | create | `apps/web/src/server/db/schema.ts` | drizzle schema: `feature_flags` table only (`key text pk`, `enabled boolean`, `scope jsonb`, `updated_at`) |
 | create | `apps/web/drizzle.config.ts` + generated migration under `apps/web/src/server/db/migrations/` | drizzle-kit config + initial migration |
 | create | `apps/web/src/server/flags/feature-flags.ts` | `isFeatureEnabled(key, ctx?: { userId?: string })` reading `feature_flags`, fail-closed default (unknown key → disabled) |
-| create | `apps/web/src/server/observability/logger.ts` | pino JSON-to-stdout wrapper; every call site imports this, never `pino` directly |
-| create | `apps/web/src/server/observability/error-tracking.ts` | thin wrapper around `@sentry/nextjs` `captureException`; call sites never import `@sentry/nextjs` directly |
+| create | `apps/web/src/observability/logger.ts` | pino JSON-to-stdout wrapper; every call site imports this, never `pino` directly |
+| create | `apps/web/src/observability/error-tracking.ts` | thin wrapper around `@sentry/nextjs` `captureException`; call sites never import `@sentry/nextjs` directly |
 | create | `packages/rules/package.json`, `packages/rules/src/index.ts` | empty package, one placeholder pure export, zero deps on `next/*`/DB/fetch |
 | create | `vitest.config.ts` (root, shared) | test runner wired for both `apps/web` and `packages/rules` |
 | create | `.env.example` | `DATABASE_URL`, `SENTRY_DSN`, placeholders for later env vars (documented as they're introduced in later phases) |
@@ -119,7 +119,7 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 | Action | File | What it covers |
 |---|---|---|
 | create | `packages/rules/src/index.test.ts` | placeholder pure function returns expected output with no I/O |
-| create | `apps/web/src/server/observability/logger.test.ts` | logger wrapper emits structured JSON with expected fields, doesn't throw on circular-safe input |
+| create | `apps/web/src/observability/logger.test.ts` | logger wrapper emits structured JSON with expected fields, doesn't throw on circular-safe input |
 | create | `apps/web/src/server/flags/feature-flags.test.ts` | `isFeatureEnabled` fails closed for unknown keys; respects seeded row |
 
 **Verification:**
@@ -134,7 +134,7 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
 - [x] Code-reviewer agent has verified this phase
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
 - [x] Documentation updated (see Documentation section)
 - [ ] Orchestrator (user) has verified and approved this phase
@@ -155,7 +155,7 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 | Action | File | What changes |
 |---|---|---|
 | modify | `apps/web/src/server/db/schema.ts` | add `users`, `wallets` (`custody` enum: `external`\|`embedded`), `sessions` (`id_hash`, `wallet_address`, `created_at`, `expires_at`, `revoked_at`, `last_seen_at`), `siws_challenges` (nonce, stored `SolanaSignInInput`, `consumed_at`, `expires_at`), `events` (append-only: `id`, `occurred_at`, `observed_at`, `event_type`, `correlation_id`, `user_id` nullable, `payload jsonb`) |
-| create | `apps/web/src/server/observability/events.ts` | `recordEvent({ eventType, occurredAt, correlationId, userId?, payload })` — the one write path into `events`; callers never `INSERT INTO events` directly. **Rejects any caller-supplied `observed_at`** — always stamped `now()` server-side, and `occurredAt` must trace back to a chain timestamp or a server-generated one, never a raw client value |
+| create | `apps/web/src/observability/events.ts` | `recordEvent({ eventType, occurredAt, correlationId, userId?, payload })` — the one write path into `events`; callers never `INSERT INTO events` directly. **Rejects any caller-supplied `observed_at`** — always stamped `now()` server-side, and `occurredAt` must trace back to a chain timestamp or a server-generated one, never a raw client value |
 | create | `apps/web/src/server/auth/solana-siws.ts` | thin wrapper: builds `SolanaSignInInput` (domain from `SIWS_DOMAIN` env var, 32-byte nonce, 5-min `expirationTime`), persists it, and verifies `SolanaSignInOutput` via `@solana/wallet-standard-util`'s `verifySignIn` **plus** our own nonce-consumed check, expiry check, and domain equality check |
 | create | `apps/web/src/server/auth/session.ts` | issues session (random 32-byte id, stores SHA-256 hash), sets httpOnly/Secure/SameSite=Lax cookie, `resolveSession(cookie)` helper used by every authenticated route — this is the **only** legitimate source of "which wallet is this request for"; no later phase's route may accept a wallet id/address from the request body instead |
 | create | `apps/web/src/app/api/auth/nonce/route.ts` | `POST` — behind `auth.wallet_connect` feature flag, fail closed if disabled |
@@ -183,7 +183,7 @@ This is the plan's one allowed infra-only phase (per format spec exception: "pur
 |---|---|---|
 | create | `apps/web/src/server/auth/solana-siws.test.ts` | using a locally generated Ed25519 keypair (no real wallet needed): (1) valid sign-in verifies and marks the nonce consumed; (2) **replay** — resubmitting the exact same, still-valid `{address, publicKey, signedMessage, signature}` a second time is rejected because the nonce is already consumed, not just because a "duplicate" is detected some other way; (3) an unconsumed but **expired** nonce (`now() > expirationTime`) is rejected even with a perfectly valid signature; (4) a valid signature against the **wrong `domain`** is rejected; (5) a **tampered** `signedMessage` byte is rejected |
 | create | `apps/web/src/server/auth/session.test.ts` | session created with correct cookie flags/expiry; revoked session fails `resolveSession`; expired session fails `resolveSession` |
-| create | `apps/web/src/server/observability/events.test.ts` | `recordEvent` persists `occurred_at`/`observed_at`/`correlation_id`/payload correctly; a caller-supplied `observed_at` is ignored/overwritten, never trusted |
+| create | `apps/web/src/observability/events.test.ts` | `recordEvent` persists `occurred_at`/`observed_at`/`correlation_id`/payload correctly; a caller-supplied `observed_at` is ignored/overwritten, never trusted |
 
 **Verification:**
 
@@ -699,11 +699,11 @@ _(The `single-source-of-truth-database.md` internal contradiction flagged during
 | Phase | Logic under test | Test file |
 |---|---|---|
 | Phase 1 | Placeholder pure function | `packages/rules/src/index.test.ts` |
-| Phase 1 | Logger wrapper structured output | `apps/web/src/server/observability/logger.test.ts` |
+| Phase 1 | Logger wrapper structured output | `apps/web/src/observability/logger.test.ts` |
 | Phase 1 | Fail-closed feature flag lookup | `apps/web/src/server/flags/feature-flags.test.ts` |
 | Phase 2 | SIWS verification, replay/expiry/domain rejection | `apps/web/src/server/auth/solana-siws.test.ts` |
 | Phase 2 | Session issuance/revocation/expiry | `apps/web/src/server/auth/session.test.ts` |
-| Phase 2 | Append-only event recording, timestamp integrity | `apps/web/src/server/observability/events.test.ts` |
+| Phase 2 | Append-only event recording, timestamp integrity | `apps/web/src/observability/events.test.ts` |
 | Phase 3 | Constitution schema validation + migration | `packages/rules/src/constitution.test.ts` |
 | Phase 3 | Server-authoritative 20-min commitment gate, session-only wallet resolution | `apps/web/src/server/constitution/commitment.test.ts` |
 | Phase 4 | Swap derivation from balance deltas, exclusions | `apps/web/src/server/chain/derive-swaps.test.ts` |
