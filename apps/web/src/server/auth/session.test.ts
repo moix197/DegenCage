@@ -6,9 +6,12 @@ import {
   buildSessionCookie,
   establishSession,
   isSessionUsable,
+  parseRevocationReason,
   resolveSession,
   revokeSession,
   SESSION_COOKIE_NAME,
+  supersedePreviousSession,
+  type SessionIdentity,
   type StoredSession,
 } from './session';
 
@@ -250,21 +253,90 @@ describe('resolveSession', () => {
 });
 
 describe('revokeSession', () => {
-  it('marks the session revoked and records the event', async () => {
+  it('marks the session revoked and records the event with its reason', async () => {
     cookieGetMock.mockReturnValue({ value: SESSION_ID });
     const { setSpy } = captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
 
-    await revokeSession('trade-intent-3');
+    await revokeSession('trade-intent-3', 'account_switch');
 
     expect((setSpy.mock.calls[0]?.[0] as { revokedAt: Date }).revokedAt).toBeInstanceOf(Date);
     expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
       eventType: 'auth.session_revoked',
       correlationId: 'trade-intent-3',
+      payload: { walletAddress: WALLET_ADDRESS, reason: 'account_switch' },
     });
   });
 
   it('is a no-op without a session cookie', async () => {
-    await revokeSession('trade-intent-4');
+    await revokeSession('trade-intent-4', 'client_request');
+
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(recordEventMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('parseRevocationReason', () => {
+  it('keeps a reason it recognises', () => {
+    expect(parseRevocationReason('wallet_disconnected')).toBe('wallet_disconnected');
+  });
+
+  it('never writes an invented reason into the audit trail', () => {
+    expect(parseRevocationReason('<script>alert(1)</script>')).toBe('client_request');
+    expect(parseRevocationReason(null)).toBe('client_request');
+  });
+});
+
+describe('supersedePreviousSession', () => {
+  const OTHER_ADDRESS = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+  function previousSession(walletAddress: string): SessionIdentity {
+    return {
+      walletAddress,
+      walletId: 'wallet-1',
+      userId: 'user-1',
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+  }
+
+  beforeEach(() => {
+    cookieGetMock.mockReturnValue({ value: SESSION_ID });
+  });
+
+  /**
+   * The regression for the switch going unnoticed. The wallet had already moved to another
+   * account; whether or not the extension ever said so, the moment a signature proves a
+   * different address the session bound to the old one has to die here — server-side, in
+   * the request that proved it, with nothing to rely on but the cookie and the signature.
+   */
+  it('revokes the session the request arrived with when a different wallet signs in', async () => {
+    const { setSpy } = captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+
+    await supersedePreviousSession(previousSession(WALLET_ADDRESS), OTHER_ADDRESS, 'trade-intent-5');
+
+    expect((setSpy.mock.calls[0]?.[0] as { revokedAt: Date }).revokedAt).toBeInstanceOf(Date);
+    expect(recordEventMock.mock.calls.map((call) => call[0])).toMatchObject([
+      {
+        eventType: 'auth.wallet_account_switched',
+        correlationId: 'trade-intent-5',
+        userId: 'user-1',
+        payload: { previousAddress: WALLET_ADDRESS, verifiedAddress: OTHER_ADDRESS },
+      },
+      { eventType: 'auth.session_revoked', payload: { reason: 'account_switch' } },
+    ]);
+  });
+
+  it('supersedes the old session when the same wallet signs in again, without crying switch', async () => {
+    captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+
+    await supersedePreviousSession(previousSession(WALLET_ADDRESS), WALLET_ADDRESS, 'trade-intent-6');
+
+    expect(recordEventMock.mock.calls.map((call) => call[0])).toMatchObject([
+      { eventType: 'auth.session_revoked', payload: { reason: 'superseded_by_sign_in' } },
+    ]);
+  });
+
+  it('has nothing to supersede on a first sign-in', async () => {
+    await supersedePreviousSession(null, WALLET_ADDRESS, 'trade-intent-7');
 
     expect(updateMock).not.toHaveBeenCalled();
     expect(recordEventMock).not.toHaveBeenCalled();

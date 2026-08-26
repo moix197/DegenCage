@@ -71,6 +71,7 @@ export type SignInRejection =
   | 'nonce_already_consumed'
   | 'challenge_expired'
   | 'domain_mismatch'
+  | 'address_mismatch'
   | 'signature_invalid';
 
 export type SignInCheck = { ok: true; address: string } | { ok: false; reason: SignInRejection };
@@ -178,6 +179,15 @@ export function checkSignIn(
   }
 
   const address = getBase58Decoder().decode(proof.publicKey);
+
+  // Named separately from `signature_invalid` because it is a different failure with a
+  // different cause. `verifySignIn` folds both into one boolean, which left the only
+  // symptom of "the wallet signed as a different account than the key it handed us" —
+  // exactly what an account switch produces — indistinguishable in the logs from a
+  // forged signature. The response stays identically opaque; only the log line differs.
+  if (parseSignInMessage(proof.signedMessage)?.address !== address) {
+    return { ok: false, reason: 'address_mismatch' };
+  }
 
   return passesSignatureVerification(address, challenge.input, proof)
     ? { ok: true, address }

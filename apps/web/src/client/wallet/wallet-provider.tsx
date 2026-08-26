@@ -6,6 +6,7 @@ import { createClient, type Client } from '@solana/kit';
 import { walletSigner, type ClientWithWallet } from '@solana/kit-plugin-wallet';
 import { ClientProvider } from '@solana/react';
 
+import type { ReauthTrigger } from './account-switch';
 import { useWalletSession } from './use-wallet-session';
 
 /**
@@ -47,22 +48,20 @@ function ConnectPanel({
   client,
   sessionAddress,
 }: WalletConnectProps & { client: ClientWithWallet }) {
-  const { wallets, connectedAddress, isReady, isSigningIn, error, signIn } = useWalletSession(
-    client,
-    sessionAddress,
-  );
+  const { wallets, connectedAddress, isReady, isSigningIn, error, reauthTrigger, signIn } =
+    useWalletSession(client, sessionAddress);
 
   if (!isReady) {
     return <p>Looking for wallets…</p>;
   }
 
-  const mismatched = sessionAddress !== null && connectedAddress !== null && connectedAddress !== sessionAddress;
-
   return (
     <section>
-      {mismatched ? (
-        <p>Your wallet switched accounts. Sign in again to continue as {connectedAddress}.</p>
-      ) : null}
+      <SessionIdentity
+        connectedAddress={connectedAddress}
+        reauthTrigger={reauthTrigger}
+        sessionAddress={sessionAddress}
+      />
 
       {wallets.length === 0 ? (
         <p>No Solana wallet detected. Install Phantom or Solflare, then reload.</p>
@@ -76,5 +75,40 @@ function ConnectPanel({
 
       {error ? <p role="alert">{error}</p> : null}
     </section>
+  );
+}
+
+/**
+ * Who the app currently thinks you are — rendered here rather than in the page so a
+ * detected mismatch can take it off screen the instant it is seen.
+ *
+ * `sessionAddress` still comes from the server's `resolveSession()`; the wallet's address
+ * is never shown as the identity, only used to say which account to reconnect with. The
+ * session is being torn down server-side while this renders, but the user must not be
+ * looking at "Connected as <the account they just left>" for even one paint in between.
+ */
+function SessionIdentity({
+  connectedAddress,
+  reauthTrigger,
+  sessionAddress,
+}: {
+  connectedAddress: string | null;
+  reauthTrigger: ReauthTrigger | null;
+  sessionAddress: string | null;
+}) {
+  if (reauthTrigger) {
+    return (
+      <p role="alert">
+        {reauthTrigger === 'account_switch'
+          ? `Your wallet switched accounts. Signing you out — connect again to continue as ${connectedAddress}.`
+          : 'Your wallet is no longer connected to this account. Signing you out — connect again to continue.'}
+      </p>
+    );
+  }
+
+  return sessionAddress ? (
+    <p>Connected as {sessionAddress}</p>
+  ) : (
+    <p>Not connected. Connect a wallet to write your trading constitution.</p>
   );
 }

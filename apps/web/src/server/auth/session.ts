@@ -233,12 +233,33 @@ export async function resolveSession(
 }
 
 /**
+ * Why a session died. A closed set, resolved server-side: a caller may *annotate* a
+ * revocation it asked for, but it can never invent one — an unrecognised value collapses
+ * to `client_request` rather than being written into the audit trail verbatim.
+ */
+export const SESSION_REVOCATION_REASONS = [
+  'account_switch',
+  'wallet_disconnected',
+  'superseded_by_sign_in',
+  'client_request',
+] as const;
+
+export type SessionRevocationReason = (typeof SESSION_REVOCATION_REASONS)[number];
+
+export function parseRevocationReason(value: string | null | undefined): SessionRevocationReason {
+  return SESSION_REVOCATION_REASONS.includes(value as SessionRevocationReason)
+    ? (value as SessionRevocationReason)
+    : 'client_request';
+}
+
+/**
  * Kills a session immediately — the account-switch path. The wallet the extension is now
  * pointing at is not the wallet this session was issued for, so the session must die
  * before anything can act under the wrong identity.
  */
 export async function revokeSession(
   correlationId: string,
+  reason: SessionRevocationReason,
   sessionId: string | undefined = undefined,
 ): Promise<void> {
   const id = sessionId ?? (await readSessionCookie());
@@ -259,12 +280,59 @@ export async function revokeSession(
     return;
   }
 
+  logger.warn('session revoked', { correlationId, reason, walletAddress: row.walletAddress });
+
   await recordEvent({
     eventType: 'auth.session_revoked',
     occurredAt: new Date(),
     correlationId,
-    payload: { walletAddress: row.walletAddress },
+    payload: { walletAddress: row.walletAddress, reason },
   });
+}
+
+/**
+ * The server-side half of account-switch detection, and the reason a stale session cannot
+ * outlive a re-connect.
+ *
+ * A sign-in proves ownership of exactly one address. Whatever session the request arrived
+ * with is superseded by that proof — always, so sessions never pile up — and when the two
+ * addresses disagree the old one was bound to an identity the wallet has moved off. That
+ * is the switch, observed where it cannot be skipped: the client watcher can miss it (the
+ * extension may simply stop reporting an account), this cannot.
+ *
+ * Both addresses come from the server: `previous` from `resolveSession()` (the cookie),
+ * `verifiedAddress` from the signature. Nothing here is taken from the request body.
+ *
+ * Must run *before* the new cookie is written, so it revokes the old session id.
+ */
+export async function supersedePreviousSession(
+  previous: SessionIdentity | null,
+  verifiedAddress: string,
+  correlationId: string,
+): Promise<void> {
+  if (!previous) {
+    return;
+  }
+
+  const switched = previous.walletAddress !== verifiedAddress;
+
+  if (switched) {
+    logger.warn('wallet account switch detected', {
+      correlationId,
+      previousAddress: previous.walletAddress,
+      verifiedAddress,
+    });
+
+    await recordEvent({
+      eventType: 'auth.wallet_account_switched',
+      occurredAt: new Date(),
+      correlationId,
+      userId: previous.userId,
+      payload: { previousAddress: previous.walletAddress, verifiedAddress },
+    });
+  }
+
+  await revokeSession(correlationId, switched ? 'account_switch' : 'superseded_by_sign_in');
 }
 
 /** Clears the cookie in the browser after a revoke; the row is already dead server-side. */

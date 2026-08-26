@@ -156,12 +156,33 @@ describe('checkSignIn', () => {
     });
   });
 
-  it('rejects a signature made by a key other than the one presented', () => {
+  /**
+   * What an account switch mid-prompt produces: the message names the account the page had
+   * a moment ago, the key belongs to the account that actually signed. It is a different
+   * failure from a forged signature and has to be *named* differently — folded into
+   * `signature_invalid` it reads in the logs exactly like an attack, and the one question
+   * worth answering ("did this user's wallet change accounts?") goes unanswered.
+   */
+  it('names an account/key disagreement rather than calling it a bad signature', () => {
     const impostor = generateWallet();
     const proof = signChallenge(impostor, input);
 
     expect(checkSignIn(challengeRow(input), { ...proof, publicKey: wallet.publicKey }, DURING, DOMAIN))
-      .toEqual({ ok: false, reason: 'signature_invalid' });
+      .toEqual({ ok: false, reason: 'address_mismatch' });
+  });
+
+  it('rejects a signature made by a key other than the one the message names', () => {
+    const impostor = generateWallet();
+    // Message and key agree on `wallet`; only the signature is somebody else's.
+    const forged = {
+      ...signChallenge(wallet, input),
+      signature: signChallenge(impostor, input).signature,
+    };
+
+    expect(checkSignIn(challengeRow(input), forged, DURING, DOMAIN)).toEqual({
+      ok: false,
+      reason: 'signature_invalid',
+    });
   });
 
   it('rejects key material of the wrong length instead of handing it to the verifier', () => {
@@ -256,6 +277,44 @@ describe('verifyWalletSignIn', () => {
     await expect(verifyWalletSignIn(garbage, 'trade-intent-5')).rejects.toMatchObject({
       reason: 'malformed_message',
     });
+  });
+
+  /**
+   * The recovery path after an account switch, and the regression for it dead-ending.
+   * Whatever happened on the previous attempt, a fresh nonce signed by the account the
+   * wallet is on now has to buy a session for *that* account — the old address's history
+   * must not stand in its way.
+   */
+  it('lets the account the wallet switched to sign in on a fresh challenge', async () => {
+    fakeChallengeTable(challengeRow(input));
+
+    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-7')).resolves
+      .toMatchObject({ walletAddress: wallet.address });
+
+    const switched = generateWallet();
+    const fresh = buildSignInInput(ISSUED_AT, DOMAIN);
+    const freshRow = challengeRow(fresh);
+    fakeChallengeTable(freshRow);
+
+    await expect(verifyWalletSignIn(signChallenge(switched, fresh), 'trade-intent-8')).resolves
+      .toMatchObject({ walletAddress: switched.address });
+    expect(freshRow.consumedAt).toBeInstanceOf(Date);
+  });
+
+  it('leaves the challenge unspent when the wallet signs as an account other than its key', async () => {
+    const row = challengeRow(input);
+    fakeChallengeTable(row);
+    const switched = generateWallet();
+    // Message from one account, public key from the other — the shape a mid-prompt switch
+    // produces. Rejecting it must not cost the user the challenge, or the retry is dead
+    // before it starts.
+    const mixed = { ...signChallenge(switched, input), publicKey: wallet.publicKey };
+
+    await expect(verifyWalletSignIn(mixed, 'trade-intent-9')).rejects.toMatchObject({
+      reason: 'address_mismatch',
+    });
+    expect(row.consumedAt).toBeNull();
+    expect(establishSessionMock).not.toHaveBeenCalled();
   });
 
   it('never issues a session when the signature does not verify', async () => {

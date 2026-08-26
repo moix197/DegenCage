@@ -8,8 +8,15 @@ export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 /**
- * "Connected as X" is rendered from `resolveSession()`, not from wallet state: the
- * server-side session is the identity, and a reload must never re-prompt for a signature.
+ * The identity comes from `resolveSession()`, never from wallet state: the server-side
+ * session is who you are, and a reload must never re-prompt for a signature.
+ *
+ * It is *handed to* the connect panel rather than printed here, though. A server render is
+ * a snapshot: the moment the wallet switches accounts this page's "Connected as X" is
+ * stale, and nothing left in the server tree can notice. The panel holds both halves — the
+ * session's address and the wallet's — so it can stop showing the old identity the instant
+ * they disagree, while the session is revoked underneath. With the kill switch off there is
+ * no panel and no way to re-auth, so no identity is claimed at all.
  */
 export default async function ConnectPage() {
   const [session, connectEnabled] = await Promise.all([
@@ -20,12 +27,6 @@ export default async function ConnectPage() {
   return (
     <main>
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>DegenCage</h1>
-
-      {session ? (
-        <p>Connected as {session.walletAddress}</p>
-      ) : (
-        <p>Not connected. Connect a wallet to write your trading constitution.</p>
-      )}
 
       {connectEnabled ? (
         <WalletConnect sessionAddress={session?.walletAddress ?? null} />
