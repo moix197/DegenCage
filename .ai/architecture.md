@@ -15,6 +15,10 @@ apps/web        Next.js App Router — UI + route handlers (Vercel), output: 'st
                              shared by server and browser, so not under src/server/
   src/server/db/             drizzle schema, migrations, seed, the one pooled getDb()
   src/server/flags/          isFeatureEnabled() — fail-closed kill switches
+  src/server/auth/           SIWS verification + sessions; resolveSession() is the only
+                             source of caller identity
+  src/client/wallet/         browser-only wallet code — the extension never reaches the
+                             server tree, and identity is still rendered from the session
 packages/rules  the rule engine: pure, I/O-free, the product IP
 
 later, only when the need is real:

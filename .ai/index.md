@@ -14,7 +14,7 @@ anywhere real.
 | db | Drizzle schema, migrations, and the one pooled Postgres handle (`getDb()`) | `apps/web/src/server/db` | [migration-and-test-tooling](decisions/migration-and-test-tooling.md), [single-source-of-truth-database](decisions/single-source-of-truth-database.md) |
 | flags | `isFeatureEnabled()` — the single fail-closed kill-switch read path | `apps/web/src/server/flags` | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
 | observability | `logger` + `captureError` — the only import points for pino and Sentry | `apps/web/src/observability` | [observability-stack](decisions/observability-stack.md) |
-| auth | SIWS sign-in, session issue/revoke/`resolveSession()`, and the client wallet account watcher | `apps/web/src/server/auth`, `apps/web/src/client/wallet` | [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md) |
+| auth | SIWS sign-in, rate-limited nonce issuance, session issue/revoke/`resolveSession()`, and the client wallet account watcher | `apps/web/src/server/auth` ([README](../apps/web/src/server/auth/README.md)), `apps/web/src/client/wallet` | [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md), [wallet-standard-ui-dependency](decisions/wallet-standard-ui-dependency.md) |
 
 > Add a row when a module lands. Don't pre-populate rows for paths that don't exist.
 
@@ -31,4 +31,6 @@ anywhere real.
 | Observability | events → Postgres; errors → Sentry; logs → pino/stdout; traces deferred | [observability-stack](decisions/observability-stack.md); rules in CLAUDE.md |
 | Kill switches / fail-closed / idempotency | `feature_flags` table + `isFeatureEnabled()`; rules in CLAUDE.md → *Safety infrastructure* | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
 | Schema / migrations / tests / DB host | Drizzle + drizzle-kit, Vitest, Neon (pooled WebSocket driver) | [migration-and-test-tooling](decisions/migration-and-test-tooling.md) |
+| Caller identity | `resolveSession()` is the **only** answer to "which wallet is this request for" — no route reads an address from a request body; single-use nonce, supersede+consume+insert in one transaction, 30-day sliding expiry inside a 90-day absolute cap | [auth README](../apps/web/src/server/auth/README.md) |
+| Unauthenticated write surfaces | `/api/auth/nonce` is throttled by counting its own rows in Postgres (10 / 5 min, keyed by a hashed client address) and reaped opportunistically — no scheduler and no Redis before the Phase 4 worker | [auth README](../apps/web/src/server/auth/README.md) |
 | Wallet identity | session identity can lag the wallet's active account after an in-extension switch — **accepted limitation**, read before using `resolveSession()` without a fresh signature | [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md) |
