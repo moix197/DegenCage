@@ -36,6 +36,7 @@ All commands run from the **repo root**; they inject the root `.env` via `dotenv
 | `SENTRY_DSN` | no | server + edge Sentry init; unset logs one startup warning, errors are logged only |
 | `NEXT_PUBLIC_SENTRY_DSN` | no | browser Sentry init; inlined at build time, so setting it needs a rebuild. Unset means the ~80 kB browser SDK is never fetched |
 | `LOG_LEVEL` | no | pino level, defaults to `info` |
+| `SIWS_DOMAIN` | yes | the domain a Sign In With Solana message is bound to (`localhost:3000` in dev, the production host otherwise); `requiredSignInDomain()` throws without it. Configuration only — never derived from `Host`/`Origin` |
 
 Later phases add their vars to `.env.example` as they introduce them.
 
@@ -47,6 +48,12 @@ Later phases add their vars to `.env.example` as they introduce them.
   user, or a database error. Add new flags to `src/server/db/seed.ts` in the same change
   as the feature they guard.
 - `src/observability/logger.ts` — `logger`. Import `pino` nowhere else.
+- `src/observability/events.ts` — `recordEvent()`, the only write path into the `events`
+  table. Behavioural events are product data, not logs: Phase 5's dashboard and every
+  discipline metric are computed from them. `observed_at` is stamped server-side there and
+  a caller-supplied one is dropped and logged. Pass the open transaction as the second
+  argument to make the event atomic with the state change it describes. `DatabaseExecutor`
+  (the pooled client, or a transaction) is exported from here so the type flows one way.
 - `src/observability/error-tracking.ts` — `captureError`, plus the
   `initErrorTracking` / `onRequestError` hooks that `src/instrumentation.ts` (server,
   edge) and `src/instrumentation-client.ts` (browser) delegate to. Import

@@ -56,8 +56,25 @@ not the ability to trade as the wrong identity via a signature.
 - Signing is the only identity check that holds during the window. Do not treat session
   identity alone as proof of the active wallet.
 
+**Not retested since `7baf105`:** this record was written at `18cb719`, and its "three
+independent channels" describes what `e6453ad` *intended*, not what ran during the manual
+test that produced the evidence above. `7baf105` landed afterwards and replaced the
+duck-typed `features` lookup in `client/wallet/wallet-account-watch.ts` with
+`getWalletFeature` — which, per
+[wallet-standard-ui-dependency](wallet-standard-ui-dependency.md), is what made the
+per-wallet `standard:events` channel resolve for the Kit plugin's `UiWallet` handles for
+the first time; the old lookup returned `null` for every one of them. Channel 2 was
+therefore dead when the limitation was established, and the current code has **not** been
+tested against it.
+
+This is **not** a claim the desync is fixed — it is untested, which is a different thing.
+The accepted limitation and every constraint above stand until a retest says otherwise.
+
 **Revisit when:**
 
+- **First: retest.** Reproduce an in-extension switch against current `main` before acting
+  on anything here. The channel that became live at `7baf105` was never exercised by the
+  test that established this limitation.
 - Before Phase 4 (wallet accountability), or before any flow that reads session identity
   without requiring a fresh signature.
 - Wallet-standard or the Solana wallet libraries ship reliable account-change propagation.

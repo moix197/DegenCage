@@ -5,6 +5,9 @@ where it lives, and links to any decision or pattern doc. Keep rows terse —
 this is a lookup table, not documentation. Retire rows that no longer point
 anywhere real.
 
+For package boundaries, dependency direction and data flow, read
+[architecture](architecture.md) alongside this map.
+
 ## Modules
 
 | Module / package | Responsibility (one line) | Path | Decisions / patterns |
@@ -13,9 +16,10 @@ anywhere real.
 | `@degencage/rules` | The rule engine — pure, I/O-free, the product IP; owns the constitution document schema | `packages/rules` | [monorepo-package-shape](decisions/monorepo-package-shape.md), [constitution-schema](decisions/constitution-schema.md) |
 | db | Drizzle schema, migrations, and the one pooled Postgres handle (`getDb()`) | `apps/web/src/server/db` | [migration-and-test-tooling](decisions/migration-and-test-tooling.md), [single-source-of-truth-database](decisions/single-source-of-truth-database.md) |
 | flags | `isFeatureEnabled()` — the single fail-closed kill-switch read path | `apps/web/src/server/flags` | [feature-flags-and-kill-switches](decisions/feature-flags-and-kill-switches.md) |
-| observability | `logger` + `captureError` — the only import points for pino and Sentry | `apps/web/src/observability` | [observability-stack](decisions/observability-stack.md) |
-| auth | SIWS sign-in, rate-limited nonce issuance, session issue/revoke/`resolveSession()`, and the client wallet account watcher | `apps/web/src/server/auth` ([README](../apps/web/src/server/auth/README.md)), `apps/web/src/client/wallet` | [rate-limit-forwarded-header-trust](decisions/rate-limit-forwarded-header-trust.md), [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md), [wallet-standard-ui-dependency](decisions/wallet-standard-ui-dependency.md) |
-| constitution | Draft → commit → activate lifecycle of a trading constitution, and the 20-minute commitment window | `apps/web/src/server/constitution` ([README](../apps/web/src/server/constitution/README.md)) | [commitment-window-server-clock](decisions/commitment-window-server-clock.md), [constitution-schema](decisions/constitution-schema.md), [guarded-state-transition](patterns/guarded-state-transition.md) |
+| observability | `logger` + `captureError` — the only import points for pino and Sentry — plus `recordEvent()`, the **sole** write path into `events`: the audit trail Phase 5 reads, server-stamped `observed_at`, transaction-aware | `apps/web/src/observability` | [observability-stack](decisions/observability-stack.md), [event-time-vs-observation-time](decisions/event-time-vs-observation-time.md) |
+| auth | SIWS sign-in, rate-limited nonce issuance, session issue/revoke/`resolveSession()` | `apps/web/src/server/auth` ([README](../apps/web/src/server/auth/README.md)) | [rate-limit-forwarded-header-trust](decisions/rate-limit-forwarded-header-trust.md), [guarded-state-transition](patterns/guarded-state-transition.md) |
+| wallet (client) | Browser half of sign-in: connect panel, SIWS dispatch, and the account-switch watcher's three change channels | `apps/web/src/client/wallet` (documented in the [auth README](../apps/web/src/server/auth/README.md)) | [wallet-account-switch-desync](decisions/wallet-account-switch-desync.md), [wallet-standard-ui-dependency](decisions/wallet-standard-ui-dependency.md) |
+| constitution | Draft → commit → activate lifecycle of a trading constitution, and the 20-minute commitment window | `apps/web/src/server/constitution` ([README](../apps/web/src/server/constitution/README.md)); UI at `apps/web/src/app/constitution` | [commitment-window-server-clock](decisions/commitment-window-server-clock.md), [constitution-schema](decisions/constitution-schema.md), [guarded-state-transition](patterns/guarded-state-transition.md) |
 
 > Add a row when a module lands. Don't pre-populate rows for paths that don't exist.
 

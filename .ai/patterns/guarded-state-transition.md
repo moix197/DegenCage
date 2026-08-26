@@ -10,6 +10,7 @@ branches on whether a row came back. Never `SELECT`, decide in application code,
 | Site | Precondition carried by the WHERE |
 | ---- | --------------------------------- |
 | `server/auth/solana-siws.ts` — nonce consume | `consumed_at IS NULL` |
+| `server/auth/solana-siws.ts` — `claimRejectionEventSlot` | `rejection_recorded_at IS NULL` |
 | `server/auth/session.ts` — revoke | `revoked_at IS NULL` |
 | `server/constitution/commitment.ts` — `updateExistingDraft` | `status = 'draft'` |
 | `server/constitution/commitment.ts` — `startCommitment` | `status = 'draft'` |

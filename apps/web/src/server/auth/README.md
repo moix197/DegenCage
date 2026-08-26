@@ -151,6 +151,18 @@ they stop at the log — otherwise the audit trail becomes the unbounded table t
 limit exists to deny. Rate-limit rejections are logged for the same reason and are never
 events.
 
+**At most one `auth.sign_in_rejected` per challenge.** Having a row is not by itself a
+bound: one issued challenge can be replayed indefinitely, so the rate limit would cap
+*issuance* while `events` still grew per attempt. `claimRejectionEventSlot()` takes the
+challenge's single slot with `UPDATE … WHERE rejection_recorded_at IS NULL … RETURNING` —
+the same guard shape as the nonce consume ([`.ai/patterns/guarded-state-transition.md`](../../../../../.ai/patterns/guarded-state-transition.md))
+— so N racing replays of one nonce write one event, and the database decides which. The
+claim runs on the pooled client and **never inside the sign-in transaction**: that
+transaction has already rolled back by the time a rejection is recorded, which would take
+the claim with it and hand the replay its slot straight back. A claim that cannot be made
+writes no event and is captured, not thrown — telemetry must not turn a rejection into a
+503, and guessing reintroduces the unbounded table.
+
 ## Kill switch
 
 `auth.wallet_connect` (`WALLET_CONNECT_FLAG`), seeded by `src/server/db/seed.ts`, gates
