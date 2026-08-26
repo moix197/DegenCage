@@ -6,6 +6,30 @@ import { decideReauth, type ReauthTrigger } from './account-switch';
 import { readActiveAddress, subscribeToWalletAccountChanges } from './wallet-account-watch';
 
 /**
+ * The wallet-standard registry, stood in for: real `UiWallet` handles are resolved to their
+ * underlying `Wallet` through a module-level `WeakMap` that only the wallet-standard app
+ * layer can populate, so the fakes below register their feature implementations here
+ * instead. `getWalletFeature` is mocked over that map with the real contract — including
+ * the throw for a wallet that does not implement the feature, which is what the graceful
+ * degradation is guarding against.
+ */
+const { walletFeatures } = vi.hoisted(() => ({
+  walletFeatures: new WeakMap<object, Record<string, unknown>>(),
+}));
+
+vi.mock('@wallet-standard/ui', () => ({
+  getWalletFeature: (handle: object, featureName: string) => {
+    const features = walletFeatures.get(handle);
+
+    if (!features || !(featureName in features)) {
+      throw new Error(`Wallet does not implement \`${featureName}\``);
+    }
+
+    return features[featureName];
+  },
+}));
+
+/**
  * The subscription itself, tested without a browser, a wallet extension, or React.
  *
  * This is the regression for the hole it closes: the watcher compared the wallet against
@@ -26,8 +50,8 @@ const OTHER_ADDRESS = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 interface FakeWallet {
   name: string;
-  /** A record of implementations (a raw wallet), or an array of names (a `UiWallet`). */
-  features: Record<string, unknown> | string[];
+  /** As on a `UiWallet`: feature *names*; the implementations live in the registry. */
+  features: string[];
 }
 
 /** A wallet that implements `standard:events`, with its listeners exposed for the test. */
@@ -43,15 +67,19 @@ function walletWithEvents(name: string) {
     };
   });
 
+  const wallet = { name, features: ['standard:connect', 'standard:events'] } satisfies FakeWallet;
+
+  walletFeatures.set(wallet, { 'standard:events': { on } });
+
   return {
-    wallet: { name, features: { 'standard:events': { on } } } satisfies FakeWallet,
+    wallet,
     on,
     unsubscribe,
     emitChange: () => listeners.forEach((listener) => listener()),
   };
 }
 
-/** The `UiWallet` shape: feature *names* only, nothing to attach to. */
+/** A wallet that does not implement `standard:events`: nothing to attach to. */
 function walletWithoutEvents(name: string): FakeWallet {
   return { name, features: ['standard:connect', 'solana:signIn'] };
 }

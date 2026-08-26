@@ -1,4 +1,5 @@
 import type { ClientWithWallet } from '@solana/kit-plugin-wallet';
+import { getWalletFeature, type UiWallet } from '@wallet-standard/ui';
 
 /**
  * Every channel that can tell us the wallet's active account moved, wired as one
@@ -17,8 +18,8 @@ import type { ClientWithWallet } from '@solana/kit-plugin-wallet';
  * 1. **The plugin store** (`client.wallet.subscribe`). The store attaches one
  *    `standard:events` `change` subscription per discovered wallet and reconciles the
  *    active account from it, so this is that event, fanned out.
- * 2. **The wallet's own `standard:events`**, when the handle exposes its feature
- *    implementations. A wallet without the feature is simply not attached to — never a
+ * 2. **The wallet's own `standard:events`**, resolved from the handle with
+ *    `getWalletFeature`. A wallet without the feature is simply not attached to — never a
  *    throw, never a missing channel for the others.
  * 3. **Refocus** (`visibilitychange` / `focus`). The backstop for a wallet whose change
  *    event is unreliable or never arrives: coming back to the tab re-reads the wallet.
@@ -50,27 +51,20 @@ function isStandardEventsFeature(value: unknown): value is StandardEventsFeature
 }
 
 /**
- * The wallet's `standard:events` implementation, or `null` when it cannot be reached.
+ * The wallet's `standard:events` implementation, or `null` when the wallet has none.
  *
- * A handle that carries its feature *implementations* (a raw wallet-standard `Wallet`) is
- * subscribed directly. The Kit plugin's `UiWallet` handles carry feature *names* only, and
- * resolving those to an implementation needs `getWalletFeature` from `@wallet-standard/ui`
- * — not a declared dependency of this app, and under `nodeLinker: hoisted` an undeclared
- * import is a clean-install failure waiting to happen. Those wallets are covered by the
- * store channel (which holds exactly this subscription itself) and by refocus.
- *
- * Either way a wallet that does not implement the feature degrades to "one fewer channel",
- * never to a crash.
+ * A `UiWallet` handle carries feature *names* only; `getWalletFeature` resolves one to the
+ * implementation on the underlying wallet-standard `Wallet`, and *throws* when the wallet
+ * does not implement it. So the handle's own feature list is asked first: a wallet without
+ * the feature degrades to "one fewer channel" — it is still covered by the store channel
+ * and by refocus — never to a crash that takes the other channels down with it.
  */
-function standardEventsOf(wallet: unknown): StandardEventsFeature | null {
-  const features = (wallet as { features?: unknown } | null)?.features;
-
-  // `UiWallet.features` is an array of names; a raw wallet's is a record of implementations.
-  if (typeof features !== 'object' || features === null || Array.isArray(features)) {
+function standardEventsOf(wallet: UiWallet): StandardEventsFeature | null {
+  if (!wallet.features.includes(STANDARD_EVENTS_FEATURE)) {
     return null;
   }
 
-  const feature = (features as Record<string, unknown>)[STANDARD_EVENTS_FEATURE];
+  const feature = getWalletFeature(wallet, STANDARD_EVENTS_FEATURE);
 
   return isStandardEventsFeature(feature) ? feature : null;
 }
