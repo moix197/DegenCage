@@ -32,6 +32,19 @@ export type ConstitutionRejectionReason =
   | 'no_committing_constitution'
   | 'commitment_not_elapsed';
 
+/** Postgres' SQLSTATE for a unique-constraint violation — driver-agnostic, not neon-specific. */
+const UNIQUE_VIOLATION_CODE = '23505';
+
+/** True for the `constitutions_user_id_idx` race: two concurrent first-saves for one user. */
+function isUniqueUserConstitutionViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === UNIQUE_VIOLATION_CODE
+  );
+}
+
 export class ConstitutionActionRejected extends Error {
   constructor(readonly reason: ConstitutionRejectionReason) {
     super(`constitution action rejected: ${reason}`);
@@ -161,6 +174,45 @@ async function updateExistingDraft(
 }
 
 /**
+ * Inserts the caller's first draft, or — if a concurrent request for the same user won the
+ * race first — falls back to updating the row that request just created.
+ *
+ * `constitutions_user_id_idx` is a UNIQUE index on `user_id`, so two concurrent first-saves
+ * (a double-submit, or two tabs) can both pass the `loadConstitutionForUser` check above and
+ * both attempt an INSERT; the loser hits a unique violation. Surfacing that raw driver error
+ * would be a 500 for what is, from the caller's point of view, an ordinary double-click —
+ * the same "re-check rather than error" idempotency `startCommitment` and
+ * `activateConstitution` already apply to their own races. Retrying into
+ * `updateExistingDraft` makes the loser's save just apply on top, last-write-wins, exactly as
+ * if the two requests had been serialized.
+ */
+async function insertNewDraft(
+  session: { userId: string; walletId: string },
+  values: { document: Constitution; schemaVersion: number },
+): Promise<ConstitutionRow> {
+  try {
+    const inserted = await getDb()
+      .insert(constitutions)
+      .values({ userId: session.userId, walletId: session.walletId, status: 'draft', ...values })
+      .returning();
+
+    return inserted[0]!;
+  } catch (error) {
+    if (!isUniqueUserConstitutionViolation(error)) {
+      throw error;
+    }
+
+    const raced = await loadConstitutionForUser(session.userId);
+
+    if (!raced) {
+      throw error;
+    }
+
+    return updateExistingDraft(raced.id, values);
+  }
+}
+
+/**
  * Creates or updates the caller's draft constitution.
  *
  * Validated against `parseConstitution` before it ever reaches the database — the server
@@ -192,14 +244,7 @@ export async function saveDraftConstitution(
     schemaVersion: parsed.constitution.schemaVersion,
   };
 
-  const row = existing
-    ? await updateExistingDraft(existing.id, values)
-    : (
-        await getDb()
-          .insert(constitutions)
-          .values({ userId: session.userId, walletId: session.walletId, status: 'draft', ...values })
-          .returning()
-      )[0]!;
+  const row = existing ? await updateExistingDraft(existing.id, values) : await insertNewDraft(session, values);
 
   await recordEventWithinRateLimit('constitution.drafted', session.userId, correlationId, new Date(), {
     constitutionId: row.id,

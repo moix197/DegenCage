@@ -72,6 +72,24 @@ function selectReturns(rows: unknown[]) {
   });
 }
 
+/** Same as `selectReturns`, but only for the next call — lets a test sequence two reads. */
+function selectReturnsOnce(rows: unknown[]) {
+  selectMock.mockReturnValueOnce({
+    from: () => ({
+      where: () => ({
+        limit: () => Promise.resolve(rows),
+      }),
+    }),
+  });
+}
+
+/** A Postgres unique-violation error, shaped like what `@neondatabase/serverless` throws. */
+function uniqueViolationError(): Error & { code: string } {
+  return Object.assign(new Error('duplicate key value violates unique constraint "constitutions_user_id_idx"'), {
+    code: '23505',
+  });
+}
+
 /**
  * Mimics drizzle's `update().set().where().returning()` chain, capturing both what was set
  * AND the WHERE it was set under. Capturing `where` is what makes a test able to fail: the
@@ -196,8 +214,16 @@ describe('saveDraftConstitution', () => {
     const result = await saveDraftConstitution(constitutionDocument(), 'trade-intent-update');
 
     expect(result.status).toBe('draft');
+    /**
+     * Both predicates matter here: `status = 'draft'` alone would let this UPDATE match any
+     * draft row in the table, not just the caller's own — asserting on `id` too is what
+     * makes this test fail if `eq(constitutions.id, constitutionId)` is ever dropped from
+     * `updateExistingDraft`'s WHERE.
+     */
     const { sql: whereClause, params } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('"id" =');
     expect(whereClause).toContain('"status" =');
+    expect(params).toContain('constitution-1');
     expect(params).toContain('draft');
   });
 
@@ -226,6 +252,43 @@ describe('saveDraftConstitution', () => {
     expect(whereClause).toContain('"status" =');
     expect(params).toContain('draft');
   });
+
+  /**
+   * `constitutions_user_id_idx` is a UNIQUE index on `user_id` — two concurrent first-saves
+   * for the same user (a double-submit, or two tabs) can both pass the `existing` check and
+   * both attempt an INSERT; the loser hits this unique violation. Without a retry, that
+   * would surface to the caller as an unhandled 500 rather than the ordinary double-click
+   * race it actually is.
+   */
+  it('retries as an update when a concurrent first-save wins the unique-index race', async () => {
+    selectReturnsOnce([]); // initial check: no existing draft yet
+    insertMock.mockReturnValue({
+      values: () => ({ returning: () => Promise.reject(uniqueViolationError()) }),
+    });
+    const racedRow = row({ id: 'constitution-raced', status: 'draft' });
+    selectReturnsOnce([racedRow]); // re-check: the winner of the race already inserted it
+    const { whereSpy } = updateReturns([racedRow]);
+
+    const result = await saveDraftConstitution(constitutionDocument(), 'trade-intent-race');
+
+    expect(result.status).toBe('draft');
+    const { params } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(params).toContain('constitution-raced');
+  });
+
+  /** The retry still respects `not_editable` — it never overwrites a row past `draft`. */
+  it('rejects the unique-index race retry if the winning row is no longer a draft', async () => {
+    selectReturnsOnce([]);
+    insertMock.mockReturnValue({
+      values: () => ({ returning: () => Promise.reject(uniqueViolationError()) }),
+    });
+    selectReturnsOnce([row({ status: 'committing', commitmentStartedAt: new Date() })]);
+    updateReturns([]); // conditional UPDATE ... WHERE status='draft' matches nothing
+
+    await expect(saveDraftConstitution(constitutionDocument(), 'trade-intent-race-2')).rejects.toThrow(
+      ConstitutionActionRejected,
+    );
+  });
 });
 
 describe('startCommitment', () => {
@@ -245,7 +308,7 @@ describe('startCommitment', () => {
 
   it('moves a draft to committing and records the event', async () => {
     const startedRow = row({ status: 'committing', commitmentStartedAt: new Date() });
-    const { setSpy } = updateReturns([startedRow]);
+    const { setSpy, whereSpy } = updateReturns([startedRow]);
 
     const result = await startCommitment('trade-intent-8');
 
@@ -255,6 +318,19 @@ describe('startCommitment', () => {
       eventType: 'constitution.commitment_started',
       correlationId: 'trade-intent-8',
     });
+
+    /**
+     * This WHERE is what stops a double-click (or a race with another request) from
+     * restarting the 20-minute clock on a row that is already `committing` — it must scope
+     * to this user AND only match a still-`draft` row. Asserting on the captured predicate,
+     * not just the mocked return value, is what makes this test fail if either guard is
+     * ever deleted from `startCommitment`.
+     */
+    const { sql: whereClause, params } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('"user_id" =');
+    expect(whereClause).toContain('"status" =');
+    expect(params).toContain(SESSION_USER_ID);
+    expect(params).toContain('draft');
   });
 
   /** A double-click must not restart the 20-minute clock or double-record the event. */
