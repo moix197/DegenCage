@@ -23,6 +23,25 @@ export const SESSION_COOKIE_NAME = 'degencage_session';
 /** Sliding, per decision 15: every resolved request pushes the horizon back out. */
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 
+/**
+ * The ceiling the sliding window cannot climb over: measured from `created_at`, so it is a
+ * function of when the wallet last *proved* it holds the key and of nothing the holder of
+ * the cookie does afterwards.
+ *
+ * A purely sliding session is immortal — stay active and it never has to be re-proved,
+ * which is exactly the property a stolen cookie wants. In a product whose whole premise is
+ * that the user's rules outlive their impulses, "this wallet is still yours" is a claim
+ * that has to be renewed on a schedule, not one that renews itself by being used. Ninety
+ * days: long enough that a disciplined user is not re-signing constantly, short enough that
+ * a session outliving the wallet that opened it is measured in weeks, not years.
+ */
+export const SESSION_ABSOLUTE_MAX_LIFETIME_MS = 90 * 24 * 60 * 60 * 1_000;
+
+/** The instant a session dies no matter how recently it was used. */
+function absoluteDeadline(createdAt: Date): Date {
+  return new Date(createdAt.getTime() + SESSION_ABSOLUTE_MAX_LIFETIME_MS);
+}
+
 export interface SessionIdentity {
   walletAddress: string;
   walletId: string;
@@ -55,6 +74,10 @@ function hashSessionId(sessionId: string): string {
 
 export function sessionExpiryFrom(now: Date): Date {
   return new Date(now.getTime() + SESSION_TTL_MS);
+}
+
+function earlier(a: Date, b: Date): Date {
+  return a.getTime() <= b.getTime() ? a : b;
 }
 
 /**
@@ -152,6 +175,8 @@ async function readSessionCookie(): Promise<string | undefined> {
 
 export interface StoredSession {
   walletAddress: string;
+  /** When the signature that created this session was verified — the absolute clock's zero. */
+  createdAt: Date;
   expiresAt: Date;
   revokedAt: Date | null;
   walletId: string;
@@ -159,9 +184,13 @@ export interface StoredSession {
 }
 
 /**
- * Pure decision: is this stored session still good? Revocation and expiry are checked
- * here rather than folded into the `WHERE` clause so both are visible, individually
- * testable, and cannot be silently lost in a query rewrite.
+ * Pure decision: is this stored session still good? Revocation, the absolute ceiling and
+ * the sliding expiry are checked here rather than folded into the `WHERE` clause so each is
+ * visible, individually testable, and cannot be silently lost in a query rewrite.
+ *
+ * The ceiling is checked *independently* of `expires_at`, and not by clamping the stored
+ * value: a row written before the cap existed, or by a future code path that forgets to
+ * clamp, still dies on time.
  */
 export function isSessionUsable(row: StoredSession | undefined, now: Date): row is StoredSession {
   if (!row) {
@@ -172,6 +201,10 @@ export function isSessionUsable(row: StoredSession | undefined, now: Date): row 
     return false;
   }
 
+  if (absoluteDeadline(row.createdAt).getTime() <= now.getTime()) {
+    return false;
+  }
+
   return row.expiresAt.getTime() > now.getTime();
 }
 
@@ -179,6 +212,7 @@ async function loadSession(idHash: string): Promise<StoredSession | undefined> {
   const rows = await getDb()
     .select({
       walletAddress: sessions.walletAddress,
+      createdAt: sessions.createdAt,
       expiresAt: sessions.expiresAt,
       revokedAt: sessions.revokedAt,
       walletId: wallets.id,
@@ -229,7 +263,11 @@ export async function resolveSession(
       return null;
     }
 
-    const expiresAt = slideExpiry ? sessionExpiryFrom(now) : row.expiresAt;
+    // The slide may push the horizon out, never past the ceiling — so a session's last
+    // hours are not silently extended into another thirty days by one late request.
+    const expiresAt = slideExpiry
+      ? earlier(sessionExpiryFrom(now), absoluteDeadline(row.createdAt))
+      : row.expiresAt;
 
     if (slideExpiry) {
       await getDb()

@@ -12,7 +12,12 @@ import {
   revokeSession,
   type SessionCookie,
 } from '@/server/auth/session';
-import { parseSignInProof, SignInRejected, verifyWalletSignIn } from '@/server/auth/solana-siws';
+import {
+  parseSignInProof,
+  recordSignInRejection,
+  SignInRejected,
+  verifyWalletSignIn,
+} from '@/server/auth/solana-siws';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -26,17 +31,19 @@ async function applyCookie(cookie: SessionCookie): Promise<void> {
  *
  * Every rejection returns the same shape and status. A caller learns only that it failed,
  * never *which* of expiry, replay, domain or signature tripped — that distinction is in
- * the logs, where it is useful, not in the response, where it is a probing oracle.
+ * the logs and the event log, where it is useful, not in the response, where it is a
+ * probing oracle.
  */
 export async function POST(request: Request): Promise<Response> {
   const correlationId = randomUUID();
 
   try {
-    // A body that is not JSON is a rejected sign-in, not a server fault.
+    // A body that is not JSON is a rejected sign-in, not a server fault — so it takes the
+    // same exit as every other rejection, and is logged and classified with them.
     const proof = parseSignInProof(await request.json().catch(() => null));
 
     if (!proof) {
-      return Response.json({ error: 'sign_in_rejected', correlationId }, { status: 401 });
+      throw new SignInRejected('malformed_proof');
     }
 
     // Read *before* verifying and before the new cookie is written: this is the identity
@@ -55,6 +62,7 @@ export async function POST(request: Request): Promise<Response> {
   } catch (error) {
     if (error instanceof SignInRejected) {
       logger.warn('wallet sign-in rejected', { correlationId, reason: error.reason });
+      await recordSignInRejection(correlationId, error.reason);
 
       return Response.json({ error: 'sign_in_rejected', correlationId }, { status: 401 });
     }

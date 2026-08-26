@@ -5,9 +5,13 @@ import type { SolanaSignInOutput } from '@solana/wallet-standard-features';
 import { parseSignInMessage, verifySignIn } from '@solana/wallet-standard-util';
 import { and, eq, isNull } from 'drizzle-orm';
 
+import { captureError } from '../../observability/error-tracking';
+import { recordEvent } from '../../observability/events';
 import { logger } from '../../observability/logger';
 import { getDb } from '../db/client';
 import { siwsChallenges, type SiwsChallengeRow, type StoredSignInInput } from '../db/schema';
+import { assertWithinChallengeRateLimit } from './challenge-rate-limit';
+import { reapExpiredChallenges } from './challenge-reaper';
 import {
   establishSession,
   supersedePreviousSession,
@@ -71,6 +75,7 @@ export function parseSignInProof(body: unknown): WalletSignInProof | null {
 }
 
 export type SignInRejection =
+  | 'malformed_proof'
   | 'malformed_message'
   | 'unknown_nonce'
   | 'nonce_already_consumed'
@@ -80,6 +85,65 @@ export type SignInRejection =
   | 'signature_invalid';
 
 export type SignInCheck = { ok: true; address: string } | { ok: false; reason: SignInRejection };
+
+/**
+ * The rejections that were reached by evaluating a challenge we actually issued.
+ *
+ * The distinction is what makes the rejection audit trail affordable. `verify` is
+ * unauthenticated, so anything it records per call is a write an anonymous caller controls
+ * the volume of; but to get *past* the nonce lookup a caller has to be holding a nonce we
+ * issued, and issuance is rate limited (`challenge-rate-limit`). Everything below is
+ * therefore bounded by that limit. The two excluded reasons — a body that is not a proof,
+ * and a nonce we never issued — are free to generate and stop at the log.
+ */
+const REJECTIONS_AGAINST_A_STORED_CHALLENGE: ReadonlySet<SignInRejection> = new Set([
+  'nonce_already_consumed',
+  'challenge_expired',
+  'domain_mismatch',
+  'address_mismatch',
+  'signature_invalid',
+] satisfies SignInRejection[]);
+
+/** Whether this rejection belongs in the event log, per the rule above. */
+function isRejectionOfAStoredChallenge(reason: SignInRejection): boolean {
+  return REJECTIONS_AGAINST_A_STORED_CHALLENGE.has(reason);
+}
+
+/**
+ * Records a refused sign-in in the event log.
+ *
+ * A rejection is a *decision*, and the decisions are what the audit trail is for
+ * (CLAUDE.md → Observability): "how often is a sign-in refused, and why" is a question
+ * about this product's behaviour, and until now the only trace of it was a log line.
+ *
+ * Nothing identifying goes in. `userId` is null and the payload carries the reason alone —
+ * no address, no public key, no nonce. No signature has proved an identity on this path, an
+ * unproven address does not enter the audit trail, and the reason is no finer a distinction
+ * than the server already drew for itself. It adds no oracle either: the HTTP response is
+ * uniformly opaque whatever is written here, and nothing here is readable by the caller.
+ *
+ * Captured, never thrown: telemetry must not convert a rejection into a 503.
+ */
+export async function recordSignInRejection(
+  correlationId: string,
+  reason: SignInRejection,
+): Promise<void> {
+  if (!isRejectionOfAStoredChallenge(reason)) {
+    return;
+  }
+
+  try {
+    await recordEvent({
+      eventType: 'auth.sign_in_rejected',
+      occurredAt: new Date(),
+      correlationId,
+      userId: null,
+      payload: { reason },
+    });
+  } catch (error) {
+    captureError(error, { correlationId, operation: 'recordSignInRejection' });
+  }
+}
 
 /**
  * The domain is configuration, never a request header. Deriving it from `Host` or
@@ -107,18 +171,51 @@ export function buildSignInInput(now: Date, domain: string): StoredSignInInput {
   };
 }
 
-export async function issueSignInChallenge(correlationId: string): Promise<StoredSignInInput> {
+/**
+ * Housekeeping, on the write path that produces the garbage.
+ *
+ * Never fatal: the challenge is already committed and returned, so a failed delete must
+ * not turn a sign-in the caller can complete into a 503. Captured rather than swallowed —
+ * a reaper that has quietly stopped running is exactly the kind of thing that is only ever
+ * noticed by the table it was supposed to be draining.
+ */
+async function reapOpportunistically(correlationId: string, now: Date): Promise<void> {
+  try {
+    await reapExpiredChallenges(getDb(), correlationId, now);
+  } catch (error) {
+    captureError(error, { correlationId, operation: 'reapExpiredChallenges' });
+  }
+}
+
+/**
+ * Issues one challenge for one client, behind the rate limit.
+ *
+ * The limit lives here rather than in the route so that the check and the write it guards
+ * cannot drift apart: there is no way to add a `siws_challenges` row without passing it.
+ *
+ * @param clientKey - From `clientKeyForRequest` — derived from transport headers, never
+ *   from anything in a request body. It buys no identity; it is only what the limit counts.
+ */
+export async function issueSignInChallenge(
+  correlationId: string,
+  clientKey: string,
+): Promise<StoredSignInInput> {
   const now = new Date();
   const input = buildSignInInput(now, requiredSignInDomain());
+
+  await assertWithinChallengeRateLimit(getDb(), clientKey, correlationId, now);
 
   await getDb().insert(siwsChallenges).values({
     nonce: input.nonce,
     input,
     issuedAt: now,
     expiresAt: new Date(input.expirationTime),
+    clientKey,
   });
 
   logger.info('siws challenge issued', { correlationId, nonce: input.nonce });
+
+  await reapOpportunistically(correlationId, now);
 
   return input;
 }

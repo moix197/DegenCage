@@ -9,6 +9,7 @@ import {
   parseRevocationReason,
   resolveSession,
   revokeSession,
+  SESSION_ABSOLUTE_MAX_LIFETIME_MS,
   SESSION_COOKIE_NAME,
   supersedePreviousSession,
   type SessionIdentity,
@@ -42,6 +43,7 @@ function sha256(value: string): string {
 function storedSession(overrides: Partial<StoredSession> = {}): StoredSession {
   return {
     walletAddress: WALLET_ADDRESS,
+    createdAt: new Date(Date.now() - 60_000),
     expiresAt: new Date(Date.now() + 60_000),
     revokedAt: null,
     walletId: 'wallet-1',
@@ -220,6 +222,30 @@ describe('isSessionUsable', () => {
       true,
     );
   });
+
+  /**
+   * The sliding window on its own makes a session immortal: keep using it and it is never
+   * re-proved, which is precisely what a stolen cookie wants. The ceiling is measured from
+   * the signature that created the session, so activity cannot buy past it.
+   */
+  it('rejects a session past its absolute lifetime however recently it was used', () => {
+    const row = storedSession({
+      createdAt: new Date(now.getTime() - SESSION_ABSOLUTE_MAX_LIFETIME_MS - 1_000),
+      expiresAt: new Date(now.getTime() + 29 * 24 * 60 * 60 * 1_000),
+    });
+
+    expect(row.expiresAt.getTime()).toBeGreaterThan(now.getTime());
+    expect(isSessionUsable(row, now)).toBe(false);
+  });
+
+  it('accepts a session a moment short of the ceiling', () => {
+    const row = storedSession({
+      createdAt: new Date(now.getTime() - SESSION_ABSOLUTE_MAX_LIFETIME_MS + 1_000),
+      expiresAt: new Date(now.getTime() + 60_000),
+    });
+
+    expect(isSessionUsable(row, now)).toBe(true);
+  });
 });
 
 describe('resolveSession', () => {
@@ -285,6 +311,36 @@ describe('resolveSession', () => {
     lookupReturning([]);
 
     await expect(resolveSession(SESSION_ID)).resolves.toBeNull();
+  });
+
+  /** The cap is enforced on the read path too, not only as a pure decision. */
+  it('fails a session past the absolute cap even though it is being used right now', async () => {
+    lookupReturning([
+      storedSession({
+        createdAt: new Date(Date.now() - SESSION_ABSOLUTE_MAX_LIFETIME_MS - 1_000),
+        expiresAt: new Date(Date.now() + 29 * 24 * 60 * 60 * 1_000),
+      }),
+    ]);
+    const { setSpy } = captureUpdate();
+
+    await expect(resolveSession(SESSION_ID)).resolves.toBeNull();
+    expect(setSpy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A late request must not quietly extend a session's last hours into another thirty days.
+   * The slide stops at the ceiling.
+   */
+  it('never slides the expiry past the absolute deadline', async () => {
+    const createdAt = new Date(Date.now() - SESSION_ABSOLUTE_MAX_LIFETIME_MS + 60_000);
+    lookupReturning([storedSession({ createdAt })]);
+    const { setSpy } = captureUpdate();
+
+    const session = await resolveSession(SESSION_ID);
+
+    const deadline = createdAt.getTime() + SESSION_ABSOLUTE_MAX_LIFETIME_MS;
+    expect(session?.expiresAt.getTime()).toBe(deadline);
+    expect((setSpy.mock.calls[0]?.[0] as { expiresAt: Date }).expiresAt.getTime()).toBe(deadline);
   });
 
   it('fails closed when the database is unreachable, and reports it', async () => {

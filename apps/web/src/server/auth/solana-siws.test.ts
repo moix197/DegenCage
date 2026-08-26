@@ -5,12 +5,16 @@ import { createSignInMessage } from '@solana/wallet-standard-util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SiwsChallengeRow, StoredSignInInput } from '../db/schema';
+import { ChallengeRateLimited, CHALLENGE_RATE_LIMIT_MAX } from './challenge-rate-limit';
 import {
   buildSignInInput,
   checkSignIn,
+  issueSignInChallenge,
+  recordSignInRejection,
   requiredSignInDomain,
   SignInRejected,
   verifyWalletSignIn,
+  type SignInRejection,
   type WalletSignInProof,
 } from './solana-siws';
 
@@ -21,17 +25,40 @@ import {
  * closed on its own.
  */
 
-const { transactionMock, establishSessionMock, supersedePreviousSessionMock } = vi.hoisted(() => ({
+const {
+  transactionMock,
+  selectMock,
+  insertMock,
+  deleteMock,
+  establishSessionMock,
+  supersedePreviousSessionMock,
+  recordEventMock,
+  captureErrorMock,
+} = vi.hoisted(() => ({
   transactionMock: vi.fn(),
+  selectMock: vi.fn(),
+  insertMock: vi.fn(),
+  deleteMock: vi.fn(),
   establishSessionMock: vi.fn(),
   supersedePreviousSessionMock: vi.fn(),
+  recordEventMock: vi.fn(),
+  captureErrorMock: vi.fn(),
 }));
 
-vi.mock('../db/client', () => ({ getDb: () => ({ transaction: transactionMock }) }));
+vi.mock('../db/client', () => ({
+  getDb: () => ({
+    transaction: transactionMock,
+    select: selectMock,
+    insert: insertMock,
+    delete: deleteMock,
+  }),
+}));
 vi.mock('./session', () => ({
   establishSession: establishSessionMock,
   supersedePreviousSession: supersedePreviousSessionMock,
 }));
+vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
+vi.mock('../../observability/error-tracking', () => ({ captureError: captureErrorMock }));
 
 const DOMAIN = 'degencage.test';
 
@@ -65,6 +92,7 @@ function challengeRow(input: StoredSignInInput, consumedAt: Date | null = null):
     issuedAt: new Date(input.issuedAt),
     expiresAt: new Date(input.expirationTime),
     consumedAt,
+    clientKey: 'client-key-hash',
   };
 }
 
@@ -407,5 +435,143 @@ describe('verifyWalletSignIn', () => {
       wallet.address,
       'trade-intent-12',
     );
+  });
+});
+
+
+describe('issueSignInChallenge', () => {
+  const CLIENT_KEY = 'client-key-hash';
+  let valuesSpy: ReturnType<typeof vi.fn>;
+
+  /** `select().from().where()` — the rate limiter's count. */
+  function issuedInWindow(count: number | Error) {
+    selectMock.mockReturnValue({
+      from: () => ({
+        where: () =>
+          count instanceof Error ? Promise.reject(count) : Promise.resolve([{ issued: count }]),
+      }),
+    });
+  }
+
+  function reapReturning(result: { nonce: string }[] | Error) {
+    deleteMock.mockReturnValue({
+      where: () => ({
+        returning: () => (result instanceof Error ? Promise.reject(result) : Promise.resolve(result)),
+      }),
+    });
+  }
+
+  beforeEach(() => {
+    valuesSpy = vi.fn().mockResolvedValue(undefined);
+    insertMock.mockReturnValue({ values: valuesSpy });
+    issuedInWindow(0);
+    reapReturning([]);
+  });
+
+  it('issues a challenge and records which client it was issued to', async () => {
+    const issued = await issueSignInChallenge('trade-intent-20', CLIENT_KEY);
+
+    expect(issued.nonce).toHaveLength(64);
+    expect(valuesSpy.mock.calls[0]?.[0]).toMatchObject({
+      nonce: issued.nonce,
+      clientKey: CLIENT_KEY,
+    });
+  });
+
+  /**
+   * The endpoint behind this is unauthenticated and writes a row per call, so the limit is
+   * the only thing standing between a `for` loop and an unbounded `siws_challenges`.
+   */
+  it('writes nothing once the client has spent its window', async () => {
+    issuedInWindow(CHALLENGE_RATE_LIMIT_MAX);
+
+    await expect(issueSignInChallenge('trade-intent-21', CLIENT_KEY)).rejects.toThrow(
+      ChallengeRateLimited,
+    );
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed, issuing nothing, when the limit cannot be counted', async () => {
+    issuedInWindow(new Error('connection terminated'));
+
+    await expect(issueSignInChallenge('trade-intent-22', CLIENT_KEY)).rejects.toThrow(
+      'connection terminated',
+    );
+    expect(insertMock).not.toHaveBeenCalled();
+  });
+
+  it('reaps expired challenges on the way out', async () => {
+    await issueSignInChallenge('trade-intent-23', CLIENT_KEY);
+
+    expect(deleteMock).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * Housekeeping is not allowed to cost the user a sign-in: the challenge is already
+   * committed by then. It must still be visible, never swallowed.
+   */
+  it('still issues the challenge when the reap fails, and reports the failure', async () => {
+    reapReturning(new Error('deadlock detected'));
+
+    await expect(issueSignInChallenge('trade-intent-24', CLIENT_KEY)).resolves.toMatchObject({
+      domain: DOMAIN,
+    });
+    expect(captureErrorMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe('recordSignInRejection', () => {
+  const AGAINST_A_STORED_CHALLENGE: SignInRejection[] = [
+    'nonce_already_consumed',
+    'challenge_expired',
+    'domain_mismatch',
+    'address_mismatch',
+    'signature_invalid',
+  ];
+
+  it.each(AGAINST_A_STORED_CHALLENGE)('records a %s rejection with its reason', async (reason) => {
+    await recordSignInRejection('trade-intent-30', reason);
+
+    expect(recordEventMock).toHaveBeenCalledOnce();
+    expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
+      eventType: 'auth.sign_in_rejected',
+      correlationId: 'trade-intent-30',
+      userId: null,
+      payload: { reason },
+    });
+  });
+
+  /**
+   * The audit trail is not a place to leak. No address, no public key, no nonce — nothing
+   * a signature has not proved, and nothing the uniform 401 does not already concede.
+   */
+  it('carries the reason and nothing that could identify the caller', async () => {
+    await recordSignInRejection('trade-intent-31', 'signature_invalid');
+
+    const payload = recordEventMock.mock.calls[0]?.[0].payload as Record<string, unknown>;
+    expect(Object.keys(payload)).toEqual(['reason']);
+  });
+
+  /**
+   * `events` is append-only product data, and this path is reachable without any identity.
+   * Getting as far as a stored challenge costs a nonce, and nonces are rate limited; the
+   * two rejections that cost nothing to produce stop at the log, or the audit trail becomes
+   * the unbounded table the rate limit exists to deny.
+   */
+  it.each<SignInRejection>(['malformed_proof', 'malformed_message', 'unknown_nonce'])(
+    'writes no event for a %s rejection, which is free to generate',
+    async (reason) => {
+      await recordSignInRejection('trade-intent-32', reason);
+
+      expect(recordEventMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('never turns a failed event write into a failed rejection', async () => {
+    recordEventMock.mockRejectedValueOnce(new Error('connection terminated'));
+
+    await expect(recordSignInRejection('trade-intent-33', 'challenge_expired')).resolves
+      .toBeUndefined();
+    expect(captureErrorMock).toHaveBeenCalledOnce();
   });
 });

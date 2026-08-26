@@ -1,4 +1,4 @@
-import { boolean, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { boolean, index, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * Scope narrows a flag below "global". Absent/empty `userIds` means the flag's
@@ -78,14 +78,30 @@ export type SessionRow = typeof sessions.$inferSelect;
  * and domain binding are ours, and they are enforced against *this stored row*, never
  * against fields echoed back by the client.
  */
-export const siwsChallenges = pgTable('siws_challenges', {
-  nonce: text('nonce').primaryKey(),
-  input: jsonb('input').$type<StoredSignInInput>().notNull(),
-  issuedAt: timestamp('issued_at', { withTimezone: true }).notNull(),
-  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
-  /** Non-null means this challenge has already bought a session. Single use, forever. */
-  consumedAt: timestamp('consumed_at', { withTimezone: true }),
-});
+export const siwsChallenges = pgTable(
+  'siws_challenges',
+  {
+    nonce: text('nonce').primaryKey(),
+    input: jsonb('input').$type<StoredSignInInput>().notNull(),
+    issuedAt: timestamp('issued_at', { withTimezone: true }).notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    /** Non-null means this challenge has already bought a session. Single use, forever. */
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    /**
+     * Who asked for this challenge, as an opaque hash — never a readable IP. The nonce
+     * endpoint is unauthenticated, so there is no user to attribute an issuance to and
+     * this is the only thing a rate limit can count. Nullable because rows issued before
+     * the limit existed have no key; such a row simply counts towards nobody.
+     */
+    clientKey: text('client_key'),
+  },
+  (table) => [
+    // The reaper's predicate.
+    index('siws_challenges_expires_at_idx').on(table.expiresAt),
+    // The rate limiter's predicate: one client's issuances inside the current window.
+    index('siws_challenges_client_key_issued_at_idx').on(table.clientKey, table.issuedAt),
+  ],
+);
 
 /** The subset of `SolanaSignInInput` we issue, stored verbatim so verification re-reads our copy. */
 export interface StoredSignInInput {

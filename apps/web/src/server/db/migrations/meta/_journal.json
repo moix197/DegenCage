@@ -15,6 +15,13 @@
       "when": 1787766245126,
       "tag": "0001_whole_tarot",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787774245015,
+      "tag": "0002_amazing_tomas",
+      "breakpoints": true
     }
   ]
 }
