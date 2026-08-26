@@ -28,6 +28,13 @@ export interface SessionIdentity {
   walletId: string;
   userId: string;
   expiresAt: Date;
+  /**
+   * The session's key at rest — the hash, never the cookie value, which never leaves the
+   * browser. Carried so the supersede *inside* a sign-in transaction can revoke this
+   * exact session — the one the request arrived with — from an executor that has no
+   * request context of its own to read a cookie from.
+   */
+  idHash: string;
 }
 
 export interface SessionCookie {
@@ -113,13 +120,10 @@ export async function establishSession(
   const { walletId, userId } = await upsertWalletOwner(executor, walletAddress);
 
   const sessionId = randomBytes(32).toString('base64url');
+  const idHash = hashSessionId(sessionId);
   const expiresAt = sessionExpiryFrom(new Date());
 
-  await executor.insert(sessions).values({
-    idHash: hashSessionId(sessionId),
-    walletAddress,
-    expiresAt,
-  });
+  await executor.insert(sessions).values({ idHash, walletAddress, expiresAt });
 
   await recordEvent(
     {
@@ -137,6 +141,7 @@ export async function establishSession(
     walletId,
     userId,
     expiresAt,
+    idHash,
     cookie: buildSessionCookie(sessionId, expiresAt),
   };
 }
@@ -187,6 +192,16 @@ async function loadSession(idHash: string): Promise<StoredSession | undefined> {
   return rows[0];
 }
 
+export interface ResolveSessionOptions {
+  /**
+   * Push the expiry horizon back out (decision 15). Off for a caller that is only
+   * identifying the session in order to revoke it: sliding a session forward one
+   * statement before killing it is pointless write traffic, and it briefly extends the
+   * life of exactly the session we decided should not have one.
+   */
+  slideExpiry?: boolean;
+}
+
 /**
  * The one caller-identity read. Fails closed: no cookie, unknown id, revoked, expired, or
  * a database that will not answer all resolve to `null`.
@@ -195,6 +210,7 @@ async function loadSession(idHash: string): Promise<StoredSession | undefined> {
  */
 export async function resolveSession(
   sessionId: string | undefined = undefined,
+  { slideExpiry = true }: ResolveSessionOptions = {},
 ): Promise<SessionIdentity | null> {
   const id = sessionId ?? (await readSessionCookie());
 
@@ -213,17 +229,21 @@ export async function resolveSession(
       return null;
     }
 
-    const expiresAt = sessionExpiryFrom(now);
-    await getDb()
-      .update(sessions)
-      .set({ lastSeenAt: now, expiresAt })
-      .where(eq(sessions.idHash, idHash));
+    const expiresAt = slideExpiry ? sessionExpiryFrom(now) : row.expiresAt;
+
+    if (slideExpiry) {
+      await getDb()
+        .update(sessions)
+        .set({ lastSeenAt: now, expiresAt })
+        .where(eq(sessions.idHash, idHash));
+    }
 
     return {
       walletAddress: row.walletAddress,
       walletId: row.walletId,
       userId: row.userId,
       expiresAt,
+      idHash,
     };
   } catch (error) {
     captureError(error, { failedClosed: true, operation: 'resolveSession' });
@@ -253,9 +273,58 @@ export function parseRevocationReason(value: string | null | undefined): Session
 }
 
 /**
+ * Revokes one session by its key at rest, through whichever executor the caller is in.
+ *
+ * `WHERE revoked_at IS NULL` keeps it idempotent: a second revoke of the same row matches
+ * nothing, so a retry cannot re-stamp the time of death or double-record the event.
+ *
+ * @param executor - Pass an open transaction to make the revoke atomic with whatever
+ *   replaces the session; defaults to the pooled client for a standalone revoke.
+ * @returns Whether this call was the one that killed it.
+ */
+async function revokeSessionByIdHash(
+  executor: DatabaseExecutor,
+  idHash: string,
+  correlationId: string,
+  reason: SessionRevocationReason,
+  userId: string | null = null,
+): Promise<boolean> {
+  const revoked = await executor
+    .update(sessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(sessions.idHash, idHash), isNull(sessions.revokedAt)))
+    .returning({ walletAddress: sessions.walletAddress });
+
+  const row = revoked[0];
+
+  if (!row) {
+    return false;
+  }
+
+  logger.warn('session revoked', { correlationId, reason, walletAddress: row.walletAddress });
+
+  await recordEvent(
+    {
+      eventType: 'auth.session_revoked',
+      occurredAt: new Date(),
+      correlationId,
+      userId,
+      payload: { walletAddress: row.walletAddress, reason },
+    },
+    executor,
+  );
+
+  return true;
+}
+
+/**
  * Kills a session immediately — the account-switch path. The wallet the extension is now
  * pointing at is not the wallet this session was issued for, so the session must die
  * before anything can act under the wrong identity.
+ *
+ * Which session dies is decided by the cookie alone. A throw here is *not* swallowed: the
+ * caller must translate it into a failed response rather than report a sign-out that did
+ * not happen.
  */
 export async function revokeSession(
   correlationId: string,
@@ -268,26 +337,7 @@ export async function revokeSession(
     return;
   }
 
-  const revoked = await getDb()
-    .update(sessions)
-    .set({ revokedAt: new Date() })
-    .where(and(eq(sessions.idHash, hashSessionId(id)), isNull(sessions.revokedAt)))
-    .returning({ walletAddress: sessions.walletAddress });
-
-  const row = revoked[0];
-
-  if (!row) {
-    return;
-  }
-
-  logger.warn('session revoked', { correlationId, reason, walletAddress: row.walletAddress });
-
-  await recordEvent({
-    eventType: 'auth.session_revoked',
-    occurredAt: new Date(),
-    correlationId,
-    payload: { walletAddress: row.walletAddress, reason },
-  });
+  await revokeSessionByIdHash(getDb(), hashSessionId(id), correlationId, reason);
 }
 
 /**
@@ -301,11 +351,18 @@ export async function revokeSession(
  * extension may simply stop reporting an account), this cannot.
  *
  * Both addresses come from the server: `previous` from `resolveSession()` (the cookie),
- * `verifiedAddress` from the signature. Nothing here is taken from the request body.
+ * `verifiedAddress` from the signature. Nothing here is taken from the request body, and
+ * the only session it can ever touch is the caller's own — `previous.idHash` is derived
+ * from the cookie that arrived on this request, never from anything the caller can name.
  *
- * Must run *before* the new cookie is written, so it revokes the old session id.
+ * **Runs inside the sign-in transaction.** Revoke, nonce-consume and new-session-insert
+ * commit together or not at all. Split across transactions, a failed revoke left the old
+ * wrong-identity session live *and* cookied while the nonce was already burnt and the new
+ * session already committed — the exact hole this whole path exists to close. A throw
+ * here must therefore roll the sign-in back, so it is deliberately not caught.
  */
 export async function supersedePreviousSession(
+  executor: DatabaseExecutor,
   previous: SessionIdentity | null,
   verifiedAddress: string,
   correlationId: string,
@@ -323,16 +380,32 @@ export async function supersedePreviousSession(
       verifiedAddress,
     });
 
-    await recordEvent({
-      eventType: 'auth.wallet_account_switched',
-      occurredAt: new Date(),
-      correlationId,
-      userId: previous.userId,
-      payload: { previousAddress: previous.walletAddress, verifiedAddress },
-    });
+    await recordEvent(
+      {
+        eventType: 'auth.wallet_account_switched',
+        occurredAt: new Date(),
+        correlationId,
+        userId: previous.userId,
+        payload: { previousAddress: previous.walletAddress, verifiedAddress },
+      },
+      executor,
+    );
   }
 
-  await revokeSession(correlationId, switched ? 'account_switch' : 'superseded_by_sign_in');
+  const revoked = await revokeSessionByIdHash(
+    executor,
+    previous.idHash,
+    correlationId,
+    switched ? 'account_switch' : 'superseded_by_sign_in',
+    previous.userId,
+  );
+
+  if (!revoked) {
+    // Already dead — revoked by the watcher or a racing sign-in between our read and this
+    // write. Nothing survives the transaction either way, but a session that resolved a
+    // moment ago and is gone now is worth seeing.
+    logger.info('previous session was already revoked', { correlationId });
+  }
 }
 
 /** Clears the cookie in the browser after a revoke; the row is already dead server-side. */

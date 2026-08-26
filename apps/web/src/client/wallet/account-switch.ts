@@ -47,3 +47,52 @@ export function reauthTriggerFor({
 
   return observedAddress === sessionAddress ? null : 'account_switch';
 }
+
+export interface ReauthAction extends AccountAgreement {
+  /** What `reauthTriggerFor` said about the current agreement. */
+  trigger: ReauthTrigger | null;
+  /** Whether a sign-in is still in flight. */
+  isSigningIn: boolean;
+  /**
+   * The address the *server* confirmed on the last successful sign-in in this page life,
+   * or `null` if there has not been one. Server-derived (the verify response), never the
+   * wallet extension's own claim.
+   */
+  signedInAddress: string | null;
+}
+
+/**
+ * Whether the watcher may act on a trigger, or must wait.
+ *
+ * A trigger compares the wallet against `sessionAddress`, and `sessionAddress` is a
+ * *server render*: it only changes when a refresh lands. In the window between "the
+ * sign-in committed" and "the page has re-rendered as the new identity", it still names
+ * the old account, so the comparison reports a switch that has already been resolved.
+ * Acting on it revokes the session the user just created — and they are told their
+ * signature was not accepted.
+ *
+ * `isSigningIn` alone does not close that window: it goes false the moment the request
+ * settles, while the refresh it kicked off is still in flight. So the wait is on the thing
+ * that actually matters — `sessionAddress` catching up to the address the server said it
+ * issued the session for.
+ *
+ * The deferral is bounded and stays fail-closed: it holds only while the wallet is still
+ * on the account we just signed in as. The moment the extension reports anything else —
+ * a different account, or none — the mismatch is real and current, and the revoke goes
+ * ahead whether or not the refresh ever landed.
+ */
+export function shouldRevokeSession({
+  trigger,
+  isSigningIn,
+  signedInAddress,
+  sessionAddress,
+  observedAddress,
+}: ReauthAction): boolean {
+  if (!trigger || isSigningIn) {
+    return false;
+  }
+
+  const awaitingRefresh = signedInAddress !== null && sessionAddress !== signedInAddress;
+
+  return !(awaitingRefresh && observedAddress === signedInAddress);
+}

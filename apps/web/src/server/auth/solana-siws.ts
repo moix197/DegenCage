@@ -8,7 +8,12 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { logger } from '../../observability/logger';
 import { getDb } from '../db/client';
 import { siwsChallenges, type SiwsChallengeRow, type StoredSignInInput } from '../db/schema';
-import { establishSession, type EstablishedSession } from './session';
+import {
+  establishSession,
+  supersedePreviousSession,
+  type EstablishedSession,
+  type SessionIdentity,
+} from './session';
 
 /**
  * Sign In With Solana, and the three checks the library does not do.
@@ -148,6 +153,9 @@ function passesSignatureVerification(address: string, input: StoredSignInInput, 
   }
 }
 
+/** What `parseSignInMessage` gives back for the bytes the wallet signed, or nullish. */
+type ParsedSignInMessage = ReturnType<typeof parseSignInMessage>;
+
 /**
  * The whole decision, as a pure function of the stored challenge and the submitted proof.
  * Split out from the transaction below the way `resolveFeatureFlag` is split from
@@ -156,6 +164,29 @@ function passesSignatureVerification(address: string, input: StoredSignInInput, 
 export function checkSignIn(
   challenge: Pick<SiwsChallengeRow, 'input' | 'consumedAt'>,
   proof: WalletSignInProof,
+  now: Date,
+  expectedDomain: string,
+): SignInCheck {
+  return checkParsedSignIn(
+    challenge,
+    proof,
+    parseSignInMessage(proof.signedMessage),
+    now,
+    expectedDomain,
+  );
+}
+
+/**
+ * As `checkSignIn`, but for the one caller that has already parsed the signed message to
+ * find the nonce it looked the challenge up by. `parsed` is never a separate input: both
+ * callers derive it from `proof.signedMessage` and nothing else, so the nonce the row was
+ * fetched with and the address checked here are guaranteed to come from one parse of one
+ * set of bytes. It stays private for that reason — it is not a seam a caller may widen.
+ */
+function checkParsedSignIn(
+  challenge: Pick<SiwsChallengeRow, 'input' | 'consumedAt'>,
+  proof: WalletSignInProof,
+  parsed: ParsedSignInMessage,
   now: Date,
   expectedDomain: string,
 ): SignInCheck {
@@ -185,7 +216,7 @@ export function checkSignIn(
   // symptom of "the wallet signed as a different account than the key it handed us" —
   // exactly what an account switch produces — indistinguishable in the logs from a
   // forged signature. The response stays identically opaque; only the log line differs.
-  if (parseSignInMessage(proof.signedMessage)?.address !== address) {
+  if (parsed?.address !== address) {
     return { ok: false, reason: 'address_mismatch' };
   }
 
@@ -202,22 +233,31 @@ export class SignInRejected extends Error {
 }
 
 /** The nonce is only a lookup key here; nothing is trusted until `checkSignIn` passes. */
-function readSubmittedNonce(proof: WalletSignInProof): string | null {
-  return parseSignInMessage(proof.signedMessage)?.nonce ?? null;
+function readSubmittedNonce(parsed: ParsedSignInMessage): string | null {
+  return parsed?.nonce ?? null;
 }
 
 /**
- * Verifies a sign-in and issues the session in one transaction.
+ * Verifies a sign-in, supersedes the session the request arrived with, and issues the new
+ * one — all in a single transaction.
  *
- * Consuming the nonce and creating the session must commit or roll back together. Split
- * across two transactions, a crash in between burns the challenge and leaves the user
- * unauthenticated with a nonce that can never be spent again.
+ * All four writes commit or roll back together. Split apart, each seam is a live hole:
+ * a crash between consume and insert burns the challenge and leaves the user
+ * unauthenticated with a nonce that can never be spent again; a revoke that fails after
+ * the insert leaves the *old*, wrong-identity session alive and cookied while the caller
+ * is told the sign-in failed. One transaction is what makes "the old identity is gone"
+ * and "the new one exists" the same fact.
+ *
+ * @param previous - The session this request arrived as, from `resolveSession()` — the
+ *   cookie, never the request body. `null` on a first sign-in.
  */
 export async function verifyWalletSignIn(
   proof: WalletSignInProof,
   correlationId: string,
+  previous: SessionIdentity | null,
 ): Promise<EstablishedSession> {
-  const nonce = readSubmittedNonce(proof);
+  const parsed = parseSignInMessage(proof.signedMessage);
+  const nonce = readSubmittedNonce(parsed);
 
   if (!nonce) {
     throw new SignInRejected('malformed_message');
@@ -239,11 +279,17 @@ export async function verifyWalletSignIn(
       throw new SignInRejected('unknown_nonce');
     }
 
-    const check = checkSignIn(challenge, proof, new Date(), expectedDomain);
+    const check = checkParsedSignIn(challenge, proof, parsed, new Date(), expectedDomain);
 
     if (!check.ok) {
       throw new SignInRejected(check.reason);
     }
+
+    // Before anything new is minted: the proof has re-bound identity, so the session the
+    // request came in as is dead from here on. A throw rolls the whole sign-in back —
+    // nonce unspent, no new session — rather than leaving the old one live behind a
+    // successful sign-in.
+    await supersedePreviousSession(tx, previous, check.address, correlationId);
 
     // Belt and braces alongside the row lock: the guard is in SQL too, so two racing
     // requests cannot both see an unconsumed nonce.

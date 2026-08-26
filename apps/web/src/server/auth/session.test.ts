@@ -63,6 +63,38 @@ function lookupReturning(result: StoredSession[] | Error) {
   });
 }
 
+/** An executor that is not a transaction: the pooled client, as the mock exposes it. */
+function pooledExecutor() {
+  return { select: selectMock, update: updateMock, insert: insertMock };
+}
+
+/** Makes the revoke write fail the way a dropped connection does. */
+function failingUpdate(error: Error) {
+  updateMock.mockReturnValue({
+    set: () => ({ where: () => ({ returning: () => Promise.reject(error) }) }),
+  });
+}
+
+/**
+ * Every string bound into a drizzle predicate, however deep — the predicate is an object
+ * graph with cycles, so this is how a test asks "what did that `WHERE` actually match on".
+ */
+function boundStrings(node: unknown, seen = new Set<unknown>()): string[] {
+  if (typeof node === 'string') {
+    return [node];
+  }
+
+  if (!node || typeof node !== 'object' || seen.has(node)) {
+    return [];
+  }
+
+  seen.add(node);
+
+  return Object.values(node as Record<string, unknown>).flatMap((value) =>
+    boundStrings(value, seen),
+  );
+}
+
 /** Captures drizzle's `update().set().where()` — awaitable, and `.returning()`-able. */
 function captureUpdate(returning: unknown[] = []) {
   const setSpy = vi.fn();
@@ -206,6 +238,26 @@ describe('resolveSession', () => {
     });
   });
 
+  it('carries the session key at rest, never the cookie value', async () => {
+    lookupReturning([storedSession()]);
+
+    const session = await resolveSession(SESSION_ID);
+
+    expect(session?.idHash).toBe(sha256(SESSION_ID));
+    expect(session?.idHash).not.toBe(SESSION_ID);
+  });
+
+  it('leaves the expiry alone for a caller that is about to revoke the session', async () => {
+    const row = storedSession();
+    lookupReturning([row]);
+    const { setSpy } = captureUpdate();
+
+    const session = await resolveSession(SESSION_ID, { slideExpiry: false });
+
+    expect(setSpy).not.toHaveBeenCalled();
+    expect(session?.expiresAt).toBe(row.expiresAt);
+  });
+
   it('slides the expiry forward on every resolved request', async () => {
     lookupReturning([storedSession()]);
     const { setSpy } = captureUpdate();
@@ -273,6 +325,30 @@ describe('revokeSession', () => {
     expect(updateMock).not.toHaveBeenCalled();
     expect(recordEventMock).not.toHaveBeenCalled();
   });
+
+  /**
+   * A sign-out that did not happen must not be reportable as one. Swallowing this is how
+   * the caller ends up answering 200 over a session row that still resolves — the user is
+   * told they are signed out while their old identity is still live.
+   */
+  it('propagates a revoke that failed instead of reporting a sign-out that did not happen', async () => {
+    cookieGetMock.mockReturnValue({ value: SESSION_ID });
+    failingUpdate(new Error('connection terminated'));
+
+    await expect(revokeSession('trade-intent-8', 'client_request')).rejects.toThrow(
+      'connection terminated',
+    );
+    expect(recordEventMock).not.toHaveBeenCalled();
+  });
+
+  it('records nothing when the session was already revoked', async () => {
+    cookieGetMock.mockReturnValue({ value: SESSION_ID });
+    captureUpdate([]);
+
+    await revokeSession('trade-intent-9', 'client_request');
+
+    expect(recordEventMock).not.toHaveBeenCalled();
+  });
 });
 
 describe('parseRevocationReason', () => {
@@ -288,6 +364,7 @@ describe('parseRevocationReason', () => {
 
 describe('supersedePreviousSession', () => {
   const OTHER_ADDRESS = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const PREVIOUS_ID_HASH = sha256(SESSION_ID);
 
   function previousSession(walletAddress: string): SessionIdentity {
     return {
@@ -295,6 +372,7 @@ describe('supersedePreviousSession', () => {
       walletId: 'wallet-1',
       userId: 'user-1',
       expiresAt: new Date(Date.now() + 60_000),
+      idHash: PREVIOUS_ID_HASH,
     };
   }
 
@@ -311,7 +389,12 @@ describe('supersedePreviousSession', () => {
   it('revokes the session the request arrived with when a different wallet signs in', async () => {
     const { setSpy } = captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
 
-    await supersedePreviousSession(previousSession(WALLET_ADDRESS), OTHER_ADDRESS, 'trade-intent-5');
+    await supersedePreviousSession(
+      pooledExecutor() as never,
+      previousSession(WALLET_ADDRESS),
+      OTHER_ADDRESS,
+      'trade-intent-5',
+    );
 
     expect((setSpy.mock.calls[0]?.[0] as { revokedAt: Date }).revokedAt).toBeInstanceOf(Date);
     expect(recordEventMock.mock.calls.map((call) => call[0])).toMatchObject([
@@ -328,7 +411,12 @@ describe('supersedePreviousSession', () => {
   it('supersedes the old session when the same wallet signs in again, without crying switch', async () => {
     captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
 
-    await supersedePreviousSession(previousSession(WALLET_ADDRESS), WALLET_ADDRESS, 'trade-intent-6');
+    await supersedePreviousSession(
+      pooledExecutor() as never,
+      previousSession(WALLET_ADDRESS),
+      WALLET_ADDRESS,
+      'trade-intent-6',
+    );
 
     expect(recordEventMock.mock.calls.map((call) => call[0])).toMatchObject([
       { eventType: 'auth.session_revoked', payload: { reason: 'superseded_by_sign_in' } },
@@ -336,9 +424,70 @@ describe('supersedePreviousSession', () => {
   });
 
   it('has nothing to supersede on a first sign-in', async () => {
-    await supersedePreviousSession(null, WALLET_ADDRESS, 'trade-intent-7');
+    await supersedePreviousSession(pooledExecutor() as never, null, WALLET_ADDRESS, 'trade-intent-7');
 
     expect(updateMock).not.toHaveBeenCalled();
     expect(recordEventMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Every write goes through the executor it is handed — the open sign-in transaction —
+   * and never reaches for the pool behind its back. That is the difference between the
+   * revoke being part of the sign-in and merely happening near it.
+   */
+  it('writes the revoke and the events through the executor it was given', async () => {
+    const { setSpy } = captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+    const executor = pooledExecutor();
+
+    await supersedePreviousSession(
+      executor as never,
+      previousSession(WALLET_ADDRESS),
+      OTHER_ADDRESS,
+      'trade-intent-10',
+    );
+
+    expect(setSpy).toHaveBeenCalledOnce();
+    expect(recordEventMock.mock.calls.map((call) => call[1])).toEqual([executor, executor]);
+  });
+
+  /**
+   * The fail-open hole itself, at this level: a revoke that will not write must throw, so
+   * the transaction around it rolls the sign-in back. Returning quietly would hand the
+   * caller a session while the old identity kept resolving.
+   */
+  it('throws when the revoke cannot be written, rather than reporting it done', async () => {
+    failingUpdate(new Error('connection terminated'));
+
+    await expect(
+      supersedePreviousSession(
+        pooledExecutor() as never,
+        previousSession(WALLET_ADDRESS),
+        WALLET_ADDRESS,
+        'trade-intent-11',
+      ),
+    ).rejects.toThrow('connection terminated');
+  });
+
+  /**
+   * The only session a sign-in may ever kill is the caller's own. `idHash` is derived from
+   * the cookie that arrived on this request; a third party's session is not addressable
+   * from here even in principle, and the address the caller signed as does not change that.
+   */
+  it('revokes by the key of the session the request arrived with, never by address', async () => {
+    const { whereSpy } = captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+
+    await supersedePreviousSession(
+      pooledExecutor() as never,
+      previousSession(WALLET_ADDRESS),
+      OTHER_ADDRESS,
+      'trade-intent-12',
+    );
+
+    expect(whereSpy).toHaveBeenCalledOnce();
+
+    const bound = boundStrings(whereSpy.mock.calls[0]?.[0]);
+    expect(bound).toContain(PREVIOUS_ID_HASH);
+    expect(bound).not.toContain(OTHER_ADDRESS);
+    expect(bound).not.toContain(WALLET_ADDRESS);
   });
 });

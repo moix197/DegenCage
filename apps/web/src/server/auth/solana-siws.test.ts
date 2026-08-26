@@ -21,13 +21,17 @@ import {
  * closed on its own.
  */
 
-const { transactionMock, establishSessionMock } = vi.hoisted(() => ({
+const { transactionMock, establishSessionMock, supersedePreviousSessionMock } = vi.hoisted(() => ({
   transactionMock: vi.fn(),
   establishSessionMock: vi.fn(),
+  supersedePreviousSessionMock: vi.fn(),
 }));
 
 vi.mock('../db/client', () => ({ getDb: () => ({ transaction: transactionMock }) }));
-vi.mock('./session', () => ({ establishSession: establishSessionMock }));
+vi.mock('./session', () => ({
+  establishSession: establishSessionMock,
+  supersedePreviousSession: supersedePreviousSessionMock,
+}));
 
 const DOMAIN = 'degencage.test';
 
@@ -63,6 +67,18 @@ function challengeRow(input: StoredSignInInput, consumedAt: Date | null = null):
     consumedAt,
   };
 }
+
+/**
+ * The session a request arrives carrying. Its `idHash` comes from the caller's own cookie
+ * and nothing else — it is the only session a sign-in is ever allowed to revoke.
+ */
+const PREVIOUS_SESSION = {
+  walletAddress: 'So11111111111111111111111111111111111111112',
+  walletId: 'wallet-1',
+  userId: 'user-1',
+  expiresAt: new Date('2026-09-25T00:00:00Z'),
+  idHash: 'hash-of-the-callers-own-cookie',
+};
 
 const ISSUED_AT = new Date('2026-08-26T12:00:00Z');
 /** Inside the 5-minute challenge window. */
@@ -194,7 +210,12 @@ describe('checkSignIn', () => {
 });
 
 describe('verifyWalletSignIn', () => {
-  /** A single-row `siws_challenges` that actually remembers being consumed. */
+  /**
+   * A single-row `siws_challenges` that actually remembers being consumed.
+   *
+   * @returns The transaction handle it will run the callback with, so a test can assert
+   *   that every write of a sign-in went through *that* executor and no other.
+   */
   function fakeChallengeTable(row: SiwsChallengeRow | null) {
     const tx = {
       select: () => ({
@@ -220,12 +241,15 @@ describe('verifyWalletSignIn', () => {
     };
 
     transactionMock.mockImplementation((callback: (tx: unknown) => unknown) => callback(tx));
+
+    return tx;
   }
 
   beforeEach(() => {
     establishSessionMock.mockImplementation(async (_tx: unknown, address: string) => ({
       walletAddress: address,
     }));
+    supersedePreviousSessionMock.mockResolvedValue(undefined);
     vi.useFakeTimers();
     vi.setSystemTime(DURING);
   });
@@ -238,7 +262,7 @@ describe('verifyWalletSignIn', () => {
     const row = challengeRow(input);
     fakeChallengeTable(row);
 
-    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-1')).resolves
+    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-1', null)).resolves
       .toMatchObject({ walletAddress: wallet.address });
     expect(row.consumedAt).toBeInstanceOf(Date);
     expect(establishSessionMock).toHaveBeenCalledOnce();
@@ -249,18 +273,18 @@ describe('verifyWalletSignIn', () => {
     fakeChallengeTable(row);
     const proof = signChallenge(wallet, input);
 
-    await expect(verifyWalletSignIn(proof, 'trade-intent-2')).resolves.toBeTruthy();
+    await expect(verifyWalletSignIn(proof, 'trade-intent-2', null)).resolves.toBeTruthy();
 
     // Same address, same publicKey, same signedMessage, same signature — and still inside
     // the expiry window. Only the spent nonce stands between this and a stolen identity.
-    await expect(verifyWalletSignIn(proof, 'trade-intent-3')).rejects.toThrow(SignInRejected);
+    await expect(verifyWalletSignIn(proof, 'trade-intent-3', null)).rejects.toThrow(SignInRejected);
     expect(establishSessionMock).toHaveBeenCalledOnce();
   });
 
   it('rejects a nonce we never issued', async () => {
     fakeChallengeTable(null);
 
-    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-4')).rejects
+    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-4', null)).rejects
       .toMatchObject({ reason: 'unknown_nonce' });
     expect(establishSessionMock).not.toHaveBeenCalled();
   });
@@ -274,7 +298,7 @@ describe('verifyWalletSignIn', () => {
       signature: new Uint8Array(64),
     };
 
-    await expect(verifyWalletSignIn(garbage, 'trade-intent-5')).rejects.toMatchObject({
+    await expect(verifyWalletSignIn(garbage, 'trade-intent-5', null)).rejects.toMatchObject({
       reason: 'malformed_message',
     });
   });
@@ -288,7 +312,7 @@ describe('verifyWalletSignIn', () => {
   it('lets the account the wallet switched to sign in on a fresh challenge', async () => {
     fakeChallengeTable(challengeRow(input));
 
-    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-7')).resolves
+    await expect(verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-7', null)).resolves
       .toMatchObject({ walletAddress: wallet.address });
 
     const switched = generateWallet();
@@ -296,7 +320,7 @@ describe('verifyWalletSignIn', () => {
     const freshRow = challengeRow(fresh);
     fakeChallengeTable(freshRow);
 
-    await expect(verifyWalletSignIn(signChallenge(switched, fresh), 'trade-intent-8')).resolves
+    await expect(verifyWalletSignIn(signChallenge(switched, fresh), 'trade-intent-8', null)).resolves
       .toMatchObject({ walletAddress: switched.address });
     expect(freshRow.consumedAt).toBeInstanceOf(Date);
   });
@@ -310,7 +334,7 @@ describe('verifyWalletSignIn', () => {
     // before it starts.
     const mixed = { ...signChallenge(switched, input), publicKey: wallet.publicKey };
 
-    await expect(verifyWalletSignIn(mixed, 'trade-intent-9')).rejects.toMatchObject({
+    await expect(verifyWalletSignIn(mixed, 'trade-intent-9', null)).rejects.toMatchObject({
       reason: 'address_mismatch',
     });
     expect(row.consumedAt).toBeNull();
@@ -323,10 +347,65 @@ describe('verifyWalletSignIn', () => {
     const proof = signChallenge(wallet, input);
     proof.signature[0] = proof.signature[0]! ^ 0x01;
 
-    await expect(verifyWalletSignIn(proof, 'trade-intent-6')).rejects.toMatchObject({
+    await expect(verifyWalletSignIn(proof, 'trade-intent-6', null)).rejects.toMatchObject({
       reason: 'signature_invalid',
     });
     expect(row.consumedAt).toBeNull();
     expect(establishSessionMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The supersede is not a step that happens near the sign-in — it is part of it. Run on
+   * its own connection it could fail after the nonce was spent and the new session
+   * inserted, and then the *old* session, bound to the account the user just left, would
+   * still be live and still be the cookie in their browser.
+   */
+  it('revokes the session the request arrived with through the sign-in transaction itself', async () => {
+    const tx = fakeChallengeTable(challengeRow(input));
+
+    await expect(
+      verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-10', PREVIOUS_SESSION),
+    ).resolves.toMatchObject({ walletAddress: wallet.address });
+
+    expect(supersedePreviousSessionMock).toHaveBeenCalledWith(
+      tx,
+      PREVIOUS_SESSION,
+      wallet.address,
+      'trade-intent-10',
+    );
+    // Same executor for both, or "revoked" and "issued" are not the same commit.
+    expect(establishSessionMock.mock.calls[0]?.[0]).toBe(tx);
+  });
+
+  /**
+   * The regression for the fail-open hole: a revoke write that will not land must take the
+   * whole sign-in down with it. Nothing may be left behind for the caller's 503 to sit on
+   * top of — no spent nonce, no new session, and (in Postgres, by the rollback this fake
+   * stands in for) no half-killed old one.
+   */
+  it('spends no nonce and issues no session when the supersede fails', async () => {
+    const row = challengeRow(input);
+    fakeChallengeTable(row);
+    supersedePreviousSessionMock.mockRejectedValue(new Error('revoke write failed'));
+
+    await expect(
+      verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-11', PREVIOUS_SESSION),
+    ).rejects.toThrow('revoke write failed');
+
+    expect(row.consumedAt).toBeNull();
+    expect(establishSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('has nothing to supersede when the request carried no session', async () => {
+    fakeChallengeTable(challengeRow(input));
+
+    await verifyWalletSignIn(signChallenge(wallet, input), 'trade-intent-12', null);
+
+    expect(supersedePreviousSessionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      null,
+      wallet.address,
+      'trade-intent-12',
+    );
   });
 });

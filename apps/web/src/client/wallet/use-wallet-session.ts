@@ -12,11 +12,18 @@ import {
   useSignMessage,
   useWallets,
 } from '@solana/kit-plugin-wallet/react';
-import type { SolanaSignInInput, SolanaSignInOutput } from '@solana/wallet-standard-features';
+import type { SolanaSignInOutput } from '@solana/wallet-standard-features';
 import { createSignInMessage, verifySignIn } from '@solana/wallet-standard-util';
 import { useRouter } from 'next/navigation';
 
-import { reauthTriggerFor, type ReauthTrigger } from './account-switch';
+import { reauthTriggerFor, shouldRevokeSession, type ReauthTrigger } from './account-switch';
+import {
+  fetchChallenge,
+  postProof,
+  revokeCurrentSession,
+  type SignInChallenge,
+  type SignInProofWire,
+} from './session-api';
 
 /**
  * Owns the whole client side of "who is signed in".
@@ -30,20 +37,12 @@ import { reauthTriggerFor, type ReauthTrigger } from './account-switch';
  *    extension without disconnecting leaves a session bound to the *previous* address.
  *    That session is revoked the moment the mismatch is seen — better a forced re-auth
  *    than acting under an identity the user is no longer using. The decision itself lives
- *    in `reauthTriggerFor`; this hook only feeds it what the extension reports and acts on
- *    the answer. Revocation is server-side — the session row dies — never client state.
+ *    in `reauthTriggerFor`, and whether it is safe to act on it yet in
+ *    `shouldRevokeSession`; this hook only feeds them what the extension reports and acts
+ *    on the answer. Revocation is server-side — the session row dies — never client state.
  */
 
 type DiscoveredWallet = ReturnType<ClientWithWallet['wallet']['getState']>['wallets'][number];
-
-/** What `/api/auth/nonce` hands back: our issued input, domain and nonce included. */
-type SignInChallenge = SolanaSignInInput & { domain: string; nonce: string };
-
-interface SignInProofWire {
-  publicKey: string;
-  signedMessage: string;
-  signature: string;
-}
 
 export interface WalletSessionState {
   wallets: readonly DiscoveredWallet[];
@@ -101,36 +100,8 @@ function assertProofIsSelfConsistent(proof: SignInProofWire, challenge: SignInCh
   }
 }
 
-async function fetchChallenge(): Promise<SignInChallenge> {
-  const response = await fetch('/api/auth/nonce', { method: 'POST' });
-
-  if (!response.ok) {
-    // The kill switch is the expected reason, so say so rather than "something failed".
-    throw new Error('Wallet connect is currently unavailable. Please try again later.');
-  }
-
-  return ((await response.json()) as { input: SignInChallenge }).input;
-}
-
-async function postProof(proof: SignInProofWire): Promise<void> {
-  const response = await fetch('/api/auth/verify', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(proof),
-  });
-
-  if (!response.ok) {
-    throw new Error('That signature was not accepted. Please try connecting again.');
-  }
-}
-
-/**
- * `reason` annotates the audit trail; it is not an instruction. *Which* session dies is
- * decided from the cookie server-side, and the reason is narrowed to a known one there.
- */
-async function revokeCurrentSession(reason: ReauthTrigger): Promise<void> {
-  await fetch(`/api/auth/verify?reason=${reason}`, { method: 'DELETE' });
-}
+const REVOKE_FAILED_MESSAGE =
+  'We could not sign you out. Reload this page — if it still shows you as connected, disconnect this site in your wallet.';
 
 function supportsSignIn(wallet: DiscoveredWallet): boolean {
   return wallet.features.includes(SIGN_IN_FEATURE);
@@ -160,6 +131,8 @@ export function useWalletSession(
   const [isSigningIn, setIsSigningIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reauthTrigger, setReauthTrigger] = useState<ReauthTrigger | null>(null);
+  /** The address the server said it issued a session for, once a sign-in has succeeded. */
+  const [signedInAddress, setSignedInAddress] = useState<string | null>(null);
 
   const connectedAddress = connected?.account.address ?? null;
   /** Latches: has the extension reported an account at any point on this page? */
@@ -168,27 +141,36 @@ export function useWalletSession(
   useEffect(() => {
     hasObservedWallet.current ||= connectedAddress !== null;
 
-    const trigger = reauthTriggerFor({
+    const agreement = {
       sessionAddress,
       observedAddress: connectedAddress,
       hasObservedWallet: hasObservedWallet.current,
-    });
+    };
+    const trigger = reauthTriggerFor(agreement);
 
     setReauthTrigger(trigger);
 
-    // A sign-in in flight is *about* to re-bind the session; revoking mid-flight would
-    // race the new cookie and could kill the session the user just created. `isSigningIn`
-    // is a dependency, so the check re-runs the moment the attempt settles either way —
-    // deferred, never skipped.
-    if (!trigger || isSigningIn) {
+    // Whether this mismatch is real *now*, or is the stale server render of a sign-in that
+    // has already succeeded, is `shouldRevokeSession`'s decision — every dependency of it
+    // is a dependency of this effect, so a deferral is always re-examined, never dropped.
+    if (!trigger || !shouldRevokeSession({ ...agreement, trigger, isSigningIn, signedInAddress })) {
       return;
     }
 
     // Revoke first, refresh second. The address on screen is rendered from
     // `resolveSession()`, so refreshing before the row is dead just re-renders the stale
-    // identity — precisely the failure this watcher exists to prevent.
-    void revokeCurrentSession(trigger).then(() => router.refresh());
-  }, [connectedAddress, isSigningIn, router, sessionAddress]);
+    // identity — precisely the failure this watcher exists to prevent. And a revoke that
+    // did not happen is never refreshed over: the user is told, not shown a sign-out we
+    // cannot vouch for.
+    void revokeCurrentSession(trigger).then((revoked) => {
+      if (!revoked) {
+        setError(REVOKE_FAILED_MESSAGE);
+        return;
+      }
+
+      router.refresh();
+    });
+  }, [connectedAddress, isSigningIn, router, sessionAddress, signedInAddress]);
 
   /**
    * Wallets without `solana:signIn` (and some Ledger firmware behind wallets that do)
@@ -248,7 +230,9 @@ export function useWalletSession(
             : await signInByMessage(wallet, challenge);
 
           assertProofIsSelfConsistent(proof, challenge);
-          await postProof(proof);
+          // Recorded before the refresh is asked for, so the watcher already knows which
+          // identity the page is *about* to render as by the time it re-runs.
+          setSignedInAddress(await postProof(proof));
           router.refresh();
         } catch (thrown) {
           if (!isAbort(thrown)) {
