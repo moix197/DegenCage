@@ -316,17 +316,17 @@ Stored as `constitutions.document jsonb` (matches `single-source-of-truth-databa
 
 **Steps:**
 
-- [ ] Live smoke-test Helius call (see Verification-first step above) before writing any pipeline code
-- [ ] Migrations: `trades`, `token_prices`, `wallets` extensions
-- [ ] Implement Helius client wrapper with exact query shape from decision 18, behind its own kill switch, fail closed on error
-- [ ] Implement swap derivation heuristic (net deltas → candidate swap; ≥1 negative + ≥1 positive delta, excluding fee-only noise, self-transfers, pure receives, and LST swaps via `lst-allowlist.ts`)
-- [ ] Implement Binance klines majors pricing (shared cache, own kill switch) and the leg-selection logic for the SOL/stablecoin leg; unresolvable → `null`, never `0`
-- [ ] Implement `evaluateTrade()` in `packages/rules` with the `daily_notional_usd` case and the `unevaluable` fallback for not-yet-implemented types
-- [ ] Implement `reconcile-wallet.ts`: single DB transaction per page, `reconciled_through_slot` advanced only to the highest slot actually persisted, row-locked on the wallet for the duration — write a test that fires two concurrent `reconcileWallet()` calls for the same wallet and asserts only one proceeds at a time and no trade is duplicated
-- [ ] First connect triggers a 90-day backfill tagged `is_baseline=true`; record `wallet.backfill_started`/`wallet.backfill_completed`; subsequent opens do incremental reconciliation from the cursor, tagged `is_baseline=false`; baseline trades are never passed to `evaluateTrade()` at all
-- [ ] Record `wallet.reconciliation_started`/`completed`/`failed`, `trade.excluded`, and `rule.decision_recorded` (for every live trade, allow or violation) events
-- [ ] `constitution-status` page renders the daily total vs limit and the trade list; distinguish `reconciliation_state='never'` from a wallet with zero trades (survivorship-bias constraint)
-- [ ] Gate the whole reconciliation call behind its feature flags; fail closed (show "not yet reconciled," never a false "clean" or a false "$0 spent today") if any flag is off or a call errors
+- [x] Live smoke-test Helius call (see Verification-first step above) before writing any pipeline code
+- [x] Migrations: `trades`, `token_prices`, `wallets` extensions
+- [x] Implement Helius client wrapper with exact query shape from decision 18, behind its own kill switch, fail closed on error
+- [x] Implement swap derivation heuristic (net deltas → candidate swap; ≥1 negative + ≥1 positive delta, excluding fee-only noise, self-transfers, pure receives, and LST swaps via `lst-allowlist.ts`)
+- [x] Implement Binance klines majors pricing (shared cache, own kill switch) and the leg-selection logic for the SOL/stablecoin leg; unresolvable → `null`, never `0`
+- [x] Implement `evaluateTrade()` in `packages/rules` with the `daily_notional_usd` case and the `unevaluable` fallback for not-yet-implemented types
+- [x] Implement `reconcile-wallet.ts`: single DB transaction per page, `reconciled_through_slot` advanced only to the highest slot actually persisted, row-locked on the wallet for the duration — write a test that fires two concurrent `reconcileWallet()` calls for the same wallet and asserts only one proceeds at a time and no trade is duplicated
+- [x] First connect triggers a 90-day backfill tagged `is_baseline=true`; record `wallet.backfill_started`/`wallet.backfill_completed`; subsequent opens do incremental reconciliation from the cursor, tagged `is_baseline=false`; baseline trades are never passed to `evaluateTrade()` at all
+- [x] Record `wallet.reconciliation_started`/`completed`/`failed`, `trade.excluded`, and `rule.decision_recorded` (for every live trade, allow or violation) events
+- [x] `constitution-status` page renders the daily total vs limit and the trade list; distinguish `reconciliation_state='never'` from a wallet with zero trades (survivorship-bias constraint)
+- [x] Gate the whole reconciliation call behind its feature flags; fail closed (show "not yet reconciled," never a false "clean" or a false "$0 spent today") if any flag is off or a call errors
 
 **Tests:**
 
@@ -340,8 +340,8 @@ Stored as `constitutions.document jsonb` (matches `single-source-of-truth-databa
 
 **Verification:**
 
-- [ ] Live Helius smoke test succeeds on the free tier (documented result, not just "it worked")
-- [ ] `pnpm test` passes
+- [x] Live Helius smoke test succeeds on the free tier (documented result, not just "it worked")
+- [x] `pnpm test` passes
 - [ ] Manual: connect a real wallet with known trade history, activate a daily-notional constitution, confirm the status page populates correctly, baseline trades are visibly marked private, re-opening the app doesn't duplicate rows
 
 **Phase review:**
@@ -349,9 +349,9 @@ Stored as `constitutions.document jsonb` (matches `single-source-of-truth-databa
 - [ ] All Steps and Verification checkboxes above ticked in the plan file
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase
+- [x] Code-reviewer agent has verified this phase
 - [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
+- [x] Tests for this phase written and passing
 - [ ] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
 - [ ] Changes committed: `feat: reconcile chain history and enforce the daily notional limit end to end`
