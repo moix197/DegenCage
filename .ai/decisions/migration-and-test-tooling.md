@@ -60,6 +60,18 @@ migration test) since we are not using Supabase's auth or storage.
 - Tests must stay hermetic: no test opens a database connection. DB-touching modules are
   split into a pure decision function plus a thin query, and the query is mocked
   (`apps/web/src/server/flags/feature-flags.test.ts` is the reference shape).
+- **The `@/*` path alias (`apps/web/tsconfig.json`) does not resolve under Vitest** — no
+  `vite-tsconfig-paths` plugin is registered in the root `vitest.config.ts`, and Vite does
+  not read tsconfig `paths` on its own (confirmed empirically: `import … from
+  '@/server/flags/feature-flags'` in a test file fails to resolve, "Cannot find package").
+  Existing routes/pages still use `@/…` freely — they are never imported by a test, only
+  built by `next build`, which resolves the alias fine. **A route or page file with a
+  `route.test.ts`/equivalent test must import its own dependencies with relative paths**
+  (`../../../server/...`), or the test file can't load the module at all. Phase 9's
+  `app/api/admin/metrics/route.ts` and `app/api/feedback/route.ts` are the first routes
+  this applies to; `app/admin/metrics/page.tsx` has no test and keeps `@/…`, consistent
+  with every other page in this codebase. Revisit by adding `vite-tsconfig-paths` if
+  enough tested routes make the relative-path split annoying.
 - **`nodeLinker: hoisted` in `pnpm-workspace.yaml`, forced by `output: 'standalone'`.**
   Next's trace step reproduces `node_modules` symlinks with untyped `fs.symlink` calls,
   which Windows refuses outside an elevated or Developer-Mode process (it permits
