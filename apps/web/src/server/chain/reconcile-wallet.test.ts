@@ -1,9 +1,10 @@
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { isQuoteMint, needsLotBackfill, ReconcileRejected, reconcileWallet } from './reconcile-wallet';
+import { isAfterLotWatermark, isQuoteMint, needsLotBackfill, ReconcileRejected, reconcileWallet } from './reconcile-wallet';
 import { WSOL_MINT } from './lst-allowlist';
 import { STABLECOIN_MINTS } from './stablecoin-mints';
+import { positionLots as positionLotsTable, trades as tradesTable } from '../db/schema';
 
 const {
   resolveSessionMock,
@@ -13,6 +14,7 @@ const {
   loadWindowedTradesMock,
   recordEventMock,
   captureErrorMock,
+  isFeatureEnabledMock,
   selectMock,
   updateMock,
   transactionMock,
@@ -24,6 +26,7 @@ const {
   loadWindowedTradesMock: vi.fn(),
   recordEventMock: vi.fn(),
   captureErrorMock: vi.fn(),
+  isFeatureEnabledMock: vi.fn(),
   selectMock: vi.fn(),
   updateMock: vi.fn(),
   transactionMock: vi.fn(),
@@ -36,6 +39,10 @@ vi.mock('../pricing/price-trade', () => ({ priceTrade: priceTradeMock }));
 vi.mock('../rules/rolling-allowance', () => ({ loadWindowedTrades: loadWindowedTradesMock }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
 vi.mock('../../observability/error-tracking', () => ({ captureError: captureErrorMock }));
+// Explicit now (previously `isFeatureEnabled` was unmocked and happened to resolve `false`
+// via a shape mismatch against the `getDb()` mock below — see git history). Explicit lets the
+// new flag-on integration tests override it per key.
+vi.mock('../flags/feature-flags', () => ({ isFeatureEnabled: isFeatureEnabledMock }));
 vi.mock('../db/client', () => ({
   getDb: () => ({ select: selectMock, update: updateMock, transaction: transactionMock }),
 }));
@@ -87,60 +94,91 @@ interface WalletFixture {
   reconciledThroughSlot: number | null;
   reconciliationState: string;
   baselineCompletedAt: Date | null;
-  // `rules.loss_limit_enabled` always resolves `false` in this file (see `activeConstitutionRow`'s
-  // sibling comment on `selectMock`'s no-projection branch) so `backfillLotMatching` never
-  // actually runs here — `null` throughout is fine; `needsLotBackfill` has its own direct
-  // unit tests above.
+  // Only load-bearing in the flag-on integration tests below (`describe('reconcileWallet —
+  // loss-limit integration (flag on)')`) — every other test in this file leaves
+  // `rules.loss_limit_enabled` at its default-mocked `false`, so `backfillLotMatching` never
+  // actually runs for them and these two stay `null` harmlessly. `needsLotBackfill` and
+  // `isAfterLotWatermark` have their own direct unit tests above regardless.
   lotsBuiltThroughSlot: number | null;
+  lotsBuiltThroughTransactionIndex: number | null;
 }
 
-const NEVER_RECONCILED: WalletFixture = { reconciledThroughSlot: null, reconciliationState: 'never', baselineCompletedAt: null, lotsBuiltThroughSlot: null };
+/** A loosely-typed stand-in for a `TradeRow` — only the fields this file's mocks and assertions actually touch. */
+type FakeTradeRow = Record<string, unknown> & { id: string; signature: string; slot: number; transactionIndex: number };
+
+const NEVER_RECONCILED: WalletFixture = {
+  reconciledThroughSlot: null,
+  reconciliationState: 'never',
+  baselineCompletedAt: null,
+  lotsBuiltThroughSlot: null,
+  lotsBuiltThroughTransactionIndex: null,
+};
 const ALREADY_BASELINED: WalletFixture = {
   reconciledThroughSlot: 50,
   reconciliationState: 'current',
   baselineCompletedAt: new Date('2026-08-01T00:00:00Z'),
   lotsBuiltThroughSlot: null,
+  lotsBuiltThroughTransactionIndex: null,
 };
 
 /**
- * A shared, mutable fake `wallets` row plus a signature-deduplicating `trades` table —
- * enough to exercise reconcile-wallet.ts's real logic (cursor-advance SQL, ON CONFLICT
- * dedup, row-lock acquisition per batch, `baseline_completed_at` bookkeeping) without a
- * real database.
+ * A shared, mutable fake `wallets` row plus a signature-deduplicating `trades` table, and
+ * (since the loss-limit fix) a `position_lots` insert/update spy and a fixed
+ * `existingTrades` fixture for `loadUnmatchedTrades` — enough to exercise
+ * reconcile-wallet.ts's real logic (cursor-advance SQL, ON CONFLICT dedup, row-lock
+ * acquisition per batch, `baseline_completed_at` bookkeeping, and — flag on — FIFO lot
+ * backfill/live-matching) without a real database.
+ *
+ * Table identity (`table === positionLotsTable` etc.), not call shape, is what routes each
+ * mock branch — the real schema objects are imported unmocked for exactly this comparison.
  */
 function fakeDatabase(
   initial: WalletFixture = NEVER_RECONCILED,
   {
     hasActiveConstitution = true,
     failFinalBatchUpdate = false,
-  }: { hasActiveConstitution?: boolean; failFinalBatchUpdate?: boolean } = {},
+    existingTrades = [],
+  }: { hasActiveConstitution?: boolean; failFinalBatchUpdate?: boolean; existingTrades?: FakeTradeRow[] } = {},
 ) {
   const wallet = { ...initial };
   const persistedSignatures = new Set<string>();
   const lockCalls: string[] = [];
   const cursorAdvanceSetCalls: unknown[] = [];
   const conflictTargets: unknown[] = [];
+  const positionLotInsertCalls: unknown[] = [];
+  const positionLotUpdateCalls: unknown[] = [];
+  const tradeUpdateCalls: unknown[] = [];
 
-  // `loadWalletReconciliationInfo` selects a *projection* (an object arg to `.select()`);
-  // `loadActiveConstitution` selects the whole row (`.select()`, no arg) — that's the only
-  // reliable way this mock can tell the two queries apart without inspecting `.from(...)`.
+  // `loadWalletReconciliationInfo` selects a *projection* (an object arg to `.select()`) from
+  // `wallets`; `loadActiveConstitutionInfo` selects the whole row (`.select()`, no arg) from
+  // `constitutions` — both still land in the shared branch below, distinguished by
+  // `projection`'s presence, same as before. `loadUnmatchedTrades` is new: `.select()` (no
+  // arg) from `trades`, with `.orderBy(...)` instead of `.limit(...)` — table identity is the
+  // only way to route it correctly since it shares "no projection" with the constitution read.
   selectMock.mockImplementation((projection?: unknown) => ({
-    from: () => ({
-      where: () => ({
-        limit: async () =>
-          projection
-            ? [
-                {
-                  reconciledThroughSlot: wallet.reconciledThroughSlot,
-                  baselineCompletedAt: wallet.baselineCompletedAt,
-                  lotsBuiltThroughSlot: wallet.lotsBuiltThroughSlot,
-                },
-              ]
-            : hasActiveConstitution
-              ? [activeConstitutionRow()]
-              : [],
-      }),
-    }),
+    from: (table: unknown) => {
+      if (table === tradesTable) {
+        return { where: () => ({ orderBy: async () => existingTrades }) };
+      }
+
+      return {
+        where: () => ({
+          limit: async () =>
+            projection
+              ? [
+                  {
+                    reconciledThroughSlot: wallet.reconciledThroughSlot,
+                    baselineCompletedAt: wallet.baselineCompletedAt,
+                    lotsBuiltThroughSlot: wallet.lotsBuiltThroughSlot,
+                    lotsBuiltThroughTransactionIndex: wallet.lotsBuiltThroughTransactionIndex,
+                  },
+                ]
+              : hasActiveConstitution
+                ? [activeConstitutionRow()]
+                : [],
+        }),
+      };
+    },
   }));
 
   updateMock.mockImplementation(() => ({
@@ -160,56 +198,110 @@ function fakeDatabase(
   function tx() {
     return {
       select: () => ({
-        from: () => ({
-          where: () => ({
-            for: () => {
-              lockCalls.push('locked');
-              return { limit: async () => [{}] };
-            },
-          }),
-        }),
-      }),
-      insert: () => ({
-        values: (row: { signature: string; slot: number }) => ({
-          onConflictDoNothing: (target: unknown) => {
-            conflictTargets.push(target);
-            return {
-              returning: async () => {
-                if (persistedSignatures.has(row.signature)) {
-                  return [];
-                }
-                persistedSignatures.add(row.signature);
-                return [{ id: row.signature }];
-              },
-            };
-          },
-        }),
-      }),
-      update: () => ({
-        set: (values: { reconciledThroughSlot?: unknown; baselineCompletedAt?: Date }) => {
-          cursorAdvanceSetCalls.push(values);
+        from: (table: unknown) => {
+          if (table === positionLotsTable) {
+            return { where: () => ({ orderBy: async () => [] }) }; // no pre-existing lots needed by any test in this file
+          }
+
+          // wallets — shared by `persistBatch`'s row-lock-only read (return value ignored)
+          // and `backfillLotMatchingBatch`'s fresh watermark read (these two fields matter).
           return {
-            where: async () => {
-              if (failFinalBatchUpdate) {
-                throw new Error('connection lost mid-commit');
-              }
-              // Mirrors what a real committed UPDATE would do — this is what proves the
-              // cursor advance and `baselineCompletedAt` land together, in one statement,
-              // when it succeeds (and neither lands, per the branch above, when it fails).
-              if (values.baselineCompletedAt) {
-                wallet.baselineCompletedAt = values.baselineCompletedAt;
-              }
-              return undefined;
-            },
+            where: () => ({
+              for: () => {
+                lockCalls.push('locked');
+                return {
+                  limit: async () => [
+                    { lotsBuiltThroughSlot: wallet.lotsBuiltThroughSlot, lotsBuiltThroughTransactionIndex: wallet.lotsBuiltThroughTransactionIndex },
+                  ],
+                };
+              },
+            }),
           };
         },
       }),
+      insert: (table: unknown) => {
+        if (table === positionLotsTable) {
+          return {
+            values: (row: unknown) => {
+              positionLotInsertCalls.push(row);
+              return Promise.resolve(undefined);
+            },
+          };
+        }
+
+        return {
+          values: (row: { signature: string; slot: number }) => ({
+            onConflictDoNothing: (target: unknown) => {
+              conflictTargets.push(target);
+              return {
+                returning: async () => {
+                  if (persistedSignatures.has(row.signature)) {
+                    return [];
+                  }
+                  persistedSignatures.add(row.signature);
+                  return [{ id: row.signature }];
+                },
+              };
+            },
+          }),
+        };
+      },
+      update: (table: unknown) => {
+        if (table === positionLotsTable) {
+          return {
+            set: (values: unknown) => ({
+              where: async () => {
+                positionLotUpdateCalls.push(values);
+              },
+            }),
+          };
+        }
+
+        if (table === tradesTable) {
+          return {
+            set: (values: unknown) => ({
+              where: async () => {
+                tradeUpdateCalls.push(values);
+              },
+            }),
+          };
+        }
+
+        return {
+          set: (values: { reconciledThroughSlot?: unknown; baselineCompletedAt?: Date }) => {
+            cursorAdvanceSetCalls.push(values);
+            return {
+              where: async () => {
+                if (failFinalBatchUpdate) {
+                  throw new Error('connection lost mid-commit');
+                }
+                // Mirrors what a real committed UPDATE would do — this is what proves the
+                // cursor advance and `baselineCompletedAt` land together, in one statement,
+                // when it succeeds (and neither lands, per the branch above, when it fails).
+                if (values.baselineCompletedAt) {
+                  wallet.baselineCompletedAt = values.baselineCompletedAt;
+                }
+                return undefined;
+              },
+            };
+          },
+        };
+      },
     };
   }
 
   transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) => callback(tx()));
 
-  return { wallet, persistedSignatures, lockCalls, cursorAdvanceSetCalls, conflictTargets };
+  return {
+    wallet,
+    persistedSignatures,
+    lockCalls,
+    cursorAdvanceSetCalls,
+    conflictTargets,
+    positionLotInsertCalls,
+    positionLotUpdateCalls,
+    tradeUpdateCalls,
+  };
 }
 
 beforeEach(() => {
@@ -217,6 +309,9 @@ beforeEach(() => {
   resolveSessionMock.mockResolvedValue(session());
   priceTradeMock.mockResolvedValue({ usdValue: '10', priceSource: 'stablecoin' });
   loadWindowedTradesMock.mockResolvedValue([]);
+  // Every flag defaults off — matches every kill switch's fail-closed default elsewhere in
+  // this codebase. The loss-limit integration tests below override this per key.
+  isFeatureEnabledMock.mockResolvedValue(false);
   deriveSwapFromTransactionMock.mockImplementation((tx: { transaction: { signatures: string[] }; slot: number }) =>
     derivedSwap(tx.transaction.signatures[0]!, tx.slot),
   );
@@ -242,6 +337,38 @@ describe('needsLotBackfill', () => {
 
   it('needs no backfill when the lots watermark is already ahead (a concurrent run advanced it)', () => {
     expect(needsLotBackfill(150, 100)).toBe(false);
+  });
+});
+
+// `isAfterLotWatermark` is the fresh, in-lock authority `backfillLotMatchingBatch` checks per
+// trade — the fix for the second round's BLOCKING 2: a coarse slot-only comparison would
+// itself skip a straggler sharing the watermark's own slot with a higher transaction index
+// (the same class of bug NIT 1 flagged in `loadUnmatchedTrades`), so this is a proper
+// (slot, transactionIndex) tuple comparison.
+describe('isAfterLotWatermark', () => {
+  it('everything is after a null watermark — nothing has ever been matched', () => {
+    expect(isAfterLotWatermark(1, 0, null, null)).toBe(true);
+  });
+
+  it('a later slot is after the watermark regardless of transaction index', () => {
+    expect(isAfterLotWatermark(101, 0, 100, 999)).toBe(true);
+  });
+
+  it('an earlier slot is never after the watermark', () => {
+    expect(isAfterLotWatermark(99, 999, 100, 0)).toBe(false);
+  });
+
+  it('the same slot with a higher transaction index is after the watermark — the exact straggler NIT 1 was about', () => {
+    expect(isAfterLotWatermark(100, 6, 100, 5)).toBe(true);
+  });
+
+  it('the same slot with a lower or equal transaction index is not after the watermark', () => {
+    expect(isAfterLotWatermark(100, 5, 100, 5)).toBe(false);
+    expect(isAfterLotWatermark(100, 4, 100, 5)).toBe(false);
+  });
+
+  it('treats a null watermark transaction index as -1 — any real transaction index in that slot is after it', () => {
+    expect(isAfterLotWatermark(100, 0, 100, null)).toBe(true);
   });
 });
 
@@ -492,5 +619,91 @@ describe('reconcileWallet', () => {
     // No duplicate: exactly one of the two runs actually persisted the trade.
     expect(a.tradesPersisted + b.tradesPersisted).toBe(1);
     expect(persistedSignatures.size).toBe(1);
+  });
+});
+
+/**
+ * `rules.loss_limit_enabled` on, end to end through `reconcileWallet()` — the coverage two
+ * rounds of review found missing: every other test in this file leaves the flag at its
+ * default-mocked `false`, so the backfill path and the quote-mint wiring were previously
+ * exercised by nothing but their own pure-function unit tests.
+ */
+describe('reconcileWallet — loss-limit integration (flag on)', () => {
+  function enableLossLimitOnly() {
+    isFeatureEnabledMock.mockImplementation(async (key: string) => key === 'rules.loss_limit_enabled');
+  }
+
+  it('a backfill run reconstructs position_lots from an already-persisted, never-matched trade', async () => {
+    const oldAcquisition: FakeTradeRow = {
+      id: 'trade-old-1',
+      walletId: WALLET_ID,
+      signature: 'sig-old-1',
+      slot: 50,
+      transactionIndex: 0,
+      occurredAt: new Date('2026-08-02T00:00:00Z'), // after activeConstitutionRow()'s activatedAt (2026-08-01)
+      soldMint: [...STABLECOIN_MINTS][0]!, // a quote mint — the disposal half is skipped entirely
+      boughtMint: 'BONK1111111111111111111111111111111111111',
+      soldAmountBaseUnits: '100000000',
+      boughtAmountBaseUnits: '5000000',
+      usdValue: '100',
+      isBaseline: false,
+      excludedReason: null,
+    };
+
+    const { positionLotInsertCalls, tradeUpdateCalls } = fakeDatabase(
+      {
+        reconciledThroughSlot: 100,
+        reconciliationState: 'current',
+        baselineCompletedAt: new Date('2026-08-01T00:00:00Z'),
+        lotsBuiltThroughSlot: null, // never built — the flag-was-off gap
+        lotsBuiltThroughTransactionIndex: null,
+      },
+      { existingTrades: [oldAcquisition] },
+    );
+    enableLossLimitOnly();
+    getTransactionsForAddressMock.mockResolvedValue([]); // no new Helius activity — the whole point is backfilling old trades
+
+    await reconcileWallet('cid-backfill-1');
+
+    expect(positionLotInsertCalls).toEqual([
+      expect.objectContaining({
+        walletId: WALLET_ID,
+        mint: 'BONK1111111111111111111111111111111111111',
+        remainingBaseUnits: '5000000',
+        costBasisUsd: '100',
+        openedAfterActivation: true,
+        slot: 50,
+        transactionIndex: 0,
+      }),
+    ]);
+    expect(tradeUpdateCalls).toEqual([{ isRoundTripClose: false, realizedLossUsd: null }]);
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'trade.lot_matched', payload: expect.objectContaining({ signature: 'sig-old-1' }) }),
+      expect.anything(),
+    );
+  });
+
+  it('never opens a position_lots row for a quote-mint (SOL) leg of a live swap', async () => {
+    const { positionLotInsertCalls } = fakeDatabase(ALREADY_BASELINED);
+    enableLossLimitOnly();
+    getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-quote', 100)]);
+    deriveSwapFromTransactionMock.mockReturnValueOnce(
+      derivedSwap('sig-quote', 100, {
+        soldMint: 'BONK1111111111111111111111111111111111111',
+        boughtMint: WSOL_MINT,
+        soldAmountBaseUnits: '5000000',
+        boughtAmountBaseUnits: '2000000000',
+        soldDecimals: 5,
+        boughtDecimals: 9,
+      }),
+    );
+
+    await reconcileWallet('cid-quote-1');
+
+    expect(positionLotInsertCalls).toEqual([]);
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({ eventType: 'trade.lot_matched', payload: expect.objectContaining({ signature: 'sig-quote', isRoundTripClose: false }) }),
+      expect.anything(),
+    );
   });
 });

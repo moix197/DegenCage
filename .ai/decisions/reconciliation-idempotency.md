@@ -18,18 +18,29 @@ top of them rather than re-deciding them.
 5. **`wallets.baseline_completed_at` — not `reconciliation_state` — decides "is this the
    baseline pull".** Written exactly once, only on a successful baseline run, and for the
    final batch it rides inside that batch's own cursor `UPDATE`.
-6. **`wallets.lots_built_through_slot` (Phase 6) is a second cursor for FIFO lot-matching
-   (`lot-matching.ts`), independent of `reconciled_through_slot` and never assumed to equal
-   it.** `rules.loss_limit_enabled` can be off while `reconciled_through_slot` keeps
-   advancing; a trade persisted during that window is deduplicated by (1) forever and a
-   normal re-run never revisits it, so it would simply never reach `position_lots`, leaving a
-   permanent hole in FIFO order. `reconcileWallet()` detects the gap
-   (`needsLotBackfill(lotsBuiltThroughSlot, reconciledThroughSlot)`, a pure predicate with its
-   own unit tests) and backfills exactly the missing range **from `trades`, not Helius** — in
-   the same true chronological order (`slot`, then `transaction_index`) live matching uses —
-   before any new trade in the current run is matched against `position_lots`. Only advances
-   when `rules.loss_limit_enabled` is actually on for the run doing the advancing, or the
-   cursor itself would falsely certify trades as lot-matched that were skipped.
+6. **`wallets.lots_built_through_slot` + `lots_built_through_transaction_index` (Phase 6) are
+   a second, *composite* cursor for FIFO lot-matching (`lot-matching.ts`), independent of
+   `reconciled_through_slot` and never assumed to equal it.** `rules.loss_limit_enabled` can
+   be off while `reconciled_through_slot` keeps advancing; a trade persisted during that
+   window is deduplicated by (1) forever and a normal re-run never revisits it, so it would
+   simply never reach `position_lots`, leaving a permanent hole in FIFO order.
+   `reconcileWallet()` detects the gap (`needsLotBackfill`, a pure predicate) and backfills
+   exactly the missing range **from `trades`, not Helius** — in the same true chronological
+   order (`slot`, then `transaction_index`) live matching uses — before any new trade in the
+   current run is matched against `position_lots`. The watermark is a `(slot,
+   transactionIndex)` *pair*, not a slot alone: a batch boundary can land mid-slot (batching
+   is by count), so a slot-only cursor could advance past a slot before every one of its
+   trades is matched, silently skipping the stragglers (`slot > cursor` excludes `slot =
+   cursor` entirely) — `isAfterLotWatermark` is the tuple comparison this requires, and
+   `lotWatermarkAdvance` is the corresponding tuple-`GREATEST` (Postgres has no built-in one).
+   Only advances when `rules.loss_limit_enabled` is actually on for the run doing the
+   advancing, or the cursor itself would falsely certify trades as lot-matched that were
+   skipped. Critically, the backfill's own idempotency is enforced **inside its row lock, on
+   a freshly-read watermark** (`backfillLotMatchingBatch`) — the watermark `backfillLotMatching`
+   read before taking any lock is only ever a candidate-range hint, never trusted as the
+   authority on what to actually write, or two overlapping runs could each apply the same lot
+   match twice (the exact same double-application risk (2)/(4) already guard against for
+   trade inserts and the cursor advance, one column over).
 
 **Why:**
 

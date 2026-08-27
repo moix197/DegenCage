@@ -98,8 +98,16 @@ export const wallets = pgTable('wallets', {
    * `reconcile-wallet.ts` detects that gap — `lots_built_through_slot < reconciled_through_slot`
    * — and backfills exactly the missing range from `trades` (not Helius) before trusting any
    * new lot match. Null until lot-matching has ever run for this wallet.
+   *
+   * Paired with `lots_built_through_transaction_index` below: a batch boundary can fall in
+   * the middle of one slot's trades (batching is by count, not by slot), so a slot-only
+   * cursor could advance past a slot before every one of its trades is actually matched,
+   * silently skipping the stragglers forever (`slot > cursor` excludes `slot = cursor`
+   * entirely). Both columns always advance together — see `lotWatermarkAdvance` in
+   * `reconcile-wallet.ts`.
    */
   lotsBuiltThroughSlot: bigint('lots_built_through_slot', { mode: 'number' }),
+  lotsBuiltThroughTransactionIndex: integer('lots_built_through_transaction_index'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

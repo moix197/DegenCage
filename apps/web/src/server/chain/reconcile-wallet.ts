@@ -1,5 +1,5 @@
 import { evaluateTrade, migrateConstitution, type AssetTier, type Constitution } from '@degencage/rules';
-import { and, asc, eq, gt, isNull, lte, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
 import { recordEvent, type DatabaseExecutor } from '../../observability/events';
@@ -60,6 +60,13 @@ const BASELINE_WINDOW_DAYS = 90;
 /** Own DB transaction (and row lock) per this many derived swaps, so a long reconciliation never holds one lock for its whole duration and a mid-run failure only rolls back its own page. */
 const PERSIST_BATCH_SIZE = 100;
 const DEFAULT_WINDOW_HOURS = 24;
+/**
+ * `wallets.lots_built_through_transaction_index` is a Postgres `integer` (int4, max
+ * 2147483647) — `Number.MAX_SAFE_INTEGER` would overflow it. Solana's own `transactionIndex`
+ * never comes remotely close to this within one slot, so it is a safe "end of slot" sentinel
+ * for `backfillLotMatching`'s final clamp.
+ */
+const MAX_TRANSACTION_INDEX = 2_147_483_647;
 
 export class ReconcileRejected extends Error {
   constructor(readonly reason: 'unauthenticated') {
@@ -89,8 +96,9 @@ function chunk<T>(items: T[], size: number): T[][] {
 interface WalletReconciliationInfo {
   reconciledThroughSlot: number | null;
   baselineCompletedAt: Date | null;
-  /** See the schema comment on `wallets.lots_built_through_slot` — `backfillLotMatching`'s starting point. */
+  /** See the schema comment on `wallets.lots_built_through_slot` — `backfillLotMatching`'s starting point. Only ever a cheap pre-check: the authoritative read happens fresh, inside the lock, in `backfillLotMatchingBatch`. */
   lotsBuiltThroughSlot: number | null;
+  lotsBuiltThroughTransactionIndex: number | null;
 }
 
 /**
@@ -107,6 +115,7 @@ async function loadWalletReconciliationInfo(walletId: string): Promise<WalletRec
       reconciledThroughSlot: wallets.reconciledThroughSlot,
       baselineCompletedAt: wallets.baselineCompletedAt,
       lotsBuiltThroughSlot: wallets.lotsBuiltThroughSlot,
+      lotsBuiltThroughTransactionIndex: wallets.lotsBuiltThroughTransactionIndex,
     })
     .from(wallets)
     .where(eq(wallets.id, walletId))
@@ -610,22 +619,26 @@ async function persistBatch(
       excludedPersisted += result.excludedPersisted ? 1 : 0;
     }
 
+    const lastInBatch = pricedBatch[pricedBatch.length - 1]!.swap;
     const highestSlot = Math.max(...pricedBatch.map(({ swap }) => swap.slot));
 
     // GREATEST, not a blind SET: a concurrent run's batch may have already advanced the
     // cursor past this batch's own highest slot, and the cursor must never move backward.
     // `baselineCompletedAt` (when present) rides in this same statement — same transaction,
-    // same UPDATE, so it is all-or-nothing with the cursor advance. `lotsBuiltThroughSlot`
-    // rides along too, but *only* when `lossLimitEnabled` — advancing it while the flag is
-    // off would falsely claim these trades were lot-matched, hiding the exact gap
-    // `backfillLotMatching` exists to close later (see the schema comment on
-    // `wallets.lots_built_through_slot`).
+    // same UPDATE, so it is all-or-nothing with the cursor advance. `lotsBuiltThroughSlot`/
+    // `lotsBuiltThroughTransactionIndex` ride along too, but *only* when `lossLimitEnabled` —
+    // advancing them while the flag is off would falsely claim these trades were lot-matched,
+    // hiding the exact gap `backfillLotMatching` exists to close later (see the schema
+    // comment on `wallets.lots_built_through_slot`). `pricedBatch` is a contiguous slice of
+    // the run's globally slot/transactionIndex-sorted list, so its *last* element — not a
+    // `Math.max` over the whole batch — is the one with the highest `(slot, transactionIndex)`
+    // pair, matching `lotWatermarkAdvance`'s tuple semantics exactly.
     await tx
       .update(wallets)
       .set({
         reconciledThroughSlot: sql`GREATEST(COALESCE(${wallets.reconciledThroughSlot}, 0), ${highestSlot})`,
         ...(baselineCompletedAt ? { baselineCompletedAt } : {}),
-        ...(lossLimitEnabled ? { lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${highestSlot})` } : {}),
+        ...(lossLimitEnabled ? lotWatermarkAdvance(lastInBatch.slot, lastInBatch.transactionIndex) : {}),
       })
       .where(eq(wallets.id, walletId));
 
@@ -634,16 +647,29 @@ async function persistBatch(
 }
 
 /**
- * Already-persisted, real (non-excluded) trades for `walletId` strictly after `afterSlot`
- * (exclusive — `null` means "the beginning") through `throughSlot` (inclusive), in true
- * chronological order — the gap `backfillLotMatching` needs to catch up. Reads from `trades`
- * itself, never Helius: these rows were already reconciled, only never lot-matched.
+ * Already-persisted, real (non-excluded) trades for `walletId` strictly after the
+ * `(afterSlot, afterTransactionIndex)` watermark pair (`afterSlot: null` means "the
+ * beginning") through `throughSlot` (inclusive), in true chronological order — the gap
+ * `backfillLotMatching` needs to catch up. Reads from `trades` itself, never Helius: these
+ * rows were already reconciled, only never lot-matched.
+ *
+ * The boundary is a proper tuple comparison, not `slot`-only: a batch boundary (batching is
+ * by count, not by slot) can land in the middle of one slot's trades, so `slot > afterSlot`
+ * alone would silently skip a straggler sharing `afterSlot`'s own slot but a higher
+ * `transaction_index`.
  */
-async function loadUnmatchedTrades(walletId: string, afterSlot: number | null, throughSlot: number): Promise<TradeRow[]> {
+async function loadUnmatchedTrades(
+  walletId: string,
+  afterSlot: number | null,
+  afterTransactionIndex: number | null,
+  throughSlot: number,
+): Promise<TradeRow[]> {
   const conditions = [eq(trades.walletId, walletId), isNull(trades.excludedReason), lte(trades.slot, throughSlot)];
 
   if (afterSlot !== null) {
-    conditions.push(gt(trades.slot, afterSlot));
+    conditions.push(
+      or(gt(trades.slot, afterSlot), and(eq(trades.slot, afterSlot), gt(trades.transactionIndex, afterTransactionIndex ?? -1)))!,
+    );
   }
 
   return getDb()
@@ -654,18 +680,83 @@ async function loadUnmatchedTrades(walletId: string, afterSlot: number | null, t
 }
 
 /**
- * Lot-matches one batch of already-persisted trades and advances `lots_built_through_slot`
- * to the highest slot in the batch — its own row-locked transaction, same shape as
- * `persistBatch`, so a long backfill never holds one lock for its whole duration.
+ * Whether `(slot, transactionIndex)` is strictly after the `(watermarkSlot,
+ * watermarkTransactionIndex)` pair — `watermarkSlot: null` means no watermark yet, so
+ * everything is after it. Pure, exported and unit-tested directly
+ * (`reconcile-wallet.test.ts`): the one predicate that decides, inside the lock, whether a
+ * given trade in a backfill batch still needs matching or was already handled by a
+ * concurrent/prior run.
+ */
+export function isAfterLotWatermark(
+  slot: number,
+  transactionIndex: number,
+  watermarkSlot: number | null,
+  watermarkTransactionIndex: number | null,
+): boolean {
+  if (watermarkSlot === null) {
+    return true;
+  }
+
+  if (slot !== watermarkSlot) {
+    return slot > watermarkSlot;
+  }
+
+  return transactionIndex > (watermarkTransactionIndex ?? -1);
+}
+
+/**
+ * The `SET` fragment that advances `wallets.lots_built_through_slot`/
+ * `lots_built_through_transaction_index` to `(slot, transactionIndex)` — a proper composite
+ * tuple advance, since Postgres has no built-in tuple `GREATEST`. Never a blind `SET`: a
+ * differently-ordered concurrent write must never regress either half of the pair. The
+ * transaction-index half only advances when the slot half doesn't move (same slot, a later
+ * trade within it) or moves forward with it (a later slot); it is left untouched when the
+ * incoming pair is actually behind the stored one.
+ */
+function lotWatermarkAdvance(slot: number, transactionIndex: number) {
+  return {
+    lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${slot})`,
+    lotsBuiltThroughTransactionIndex: sql`CASE
+      WHEN ${slot} > COALESCE(${wallets.lotsBuiltThroughSlot}, 0) THEN ${transactionIndex}
+      WHEN ${slot} = COALESCE(${wallets.lotsBuiltThroughSlot}, 0) THEN GREATEST(COALESCE(${wallets.lotsBuiltThroughTransactionIndex}, 0), ${transactionIndex})
+      ELSE ${wallets.lotsBuiltThroughTransactionIndex}
+    END`,
+  };
+}
+
+/**
+ * Lot-matches one batch of already-persisted trades and advances the lots watermark to the
+ * highest `(slot, transactionIndex)` pair in the batch — its own row-locked transaction, same
+ * shape as `persistBatch`, so a long backfill never holds one lock for its whole duration.
+ *
+ * Idempotency against a concurrent run is enforced *here*, not by the caller: the watermark
+ * is re-read fresh, inside this transaction's lock, and every trade at or below it is
+ * skipped. `backfillLotMatching`'s own watermark read (before any lock) only ever decides
+ * *candidates* to fetch from `trades` — it is never trusted as the authority on what to
+ * actually write, or two overlapping runs could each apply the same lot match twice.
  */
 async function backfillLotMatchingBatch(walletId: string, userId: string, correlationId: string, activatedAt: Date | null, batch: TradeRow[]): Promise<void> {
   await getDb().transaction(async (tx) => {
-    await tx.select().from(wallets).where(eq(wallets.id, walletId)).for('update').limit(1);
+    const [walletRow] = await tx
+      .select({
+        lotsBuiltThroughSlot: wallets.lotsBuiltThroughSlot,
+        lotsBuiltThroughTransactionIndex: wallets.lotsBuiltThroughTransactionIndex,
+      })
+      .from(wallets)
+      .where(eq(wallets.id, walletId))
+      .for('update')
+      .limit(1);
 
-    let highestSlot = 0;
+    const freshSlot = walletRow?.lotsBuiltThroughSlot ?? null;
+    const freshTransactionIndex = walletRow?.lotsBuiltThroughTransactionIndex ?? null;
 
     for (const tradeRow of batch) {
-      highestSlot = Math.max(highestSlot, tradeRow.slot);
+      if (!isAfterLotWatermark(tradeRow.slot, tradeRow.transactionIndex, freshSlot, freshTransactionIndex)) {
+        // Already matched — by this same backfill earlier, or by a concurrent run that won
+        // the race for this wallet's lock first. The freshly-read watermark is authoritative;
+        // `batch`'s membership (decided before this lock, from a possibly-stale read) is not.
+        continue;
+      }
 
       // `loadUnmatchedTrades` only ever selects real (non-excluded) trades, and a real trade
       // always has both legs populated (see the `trades` schema comment) — the `!`s below
@@ -708,10 +799,13 @@ async function backfillLotMatchingBatch(walletId: string, userId: string, correl
       }
     }
 
-    await tx
-      .update(wallets)
-      .set({ lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${highestSlot})` })
-      .where(eq(wallets.id, walletId));
+    // `batch` is sorted (slot, transactionIndex) ascending — same sort `loadUnmatchedTrades`
+    // returns — so its *last* element is always the highest pair, whether or not it was
+    // itself skipped above (a skipped last element means the whole batch was already caught
+    // up, and this GREATEST/CASE advance is then a safe no-op).
+    const last = batch[batch.length - 1]!;
+
+    await tx.update(wallets).set(lotWatermarkAdvance(last.slot, last.transactionIndex)).where(eq(wallets.id, walletId));
   });
 }
 
@@ -719,7 +813,10 @@ async function backfillLotMatchingBatch(walletId: string, userId: string, correl
  * Pure gap-detection, exported and unit-tested directly (`reconcile-wallet.test.ts`) per
  * `.ai/decisions/migration-and-test-tooling.md`'s "DB-touching modules are split into a pure
  * decision function plus a thin query" — `backfillLotMatching` below is the thin, I/O-heavy
- * orchestration around this one true/false call.
+ * orchestration around this one true/false call. Slot-only (no `transactionIndex`) is
+ * intentional: this is only ever a cheap "might there be a gap at all" pre-check against
+ * `reconciled_through_slot`, itself a slot-only cursor — the precise, transaction-index-aware
+ * boundary lives in `loadUnmatchedTrades` and `isAfterLotWatermark`, not here.
  */
 export function needsLotBackfill(lotsBuiltThroughSlot: number | null, reconciledThroughSlot: number): boolean {
   return lotsBuiltThroughSlot === null || lotsBuiltThroughSlot < reconciledThroughSlot;
@@ -732,12 +829,18 @@ export function needsLotBackfill(lotsBuiltThroughSlot: number | null, reconciled
  * chronological order live matching uses) *before* any new trade in this run is matched
  * against them, so a later disposal is never wrongly ruled eligible against an incomplete
  * lot history. A no-op when there is no gap.
+ *
+ * `lotsBuiltThroughSlot`/`lotsBuiltThroughTransactionIndex` here are a snapshot taken before
+ * any lock — used only to decide *whether to bother* and to shape the `loadUnmatchedTrades`
+ * query's candidate range. They are never trusted as the last word on what to actually write;
+ * `backfillLotMatchingBatch` re-reads the real value inside its own lock per batch.
  */
 async function backfillLotMatching(
   walletId: string,
   userId: string,
   correlationId: string,
   lotsBuiltThroughSlot: number | null,
+  lotsBuiltThroughTransactionIndex: number | null,
   reconciledThroughSlot: number | null,
   activatedAt: Date | null,
 ): Promise<void> {
@@ -746,10 +849,10 @@ async function backfillLotMatching(
   }
 
   if (!needsLotBackfill(lotsBuiltThroughSlot, reconciledThroughSlot)) {
-    return; // already caught up
+    return; // already caught up, as of this (possibly slightly stale) read
   }
 
-  const unmatched = await loadUnmatchedTrades(walletId, lotsBuiltThroughSlot, reconciledThroughSlot);
+  const unmatched = await loadUnmatchedTrades(walletId, lotsBuiltThroughSlot, lotsBuiltThroughTransactionIndex, reconciledThroughSlot);
 
   for (const batch of chunk(unmatched, PERSIST_BATCH_SIZE)) {
     await backfillLotMatchingBatch(walletId, userId, correlationId, activatedAt, batch);
@@ -757,10 +860,15 @@ async function backfillLotMatching(
 
   // Clamp all the way to `reconciledThroughSlot` even if the gap's tail was entirely
   // excluded candidates (no real trade there to carry the watermark forward) — otherwise the
-  // next run rescans an already-confirmed-empty range forever.
+  // next run rescans an already-confirmed-empty range forever. `MAX_TRANSACTION_INDEX` for
+  // the transaction-index half is deliberate: `loadUnmatchedTrades`'s `lte(slot, throughSlot)`
+  // just confirmed *every* trade up to and including the whole of `reconciledThroughSlot`'s
+  // slot was considered, not just up to some transaction index within it, so the clamp must
+  // cover the entire slot, not stop partway through it. A single `UPDATE` statement is
+  // atomic against Postgres' own MVCC — no explicit lock needed for this one.
   await getDb()
     .update(wallets)
-    .set({ lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${reconciledThroughSlot})` })
+    .set(lotWatermarkAdvance(reconciledThroughSlot, MAX_TRANSACTION_INDEX))
     .where(eq(wallets.id, walletId));
 }
 
@@ -828,7 +936,15 @@ async function runReconciliation(
     // otherwise a disposal in this very run could draw down the wrong (newer) lot for a mint
     // whose true oldest lot is still sitting unmatched in the gap.
     if (lossLimitEnabled) {
-      await backfillLotMatching(walletId, userId, correlationId, info.lotsBuiltThroughSlot, cursor, activatedAt);
+      await backfillLotMatching(
+        walletId,
+        userId,
+        correlationId,
+        info.lotsBuiltThroughSlot,
+        info.lotsBuiltThroughTransactionIndex,
+        cursor,
+        activatedAt,
+      );
     }
 
     for (let index = 0; index < batches.length; index += 1) {

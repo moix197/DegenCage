@@ -1,0 +1,1 @@
+ALTER TABLE "wallets" ADD COLUMN "lots_built_through_transaction_index" integer;
