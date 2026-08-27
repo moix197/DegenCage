@@ -51,10 +51,56 @@ is that action's durable record instead — voiding is reserved for the system d
 to honor a stale request, which is exactly the case that needs its own answer of "why didn't
 this apply" sitting in the events log.
 
+**Rate-limit asymmetry (the same shape, applied to the request itself):** Only the loosening
+actions are throttled — `requestLimitChange`'s increase path (`scheduleIncrease`) and
+`cancelPendingChange`. A decrease (`applyDecreaseImmediately`) never calls a rate limiter at
+all; the function is simply never invoked on that path. This reuses
+`assertWithinConstitutionActionRateLimit` (`server/constitution/rate-limit.ts`, already
+counting `constitution.drafted`/`constitution.activation_rejected_early` for the draft/commit
+flow) as an **action gate**, not only a write guard — `assertRateLimitForLoosening`
+(`pending-changes.ts`) calls it before doing anything else on the loosening path and turns a
+`ConstitutionActionRateLimited` into `PendingChangeRejected('rate_limited')`, rejecting the
+request outright rather than merely skipping an event write.
+
+Cancelling a pending increase is throttled too, on its *own* counter
+(`constitution.limit_increase_cancelled`, separate from `constitution.limit_increase_
+requested`): cancelling is still editing commitment state, not a passive read, and treating it
+as loosening-adjacent closes an obvious workaround — hammer "cancel" then "request" in a loop
+to route around a request-only limit.
+
+**Fail-closed direction is itself asymmetric**, mirroring the decrease/increase split above:
+- A limiter failure that *is* the expected `ConstitutionActionRateLimited` (the count query
+  ran, the caller is over the threshold) rejects the loosening action, same as any other
+  rejection reason.
+- A limiter failure that is *not* that — the database itself unreachable — is re-thrown as-is
+  by `assertRateLimitForLoosening` rather than swallowed or treated as "allow": an unreachable
+  limiter must **reject** the loosening it was asked to gate (CLAUDE.md → fail closed), the
+  same direction every other kill-switch/limiter failure in this codebase fails.
+- The decrease path is unaffected by either case, because it never calls the limiter — there
+  is no failure mode there to fail closed (or open) about.
+
+**Behavioral signal:** every throttled loosening attempt records `constitution.edit_rate_
+limited` (payload: `path: 'increase_requested' | 'cancel_pending'`, plus the relevant
+`limitId`/`pendingChangeId`) — reused as one event type across both throttled paths rather than
+inventing two near-duplicates, since both mean the same thing for Phase 9's metrics: "wants
+looser rules, right now." That write is itself self-throttled (`recordRateLimitedAttempt`,
+same shape as `commitment.ts`'s private `recordEventWithinRateLimit`) so a caller hammering
+past the limit does not also grow this event type unbounded — the rejection still fires on
+every call, only the audit trail stops growing once it has enough rows to prove the pattern.
+
 **Rejected:**
 
 - **Apply `new_value` unconditionally on schedule** — the stale-value hole above. Rejected
   after being found in code review on the first version of this phase.
+- **Rate-limiting the decrease path too, "for symmetry"** — the opposite of the point. Tighten-
+  ing your own constitution must be safe unconditionally, including when the rate limiter
+  itself is down; the only way to guarantee that is to never call it on that path at all,
+  which is what `applyDecreaseImmediately` does.
+- **Guarding only the event *write*, the same way `commitment.ts` uses this helper today** —
+  would let someone spam increase requests as long as they don't mind the audit trail being
+  incomplete; the edit surface is exactly where someone hammering "loosen my limits" shows up
+  (this decision's own motivating report), so the action itself has to be gated, not just its
+  bookkeeping.
 - **A scheduler / cron worker to apply due increases** — Phase 0 explicitly has neither
   (`hosting-and-growth-path.md`); reusing the existing lazy app-open trigger is one pattern,
   not two.

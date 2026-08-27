@@ -13,11 +13,17 @@ import {
   type ConstitutionRow,
 } from '../db/schema';
 import { isFeatureEnabled } from '../flags/feature-flags';
+import { ConstitutionActionRateLimited, assertWithinConstitutionActionRateLimit } from './rate-limit';
 
 /**
  * Asymmetric constitution edits (decision 12): loosening a limit is *always* the slow path,
  * tightening is *always* immediate — the same friction-only-one-way shape as the commitment
  * period in `./commitment.ts`, applied to an already-active constitution instead of a draft.
+ * The same asymmetry extends to rate limiting (`asymmetric-constitution-edits.md`,
+ * `.ai/decisions/`): only the loosening actions — `scheduleIncrease` and
+ * `cancelPendingChange` — are throttled, via `assertRateLimitForLoosening`;
+ * `applyDecreaseImmediately` never calls a rate limiter at all, so tightening is never
+ * throttled and a limiter outage can never block it either.
  *
  * Only `maxUsd` is editable through this module. `windowHours` and `tier` are part of a
  * `LimitRule` too, but "wider window" and "shorter window" do not map onto "looser" and
@@ -52,7 +58,8 @@ export type PendingChangeRejectionReason =
   | 'invalid_value'
   | 'no_change'
   | 'pending_change_exists'
-  | 'pending_change_not_found';
+  | 'pending_change_not_found'
+  | 'rate_limited';
 
 export class PendingChangeRejected extends Error {
   constructor(readonly reason: PendingChangeRejectionReason) {
@@ -69,6 +76,82 @@ async function requireSession(): Promise<SessionIdentity> {
   }
 
   return session;
+}
+
+/** Which of this module's two throttled actions produced a `constitution.edit_rate_limited` event. */
+type ThrottledEditPath = 'increase_requested' | 'cancel_pending';
+
+/**
+ * Records `constitution.edit_rate_limited`, but never faster than that event type's own
+ * per-user rate limit allows — same shape as `commitment.ts`'s private
+ * `recordEventWithinRateLimit`: a caller hammering the button past the throttle still gets
+ * rejected every time (`assertRateLimitForLoosening` below already guarantees that), but the
+ * audit trail for "they kept trying" stops growing once it has enough rows to prove the
+ * pattern. A failure to record this — throttled or not — never changes the caller's outcome:
+ * the rejection already happened before this runs.
+ */
+async function recordRateLimitedAttempt(
+  userId: string,
+  correlationId: string,
+  now: Date,
+  path: ThrottledEditPath,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await assertWithinConstitutionActionRateLimit(userId, 'constitution.edit_rate_limited', correlationId, now);
+  } catch (error) {
+    if (error instanceof ConstitutionActionRateLimited) {
+      return;
+    }
+
+    captureError(error, { correlationId, operation: 'constitutionEditRateLimitedEventThrottle' });
+
+    return;
+  }
+
+  await recordEvent({
+    eventType: 'constitution.edit_rate_limited',
+    occurredAt: now,
+    correlationId,
+    userId,
+    payload: { path, ...payload },
+  });
+}
+
+/**
+ * Gates the *loosening* half of this module — an increase request or a cancel of a pending
+ * increase — against `eventType`'s own per-user rate limit. Throws `PendingChangeRejected('rate_limited')`
+ * once the caller has made its share of that event type inside the window, after recording
+ * one (self-throttled) `constitution.edit_rate_limited` signal.
+ *
+ * **Never called on the decrease path** — that is the whole point (`asymmetric-constitution-
+ * edits.md`, `.ai/decisions/`): tightening your own constitution is always safe and must
+ * never be throttled. And the fail-closed direction here is itself asymmetric: a limiter
+ * error (not a `ConstitutionActionRateLimited` — the database itself is unavailable) is
+ * re-thrown as-is, which the caller never mistakes for a normal rejection reason. That is
+ * deliberate: an unreachable limiter must **reject** the loosening it was asked to gate
+ * (CLAUDE.md → fail closed), while leaving the decrease path — which never calls this
+ * function at all — completely unaffected by the same outage.
+ */
+async function assertRateLimitForLoosening(
+  userId: string,
+  eventType: string,
+  correlationId: string,
+  now: Date,
+  path: ThrottledEditPath,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  try {
+    await assertWithinConstitutionActionRateLimit(userId, eventType, correlationId, now);
+  } catch (error) {
+    if (!(error instanceof ConstitutionActionRateLimited)) {
+      throw error;
+    }
+
+    await recordRateLimitedAttempt(userId, correlationId, now, path, payload);
+
+    throw new PendingChangeRejected('rate_limited');
+  }
 }
 
 /** The caller's *active* constitution — the only status this module ever edits. */
@@ -201,6 +284,20 @@ async function scheduleIncrease(
   newValue: string,
   correlationId: string,
 ): Promise<RequestLimitChangeResult> {
+  const now = new Date();
+
+  // The rate-limit gate, ahead of every other check — someone hammering the "loosen this
+  // limit" control is exactly what this gate exists to catch, and it must fire before any
+  // other rejection reason has a chance to mask it.
+  await assertRateLimitForLoosening(
+    session.userId,
+    'constitution.limit_increase_requested',
+    correlationId,
+    now,
+    'increase_requested',
+    { constitutionId: constitutionRow.id, limitId, field, oldValue, newValue },
+  );
+
   await assertNoExistingPendingChange(constitutionRow.id, limitId, field);
 
   const inserted = await getDb()
@@ -219,7 +316,7 @@ async function scheduleIncrease(
 
   await recordEvent({
     eventType: 'constitution.limit_increase_requested',
-    occurredAt: new Date(),
+    occurredAt: now,
     correlationId,
     userId: session.userId,
     payload: {
@@ -310,6 +407,20 @@ export async function loadPendingChangesForCurrentUser(): Promise<ConstitutionPe
  */
 export async function cancelPendingChange(pendingChangeId: string, correlationId: string): Promise<void> {
   const session = await requireSession();
+  const now = new Date();
+
+  // Cancelling a pending increase is neutral-to-loosening in spirit — it edits commitment
+  // state the same rate-limited action-gate protects on the request side — so it shares the
+  // gate, keyed on its own event type (a different bucket from `increase_requested`).
+  await assertRateLimitForLoosening(
+    session.userId,
+    'constitution.limit_increase_cancelled',
+    correlationId,
+    now,
+    'cancel_pending',
+    { pendingChangeId },
+  );
+
   const constitutionRow = await loadActiveConstitutionForUser(session.userId);
 
   const deleted = await getDb()
@@ -330,7 +441,7 @@ export async function cancelPendingChange(pendingChangeId: string, correlationId
 
   await recordEvent({
     eventType: 'constitution.limit_increase_cancelled',
-    occurredAt: new Date(),
+    occurredAt: now,
     correlationId,
     userId: session.userId,
     payload: {

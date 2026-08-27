@@ -42,6 +42,10 @@ export const runtime = 'nodejs';
  * `PendingChangeRejectionReason` plus two reasons synthesized only here (the flag being off,
  * and an unexpected error) — this page's own rejection vocabulary is a superset of the
  * module's, so it stays a plain string-keyed map rather than `Record<PendingChangeRejectionReason, …>`.
+ *
+ * `rate_limited`'s wording is deliberately non-punitive ("friction, not punishment" —
+ * CLAUDE.md → *What we're building*): it reads as pacing, not as a penalty for wanting to
+ * loosen a limit, and it never appears at all on the decrease path, which is never throttled.
  */
 const REJECTION_MESSAGES: Partial<Record<string, string>> = {
   unauthenticated: 'Your session expired — reconnect your wallet and try again.',
@@ -51,6 +55,7 @@ const REJECTION_MESSAGES: Partial<Record<string, string>> = {
   no_change: 'That is already the current limit — nothing to change.',
   pending_change_exists: 'There is already a pending increase for this limit. Cancel it before requesting another.',
   pending_change_not_found: 'That pending change is already gone — it may have applied, been voided, or been cancelled already.',
+  rate_limited: "You've requested a few loosening changes in a row — take a short pause before the next one. Tightening a limit is never affected by this.",
   authoring_disabled: 'Constitution editing is switched off right now. Nothing is wrong with your wallet.',
   unavailable: 'Something went wrong on our end — please try again.',
 } satisfies Partial<Record<PendingChangeRejectionReason | 'authoring_disabled' | 'unavailable', string>>;
@@ -59,31 +64,42 @@ function describeRejection(reason: string): string {
   return REJECTION_MESSAGES[reason] ?? 'That request could not be completed.';
 }
 
+/**
+ * Every redirect on the error path carries `correlationId` alongside `error` — CLAUDE.md
+ * requires correlation end-to-end, and this is the one seam where a rejection leaves the
+ * function that recorded it (in a log line, in an event payload) via a URL instead of a JSON
+ * response. Without it here, a user-reported failure on this page would be untraceable back
+ * to the server-side log/event that explains it, unlike every API route's `{error,
+ * correlationId}` body.
+ */
+function errorRedirectUrl(reason: string, correlationId: string): string {
+  return `/constitution/edit?error=${encodeURIComponent(reason)}&correlationId=${encodeURIComponent(correlationId)}`;
+}
+
 async function requestLimitChangeAction(formData: FormData): Promise<void> {
   'use server';
 
+  const correlationId = randomUUID();
   const limitId = formData.get('limitId');
   const newMaxUsd = formData.get('newMaxUsd');
 
   if (typeof limitId !== 'string' || typeof newMaxUsd !== 'string' || newMaxUsd.trim() === '') {
-    redirect('/constitution/edit?error=invalid_value');
+    redirect(errorRedirectUrl('invalid_value', correlationId));
   }
 
-  const correlationId = randomUUID();
-
   if (!(await isFeatureEnabled(CONSTITUTION_AUTHOR_FLAG))) {
-    redirect('/constitution/edit?error=authoring_disabled');
+    redirect(errorRedirectUrl('authoring_disabled', correlationId));
   }
 
   try {
     await requestLimitChange(limitId, newMaxUsd.trim(), correlationId);
   } catch (error) {
     if (error instanceof PendingChangeRejected) {
-      redirect(`/constitution/edit?error=${error.reason}`);
+      redirect(errorRedirectUrl(error.reason, correlationId));
     }
 
     captureError(error, { correlationId, route: 'constitution.edit.requestLimitChange' });
-    redirect('/constitution/edit?error=unavailable');
+    redirect(errorRedirectUrl('unavailable', correlationId));
   }
 
   revalidatePath('/constitution/edit');
@@ -92,27 +108,26 @@ async function requestLimitChangeAction(formData: FormData): Promise<void> {
 async function cancelPendingChangeAction(formData: FormData): Promise<void> {
   'use server';
 
+  const correlationId = randomUUID();
   const pendingChangeId = formData.get('pendingChangeId');
 
   if (typeof pendingChangeId !== 'string') {
-    redirect('/constitution/edit?error=pending_change_not_found');
+    redirect(errorRedirectUrl('pending_change_not_found', correlationId));
   }
 
-  const correlationId = randomUUID();
-
   if (!(await isFeatureEnabled(CONSTITUTION_AUTHOR_FLAG))) {
-    redirect('/constitution/edit?error=authoring_disabled');
+    redirect(errorRedirectUrl('authoring_disabled', correlationId));
   }
 
   try {
     await cancelPendingChange(pendingChangeId, correlationId);
   } catch (error) {
     if (error instanceof PendingChangeRejected) {
-      redirect(`/constitution/edit?error=${error.reason}`);
+      redirect(errorRedirectUrl(error.reason, correlationId));
     }
 
     captureError(error, { correlationId, route: 'constitution.edit.cancelPendingChange' });
-    redirect('/constitution/edit?error=unavailable');
+    redirect(errorRedirectUrl('unavailable', correlationId));
   }
 
   revalidatePath('/constitution/edit');
@@ -165,6 +180,8 @@ export default async function ConstitutionEditPage({
   ]);
   const rawErrorReason = resolvedSearchParams.error;
   const errorReason = Array.isArray(rawErrorReason) ? rawErrorReason[0] : rawErrorReason;
+  const rawErrorCorrelationId = resolvedSearchParams.correlationId;
+  const errorCorrelationId = Array.isArray(rawErrorCorrelationId) ? rawErrorCorrelationId[0] : rawErrorCorrelationId;
 
   if (!authorEnabled) {
     return (
@@ -217,7 +234,12 @@ export default async function ConstitutionEditPage({
     <main>
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Edit constitution</h1>
       <p>Decreasing a limit applies immediately. Increasing a limit takes effect 48 hours after you request it.</p>
-      {errorReason ? <p role="alert">{describeRejection(errorReason)}</p> : null}
+      {errorReason ? (
+        <p role="alert">
+          {describeRejection(errorReason)}
+          {errorCorrelationId ? ` (ref: ${errorCorrelationId})` : ''}
+        </p>
+      ) : null}
       <ul>
         {record.document.limits.map((limit) => {
           const pending = pendingByLimitId.get(limit.id);

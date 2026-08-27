@@ -9,6 +9,7 @@ Decisions that outlive this module live in `.ai/`:
 [constitution-schema](../../../../../.ai/decisions/constitution-schema.md),
 [commitment-window-server-clock](../../../../../.ai/decisions/commitment-window-server-clock.md),
 [asymmetric-constitution-edits](../../../../../.ai/decisions/asymmetric-constitution-edits.md),
+[server-actions-for-constitution-edit](../../../../../.ai/decisions/server-actions-for-constitution-edit.md),
 [guarded-state-transition](../../../../../.ai/patterns/guarded-state-transition.md).
 This file is the flow and the invariants.
 
@@ -69,14 +70,22 @@ One row per user (`constitutions_user_id_idx` is UNIQUE). `draft` is the only st
 `constitution.activation_rejected_early`. The last one is a behavioural signal, not just a
 guard failure — it is a user trying to escape their own cooling-off period.
 
-`pending-changes.ts` adds five more, all unthrottled (none of them is a caller-loopable
-guard-failure the way `activation_rejected_early` is): `constitution.limit_decreased`,
+`pending-changes.ts` adds six more: `constitution.limit_decreased`,
 `constitution.limit_increase_requested`, `constitution.limit_increase_applied`,
-`constitution.limit_increase_cancelled`, and `constitution.limit_increase_voided` — the last
-one is Phase 5's "decrease-requests as a proxy for wants-stricter-rules" signal's mirror
-image: a voided row is the audit trail for "the system caught a stale increase and refused
-it," load-bearing evidence that the timelock's safety check actually fired, not just that it
-exists in code.
+`constitution.limit_increase_cancelled`, `constitution.limit_increase_voided`, and
+`constitution.edit_rate_limited`. `limit_increase_voided` is Phase 5's "decrease-requests as a
+proxy for wants-stricter-rules" signal's mirror image: a voided row is the audit trail for
+"the system caught a stale increase and refused it," load-bearing evidence that the timelock's
+safety check actually fired, not just that it exists in code. `edit_rate_limited` is the
+Phase 8 rate-limiting follow-up's own signal — recorded once per throttled `requestLimitChange`
+(increase direction) or `cancelPendingChange` call, payload carries `path:
+'increase_requested' | 'cancel_pending'` so the two throttled surfaces share one event type
+instead of two near-duplicates.
+
+Five of those six are unthrottled — `limit_decreased` most deliberately: decreases are the one
+action this whole module refuses to ever throttle (see the rate-limiting section below).
+`edit_rate_limited` is the exception, and it throttles *itself* the same way `drafted`/
+`activation_rejected_early` throttle their own writes below.
 
 The two a session can generate in a loop (`drafted`, `activation_rejected_early`) have
 their **event write** throttled per user by `rate-limit.ts`. Read carefully:
@@ -125,6 +134,18 @@ this section is the module's own shape.
   caller's *own* active constitution (never trusts the id alone), and records
   `constitution.limit_increase_cancelled`. No `voided_at`/`cancelled_at` ambiguity here — a
   cancelled row is simply gone; the event is its only remaining trace.
+- **Rate limiting is asymmetric, same as everything else here** (full rationale in the decision
+  doc). `assertRateLimitForLoosening` gates `scheduleIncrease` and `cancelPendingChange` —
+  each keyed on its own real event type (`constitution.limit_increase_requested` /
+  `constitution.limit_increase_cancelled`) via the *reused*
+  `assertWithinConstitutionActionRateLimit` (`./rate-limit.ts`), called here as an **action
+  gate** rather than only a write guard: a throttled call is rejected as
+  `PendingChangeRejected('rate_limited')`, not merely under-logged. `applyDecreaseImmediately`
+  never calls it — decreasing is never throttled, and a limiter outage can never block it.
+  A `ConstitutionActionRateLimited` throttles the action *and* (via the self-throttled
+  `recordRateLimitedAttempt`) records `constitution.edit_rate_limited`; any other error from
+  the limiter (the database itself unreachable) is re-thrown as-is, which is this path's own
+  fail-closed: an unreachable limiter rejects the loosening it was asked to gate.
 - **`applyDuePendingChanges(correlationId)`**, gated by `CONSTITUTION_PENDING_CHANGE_APPLY_FLAG`
   (seeded by `seed.ts`, same as every other switch here), scans up to
   `PENDING_CHANGE_APPLY_BATCH_LIMIT` rows where `effective_at <= now() AND applied_at IS NULL
