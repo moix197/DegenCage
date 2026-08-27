@@ -83,24 +83,79 @@ function extractEvaluations(payload: Record<string, unknown>): LimitEvaluation[]
   return Array.isArray(payload.evaluations) ? (payload.evaluations as LimitEvaluation[]) : [];
 }
 
+/** UTC calendar day, used for cohorting and for the return-visit window below — display-only precision, not a Postgres `now()`-gated deadline like the commitment window. */
+function dayKey(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/**
+ * `rolling_loss_usd` is excluded from every violation count in this file that compares live
+ * against the baseline counterfactual: a baseline trade can never be loss-limit-eligible
+ * (`lot-matching.ts` requires both legs of a close to be after activation, which by
+ * definition no baseline trade is), so that limit type can only ever read `allow` on the
+ * baseline side while live's can genuinely violate — counting it would understate baseline
+ * and flatter the product. See `.ai/decisions/baseline-counterfactual-metric.md`. Not used
+ * by `getRulesKeptStats`, which is live-only and has no such asymmetry to correct for.
+ */
+function isComparableViolation(evaluation: LimitEvaluation): boolean {
+  return evaluation.verdict === 'violation' && evaluation.type !== 'rolling_loss_usd';
+}
+
 // ---------------------------------------------------------------------------
-// Onboarding completion: auth.session_created -> constitution.activated
+// Onboarding completion: auth.session_created -> constitution.activated, by day cohort
 // ---------------------------------------------------------------------------
 
-export interface OnboardingCompletionStats {
+export interface OnboardingCohortStats {
   sessionUserCount: number;
   activatedUserCount: number;
   rate: number;
 }
 
+export interface OnboardingCompletionStats {
+  sessionUserCount: number;
+  activatedUserCount: number;
+  rate: number;
+  /** Keyed by the UTC day of each user's *first* `auth.session_created` — did that day's cohort eventually activate, regardless of which day. */
+  byDayCohort: Record<string, OnboardingCohortStats>;
+}
+
 export function computeOnboardingCompletionStats(rows: EventRow[]): OnboardingCompletionStats {
-  const sessionUsers = distinctUserIds(rows.filter((row) => row.eventType === EVENT_SESSION_CREATED));
   const activatedUsers = distinctUserIds(rows.filter((row) => row.eventType === EVENT_CONSTITUTION_ACTIVATED));
+  const firstSessionAtByUser = new Map<string, Date>();
+
+  for (const row of rows) {
+    if (row.eventType !== EVENT_SESSION_CREATED || !row.userId) continue;
+
+    const existing = firstSessionAtByUser.get(row.userId);
+    if (!existing || row.occurredAt.getTime() < existing.getTime()) {
+      firstSessionAtByUser.set(row.userId, row.occurredAt);
+    }
+  }
+
+  const cohortUserIds = new Map<string, { sessionUserIds: Set<string>; activatedUserIds: Set<string> }>();
+
+  for (const [userId, firstSessionAt] of firstSessionAtByUser) {
+    const day = dayKey(firstSessionAt);
+    const bucket = cohortUserIds.get(day) ?? { sessionUserIds: new Set(), activatedUserIds: new Set() };
+    bucket.sessionUserIds.add(userId);
+    if (activatedUsers.has(userId)) bucket.activatedUserIds.add(userId);
+    cohortUserIds.set(day, bucket);
+  }
+
+  const byDayCohort: Record<string, OnboardingCohortStats> = {};
+  for (const [day, bucket] of cohortUserIds) {
+    byDayCohort[day] = {
+      sessionUserCount: bucket.sessionUserIds.size,
+      activatedUserCount: bucket.activatedUserIds.size,
+      rate: safeRate(bucket.activatedUserIds.size, bucket.sessionUserIds.size),
+    };
+  }
 
   return {
-    sessionUserCount: sessionUsers.size,
+    sessionUserCount: firstSessionAtByUser.size,
     activatedUserCount: activatedUsers.size,
-    rate: safeRate(activatedUsers.size, sessionUsers.size),
+    rate: safeRate(activatedUsers.size, firstSessionAtByUser.size),
+    byDayCohort,
   };
 }
 
@@ -197,10 +252,6 @@ export interface ReturnVisitStats {
   week2ReturnRate: number;
 }
 
-function dayKey(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
 /** Every day-8..14 window boundary in this file is `activatedAt + N days`, in UTC calendar days derived from `dayKey` — display-only precision, not a Postgres `now()`-gated deadline like the commitment window. */
 export function computeReturnVisitStats(rows: EventRow[], now: Date): ReturnVisitStats {
   const viewedDaysByUser = new Map<string, Set<string>>();
@@ -267,24 +318,61 @@ export async function getReturnVisitStats(now: Date = new Date(), executor: Data
 // this event type is never written for a baseline trade (`reconcile-wallet.ts`).
 // ---------------------------------------------------------------------------
 
-export interface RulesKeptStats {
-  totalEvaluations: number;
+export interface RulesKeptUserStats {
+  totalDecidedEvaluations: number;
   allowedCount: number;
   rulesKeptRate: number;
 }
 
+export interface RulesKeptStats {
+  /** `allow` + `violation` only — `unevaluable` is excluded from the denominator (it's neither kept nor broken, just undecided; e.g. `rolling_loss_usd` with the loss-limit pipeline off). */
+  totalDecidedEvaluations: number;
+  allowedCount: number;
+  unevaluableCount: number;
+  rulesKeptRate: number;
+  byUser: Record<string, RulesKeptUserStats>;
+}
+
 export function computeRulesKeptStats(rows: EventRow[]): RulesKeptStats {
-  let totalEvaluations = 0;
+  let totalDecidedEvaluations = 0;
   let allowedCount = 0;
+  let unevaluableCount = 0;
+  const byUserCounts = new Map<string, { totalDecidedEvaluations: number; allowedCount: number }>();
 
   for (const row of rows) {
+    const userBucket = row.userId ? (byUserCounts.get(row.userId) ?? { totalDecidedEvaluations: 0, allowedCount: 0 }) : null;
+
     for (const evaluation of extractEvaluations(row.payload)) {
-      totalEvaluations += 1;
-      if (evaluation.verdict === 'allow') allowedCount += 1;
+      if (evaluation.verdict === 'unevaluable') {
+        unevaluableCount += 1;
+        continue;
+      }
+
+      totalDecidedEvaluations += 1;
+      const allowed = evaluation.verdict === 'allow';
+      if (allowed) allowedCount += 1;
+
+      if (userBucket) {
+        userBucket.totalDecidedEvaluations += 1;
+        if (allowed) userBucket.allowedCount += 1;
+      }
     }
+
+    if (row.userId && userBucket) byUserCounts.set(row.userId, userBucket);
   }
 
-  return { totalEvaluations, allowedCount, rulesKeptRate: safeRate(allowedCount, totalEvaluations) };
+  const byUser: Record<string, RulesKeptUserStats> = {};
+  for (const [userId, counts] of byUserCounts) {
+    byUser[userId] = { ...counts, rulesKeptRate: safeRate(counts.allowedCount, counts.totalDecidedEvaluations) };
+  }
+
+  return {
+    totalDecidedEvaluations,
+    allowedCount,
+    unevaluableCount,
+    rulesKeptRate: safeRate(allowedCount, totalDecidedEvaluations),
+    byUser,
+  };
 }
 
 export async function getRulesKeptStats(executor: DatabaseExecutor = getDb()): Promise<RulesKeptStats> {
@@ -335,7 +423,11 @@ async function loadBaselineTrades(walletId: string, executor: DatabaseExecutor =
  *
  * `lossLimitEnabled: true` on every trade regardless of the flag's historical state when the
  * baseline was originally reconciled — this counterfactual asks "would this constitution's
- * limits have caught this activity", not "was the loss-limit pipeline on at backfill time".
+ * limits have caught this activity", not "was the loss-limit pipeline on at backfill time". A
+ * trade's `rolling_loss_usd` evaluation is then excluded from the violation check via
+ * `isComparableViolation` — see that function's comment for why (a baseline trade's
+ * `realizedLossUsd` is always `null`, so this limit type can only ever read `allow` here,
+ * which would flatter the product if compared against live's real loss-limit verdicts).
  */
 export function computeBaselineCounterfactualViolationCount(constitution: Constitution, baselineTrades: BaselineTradeRow[]): number {
   const sorted = [...baselineTrades].sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
@@ -347,7 +439,7 @@ export function computeBaselineCounterfactualViolationCount(constitution: Consti
     const priorTrades = evaluable.slice(0, index);
     const decision = evaluateTrade(constitution, priorTrades, evaluable[index]!);
 
-    if (decision.evaluations.some((evaluation) => evaluation.verdict === 'violation')) {
+    if (decision.evaluations.some(isComparableViolation)) {
       violationCount += 1;
     }
   }
@@ -355,15 +447,20 @@ export function computeBaselineCounterfactualViolationCount(constitution: Consti
   return violationCount;
 }
 
-function weeksBetween(rows: { occurredAt: Date }[]): number {
-  if (rows.length < 2) return 0;
+/**
+ * The 90-day pre-activation backfill (decision 9) — a fixed collection window, not something
+ * measured from where a user's trades happened to fall. Previously this denominator was the
+ * span between a user's *first and last* baseline trade, which understated the window for
+ * anyone whose baseline activity was clustered (inflating their counterfactual rate) and
+ * collapsed to `0` for a user with 0 or 1 baseline trades — neither is comparable to live's
+ * denominator (calendar weeks since activation, unaffected by how trades cluster). Using the
+ * same fixed 90 days for every user makes both sides genuinely comparable.
+ */
+const BASELINE_WINDOW_DAYS = 90;
+const BASELINE_WINDOW_WEEKS = BASELINE_WINDOW_DAYS / 7;
 
-  const sorted = [...rows].sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
-  const first = sorted[0]!.occurredAt.getTime();
-  const last = sorted[sorted.length - 1]!.occurredAt.getTime();
-
-  return (last - first) / WEEK_MS;
-}
+/** A floor under `liveWeeksElapsed` so a just-activated user's rate is never computed against a literal `0` — `safeRate`'s zero-denominator guard would otherwise silently report `0/week` even if a violation happened in the very first hour, which reads as "clean" rather than "not enough time has passed". One hour is short enough to never meaningfully distort an established user's rate. */
+const MIN_WEEKS_ELAPSED = 1 / (24 * 7);
 
 interface LiveViolationEventRow {
   occurredAt: Date;
@@ -377,11 +474,12 @@ async function loadLiveViolationEventsForUser(userId: string, executor: Database
     .where(and(eq(events.userId, userId), eq(events.eventType, EVENT_RULE_DECISION_RECORDED)));
 }
 
+/** Mirrors `computeBaselineCounterfactualViolationCount`'s `isComparableViolation` filter — see that comment for why `rolling_loss_usd` is excluded on both sides of this comparison. */
 function countViolationEvents(rows: LiveViolationEventRow[]): number {
   let count = 0;
 
   for (const row of rows) {
-    if (extractEvaluations(row.payload).some((evaluation) => evaluation.verdict === 'violation')) {
+    if (extractEvaluations(row.payload).some(isComparableViolation)) {
       count += 1;
     }
   }
@@ -395,7 +493,8 @@ export interface ExternalViolationFrequencyComparison {
   liveWeeksElapsed: number;
   liveViolationsPerWeek: number;
   baselineViolationCount: number;
-  baselineWeeksSpan: number;
+  /** Always `BASELINE_WINDOW_WEEKS` (90 days) — the fixed collection window, not measured from trade timestamps. See the constant's comment. */
+  baselineWindowWeeks: number;
   baselineViolationsPerWeek: number;
 }
 
@@ -417,9 +516,8 @@ export async function getExternalViolationFrequencyComparison(
   ]);
 
   const liveViolationCount = countViolationEvents(liveRows);
-  const liveWeeksElapsed = Math.max(0, (now.getTime() - activatedAt.getTime()) / WEEK_MS);
+  const liveWeeksElapsed = Math.max(MIN_WEEKS_ELAPSED, (now.getTime() - activatedAt.getTime()) / WEEK_MS);
   const baselineViolationCount = computeBaselineCounterfactualViolationCount(constitution, baselineTrades);
-  const baselineWeeksSpan = weeksBetween(baselineTrades);
 
   return {
     userId,
@@ -427,8 +525,8 @@ export async function getExternalViolationFrequencyComparison(
     liveWeeksElapsed,
     liveViolationsPerWeek: safeRate(liveViolationCount, liveWeeksElapsed),
     baselineViolationCount,
-    baselineWeeksSpan,
-    baselineViolationsPerWeek: safeRate(baselineViolationCount, baselineWeeksSpan),
+    baselineWindowWeeks: BASELINE_WINDOW_WEEKS,
+    baselineViolationsPerWeek: safeRate(baselineViolationCount, BASELINE_WINDOW_WEEKS),
   };
 }
 

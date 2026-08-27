@@ -1,16 +1,36 @@
+import { cookies } from 'next/headers';
+import { notFound } from 'next/navigation';
+
+import { ADMIN_SESSION_COOKIE_NAME, verifyAdminSessionCookie } from '@/server/admin/access';
 import { buildMetricsSnapshot, type MetricsSnapshot } from '@/server/metrics/queries';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 /**
- * Internal-only, unlinked page (decision 11 — no RBAC in Phase 0). Renders the same
- * `buildMetricsSnapshot()` the header-gated `GET /api/admin/metrics` answers with, called
- * directly server-side rather than over HTTP — a page navigation cannot attach the
- * shared-secret header a browser fetch could, so the API route (not this page) is what
- * enforces that gate for any programmatic caller. See `.ai/decisions/admin-metrics-secret-gate.md`.
+ * Internal-only: real per-user data (violation rates, the private baseline counterfactual,
+ * verbatim feedback quotes), so this page is gated exactly like `GET /api/admin/metrics` —
+ * same secret, different transport. A page navigation can't attach a custom header the way a
+ * `fetch`/`curl` call to the API route can, so instead of the header this checks the signed,
+ * httpOnly cookie `api/admin/login/route.ts` sets after verifying the secret
+ * (`server/admin/access.ts`'s `verifyAdminSessionCookie` — the same cryptographic primitives
+ * the route uses, not a second implementation). No cookie, an expired one, or a tampered one
+ * all `notFound()` — the data fetch below never runs. See
+ * `.ai/decisions/admin-metrics-secret-gate.md`.
  */
+async function requireAdminSession(): Promise<void> {
+  const expected = process.env.ADMIN_METRICS_SECRET;
+  const cookieStore = await cookies();
+  const cookieValue = cookieStore.get(ADMIN_SESSION_COOKIE_NAME)?.value;
+
+  if (!expected || !cookieValue || !verifyAdminSessionCookie(cookieValue, expected)) {
+    notFound();
+  }
+}
+
 export default async function AdminMetricsPage() {
+  await requireAdminSession();
+
   const snapshot = await buildMetricsSnapshot(new Date());
 
   return (
@@ -62,12 +82,38 @@ function Stat({ label, value }: { label: string; value: string }) {
 
 function OnboardingSection({ snapshot }: { snapshot: MetricsSnapshot }) {
   const { onboarding } = snapshot;
+  const cohortDays = Object.keys(onboarding.byDayCohort).sort();
 
   return (
-    <Section title="Onboarding completion">
+    <Section title="Onboarding completion" note="Grouped by the UTC day of each user's first session.">
       <Stat label="Sessions" value={formatNumber(onboarding.sessionUserCount)} />
       <Stat label="Activated" value={formatNumber(onboarding.activatedUserCount)} />
       <Stat label="Completion rate" value={formatPercent(onboarding.rate)} />
+      {cohortDays.length > 0 ? (
+        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Cohort day</th>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Sessions</th>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Activated</th>
+              <th style={{ textAlign: 'left' }}>Rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {cohortDays.map((day) => {
+              const cohort = onboarding.byDayCohort[day]!;
+              return (
+                <tr key={day}>
+                  <td style={{ paddingRight: '1rem' }}>{day}</td>
+                  <td style={{ paddingRight: '1rem' }}>{formatNumber(cohort.sessionUserCount)}</td>
+                  <td style={{ paddingRight: '1rem' }}>{formatNumber(cohort.activatedUserCount)}</td>
+                  <td>{formatPercent(cohort.rate)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      ) : null}
     </Section>
   );
 }
@@ -113,12 +159,39 @@ function ReturnVisitsSection({ snapshot }: { snapshot: MetricsSnapshot }) {
 
 function RulesKeptSection({ snapshot }: { snapshot: MetricsSnapshot }) {
   const { rulesKept } = snapshot;
+  const userIds = Object.keys(rulesKept.byUser).sort();
 
   return (
-    <Section title="Rules kept %">
-      <Stat label="Evaluations" value={formatNumber(rulesKept.totalEvaluations)} />
+    <Section title="Rules kept %" note="Denominator excludes `unevaluable` evaluations — those are undecided, not kept or broken.">
+      <Stat label="Decided evaluations" value={formatNumber(rulesKept.totalDecidedEvaluations)} />
       <Stat label="Allowed" value={formatNumber(rulesKept.allowedCount)} />
+      <Stat label="Unevaluable (excluded)" value={formatNumber(rulesKept.unevaluableCount)} />
       <Stat label="Rules kept rate" value={formatPercent(rulesKept.rulesKeptRate)} />
+      {userIds.length > 0 ? (
+        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>User</th>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Decided evaluations</th>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Allowed</th>
+              <th style={{ textAlign: 'left' }}>Rate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {userIds.map((userId) => {
+              const user = rulesKept.byUser[userId]!;
+              return (
+                <tr key={userId}>
+                  <td style={{ paddingRight: '1rem' }}>{userId}</td>
+                  <td style={{ paddingRight: '1rem' }}>{formatNumber(user.totalDecidedEvaluations)}</td>
+                  <td style={{ paddingRight: '1rem' }}>{formatNumber(user.allowedCount)}</td>
+                  <td>{formatPercent(user.rulesKeptRate)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      ) : null}
     </Section>
   );
 }
@@ -127,7 +200,7 @@ function ExternalViolationsSection({ snapshot }: { snapshot: MetricsSnapshot }) 
   return (
     <Section
       title="External violation frequency: live vs. baseline counterfactual"
-      note="Baseline figures are an internal-only comparison — the 90-day pre-activation record is never shown to the user it belongs to."
+      note="Baseline figures are an internal-only comparison — the 90-day pre-activation record is never shown to the user it belongs to. rolling_loss_usd is excluded from both sides (a baseline trade can never be loss-limit-eligible, so counting it would flatter the product)."
     >
       {snapshot.externalViolations.length === 0 ? (
         <p>No active constitutions yet.</p>

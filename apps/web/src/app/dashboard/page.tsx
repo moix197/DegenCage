@@ -7,10 +7,12 @@ import { applyDuePendingChanges } from '@/server/constitution/pending-changes';
 import { getDb } from '@/server/db/client';
 import { trades, type TokenClassificationQuality } from '@/server/db/schema';
 import { buildDashboardState, loadReconciliationState } from '@/server/dashboard/dashboard-state';
+import { FEEDBACK_CAPTURE_FLAG } from '@/server/feedback/feedback';
 import { DASHBOARD_DISCIPLINE_VIEW_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
 import { captureError } from '@/observability/error-tracking';
 import { recordEvent } from '@/observability/events';
 import { DashboardPanel } from './dashboard-panel';
+import { FeedbackPrompt } from './feedback-prompt';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -88,11 +90,12 @@ function formatUsd(usdValue: string | null): string {
  * `daily_notional_usd` limit all render an explicit state — never a false "$0 spent today".
  */
 export default async function DashboardPage() {
-  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled] = await Promise.all([
+  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled, feedbackCaptureEnabled] = await Promise.all([
     resolveSession(),
     isFeatureEnabled(DASHBOARD_DISCIPLINE_VIEW_FLAG),
     isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG),
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
+    isFeatureEnabled(FEEDBACK_CAPTURE_FLAG),
   ]);
 
   if (!dashboardEnabled || !reconcileEnabled) {
@@ -166,6 +169,10 @@ export default async function DashboardPage() {
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
 
       <DashboardPanel initial={initial} />
+
+      {/* Ships dark by default (`FEEDBACK_CAPTURE_FLAG` not seeded enabled) — surfaced at
+          the "after a violation is shown" moment the plan calls out, not on every visit. */}
+      {feedbackCaptureEnabled && initial.violations.length > 0 ? <FeedbackPrompt /> : null}
 
       <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Recent activity</h2>
       {tradesList.length === 0 ? (

@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
 
-import { captureError } from '../../../observability/error-tracking';
-import { isFeatureEnabled } from '../../../server/flags/feature-flags';
+import { captureError } from '@/observability/error-tracking';
+import { isFeatureEnabled } from '@/server/flags/feature-flags';
 import {
   FEEDBACK_CAPTURE_FLAG,
   FeedbackRejected,
   httpStatusForFeedbackRejection,
   recordFeedback,
   recordFeedbackPrompt,
-} from '../../../server/feedback/feedback';
+} from '@/server/feedback/feedback';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';

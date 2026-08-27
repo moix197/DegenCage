@@ -24,6 +24,7 @@ import {
  */
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1_000;
+const BASELINE_WINDOW_WEEKS = 90 / 7;
 
 const { selectMock } = vi.hoisted(() => ({ selectMock: vi.fn() }));
 
@@ -48,18 +49,24 @@ function daysAfter(base: Date, days: number): Date {
 }
 
 describe('getOnboardingCompletionStats', () => {
-  it('divides distinct activated users by distinct session users', async () => {
+  it('divides distinct activated users by distinct session users, and groups by first-session day cohort', async () => {
     selectReturnsOnce([
-      { userId: 'u1', eventType: 'auth.session_created', occurredAt: new Date(), payload: {} },
-      { userId: 'u2', eventType: 'auth.session_created', occurredAt: new Date(), payload: {} },
-      { userId: 'u3', eventType: 'auth.session_created', occurredAt: new Date(), payload: {} },
-      { userId: 'u1', eventType: 'constitution.activated', occurredAt: new Date(), payload: {} },
-      { userId: 'u2', eventType: 'constitution.activated', occurredAt: new Date(), payload: {} },
+      { userId: 'u1', eventType: 'auth.session_created', occurredAt: new Date('2026-01-01T10:00:00.000Z'), payload: {} },
+      { userId: 'u2', eventType: 'auth.session_created', occurredAt: new Date('2026-01-01T11:00:00.000Z'), payload: {} },
+      { userId: 'u3', eventType: 'auth.session_created', occurredAt: new Date('2026-01-02T09:00:00.000Z'), payload: {} },
+      { userId: 'u1', eventType: 'constitution.activated', occurredAt: new Date('2026-01-01T12:00:00.000Z'), payload: {} },
+      { userId: 'u2', eventType: 'constitution.activated', occurredAt: new Date('2026-01-05T00:00:00.000Z'), payload: {} },
     ]);
 
     const result = await getOnboardingCompletionStats();
 
-    expect(result).toEqual({ sessionUserCount: 3, activatedUserCount: 2, rate: 2 / 3 });
+    expect(result.sessionUserCount).toBe(3);
+    expect(result.activatedUserCount).toBe(2);
+    expect(result.rate).toBe(2 / 3);
+    expect(result.byDayCohort).toEqual({
+      '2026-01-01': { sessionUserCount: 2, activatedUserCount: 2, rate: 1 },
+      '2026-01-02': { sessionUserCount: 1, activatedUserCount: 0, rate: 0 },
+    });
   });
 
   it('is zero, not NaN, with no sessions at all', async () => {
@@ -67,7 +74,7 @@ describe('getOnboardingCompletionStats', () => {
 
     const result = await getOnboardingCompletionStats();
 
-    expect(result).toEqual({ sessionUserCount: 0, activatedUserCount: 0, rate: 0 });
+    expect(result).toEqual({ sessionUserCount: 0, activatedUserCount: 0, rate: 0, byDayCohort: {} });
   });
 });
 
@@ -145,13 +152,14 @@ describe('getReturnVisitStats', () => {
 });
 
 describe('getRulesKeptStats', () => {
-  it('divides allowed evaluations by every evaluation recorded', async () => {
+  it('divides allowed by decided (allow+violation) evaluations, excluding unevaluable, and groups by user', async () => {
     selectReturnsOnce([
       {
         userId: 'u1',
         eventType: 'rule.decision_recorded',
         occurredAt: new Date(),
-        payload: { evaluations: [{ verdict: 'allow' }, { verdict: 'violation' }] },
+        // unevaluable must not count toward either the numerator or the denominator.
+        payload: { evaluations: [{ verdict: 'allow' }, { verdict: 'violation' }, { verdict: 'unevaluable' }] },
       },
       {
         userId: 'u2',
@@ -163,20 +171,31 @@ describe('getRulesKeptStats', () => {
 
     const result = await getRulesKeptStats();
 
-    expect(result).toEqual({ totalEvaluations: 3, allowedCount: 2, rulesKeptRate: 2 / 3 });
+    expect(result).toEqual({
+      totalDecidedEvaluations: 3,
+      allowedCount: 2,
+      unevaluableCount: 1,
+      rulesKeptRate: 2 / 3,
+      byUser: {
+        u1: { totalDecidedEvaluations: 2, allowedCount: 1, rulesKeptRate: 0.5 },
+        u2: { totalDecidedEvaluations: 1, allowedCount: 1, rulesKeptRate: 1 },
+      },
+    });
   });
 });
 
 describe('getExternalViolationFrequencyComparison', () => {
-  it('compares the live post-activation rate against the ad hoc baseline counterfactual', async () => {
+  it('compares the live post-activation rate against the ad hoc baseline counterfactual, using the fixed 90-day window as the baseline denominator', async () => {
     const activatedAt = new Date('2026-01-01T00:00:00.000Z');
     const now = new Date(activatedAt.getTime() + 3 * WEEK_MS);
 
     const liveRows = [
-      { occurredAt: new Date('2026-01-05T00:00:00.000Z'), payload: { evaluations: [{ verdict: 'violation' }] } },
-      { occurredAt: new Date('2026-01-10T00:00:00.000Z'), payload: { evaluations: [{ verdict: 'allow' }] } },
+      { occurredAt: new Date('2026-01-05T00:00:00.000Z'), payload: { evaluations: [{ verdict: 'violation', type: 'daily_notional_usd' }] } },
+      { occurredAt: new Date('2026-01-10T00:00:00.000Z'), payload: { evaluations: [{ verdict: 'allow', type: 'daily_notional_usd' }] } },
     ];
 
+    // Only 1 hour apart — under the old "measured span" denominator this would have produced
+    // a tiny, wildly inflated baseline rate; under the fixed 90-day window it doesn't matter.
     const baselineTradeOne = { occurredAt: new Date('2025-10-01T00:00:00.000Z'), usdValue: '100', isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null };
     const baselineTradeTwo = { occurredAt: new Date('2025-10-01T01:00:00.000Z'), usdValue: '500', isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null };
 
@@ -196,20 +215,64 @@ describe('getExternalViolationFrequencyComparison', () => {
     );
 
     const expectedLiveWeeksElapsed = (now.getTime() - activatedAt.getTime()) / WEEK_MS;
-    const expectedBaselineWeeksSpan = (baselineTradeTwo.occurredAt.getTime() - baselineTradeOne.occurredAt.getTime()) / WEEK_MS;
 
     expect(result.liveViolationCount).toBe(1); // only the first decision event carries a violation
     expect(result.liveWeeksElapsed).toBeCloseTo(expectedLiveWeeksElapsed, 10);
     expect(result.liveViolationsPerWeek).toBeCloseTo(1 / expectedLiveWeeksElapsed, 10);
     // second baseline trade: $100 prior + $500 = $600 > $400 maxUsd -> one counterfactual violation
     expect(result.baselineViolationCount).toBe(1);
-    expect(result.baselineWeeksSpan).toBeCloseTo(expectedBaselineWeeksSpan, 10);
-    expect(result.baselineViolationsPerWeek).toBeCloseTo(1 / expectedBaselineWeeksSpan, 10);
+    expect(result.baselineWindowWeeks).toBeCloseTo(BASELINE_WINDOW_WEEKS, 10);
+    expect(result.baselineViolationsPerWeek).toBeCloseTo(1 / BASELINE_WINDOW_WEEKS, 10);
+  });
+
+  it('floors liveWeeksElapsed for a just-activated user instead of reporting a vacuous 0/week', async () => {
+    const activatedAt = new Date('2026-01-01T00:00:00.000Z');
+
+    const liveRows = [{ occurredAt: activatedAt, payload: { evaluations: [{ verdict: 'violation', type: 'daily_notional_usd' }] } }];
+
+    selectReturnsOnce(liveRows);
+    selectReturnsOrderedOnce([]);
+
+    const constitution: Constitution = { schemaVersion: 1, limits: [] };
+
+    const result = await getExternalViolationFrequencyComparison(
+      { userId: 'user-1', walletId: 'wallet-1', constitution, activatedAt },
+      activatedAt, // now === activatedAt: zero elapsed time
+    );
+
+    expect(result.liveWeeksElapsed).toBeGreaterThan(0);
+    expect(result.liveViolationsPerWeek).toBeGreaterThan(0); // not silently zeroed by a 0-denominator guard
+  });
+
+  it('excludes rolling_loss_usd from both sides, so a baseline trade that can never be loss-eligible does not flatter the comparison', async () => {
+    const activatedAt = new Date('2026-01-01T00:00:00.000Z');
+    const now = new Date(activatedAt.getTime() + WEEK_MS);
+
+    // Live: the only evaluation is a rolling_loss_usd violation — must not count.
+    const liveRows = [{ occurredAt: new Date('2026-01-02T00:00:00.000Z'), payload: { evaluations: [{ verdict: 'violation', type: 'rolling_loss_usd' }] } }];
+
+    // Baseline: `realizedLossUsd` is always null (never loss-eligible pre-activation), so
+    // `rolling_loss_usd` reads `allow` here regardless — the exclusion is what makes both
+    // sides symmetric, not what changes this particular baseline's own count.
+    const baselineTrade = { occurredAt: new Date('2025-10-01T00:00:00.000Z'), usdValue: '10', isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null };
+
+    selectReturnsOnce(liveRows);
+    selectReturnsOrderedOnce([baselineTrade]);
+
+    const constitution: Constitution = {
+      schemaVersion: 1,
+      limits: [{ id: 'limit-1', type: 'rolling_loss_usd', maxUsd: '50', windowHours: 168 }],
+    };
+
+    const result = await getExternalViolationFrequencyComparison({ userId: 'user-1', walletId: 'wallet-1', constitution, activatedAt }, now);
+
+    expect(result.liveViolationCount).toBe(0);
+    expect(result.baselineViolationCount).toBe(0);
   });
 });
 
 describe('computeBaselineCounterfactualViolationCount', () => {
-  it('re-runs evaluateTrade ad hoc over baseline trades only, honoring each limit\'s own window', async () => {
+  it("re-runs evaluateTrade ad hoc over baseline trades only, honoring each limit's own window", async () => {
     const constitution: Constitution = {
       schemaVersion: 1,
       limits: [{ id: 'limit-1', type: 'daily_notional_usd', maxUsd: '100', windowHours: 1 }],
@@ -224,6 +287,19 @@ describe('computeBaselineCounterfactualViolationCount', () => {
     ]);
 
     expect(violationCount).toBe(1);
+  });
+
+  it('never counts a rolling_loss_usd evaluation as a violation, since a baseline trade can never be loss-eligible', () => {
+    const constitution: Constitution = {
+      schemaVersion: 1,
+      limits: [{ id: 'limit-1', type: 'rolling_loss_usd', maxUsd: '1', windowHours: 168 }],
+    };
+
+    const violationCount = computeBaselineCounterfactualViolationCount(constitution, [
+      { occurredAt: new Date('2025-10-01T00:00:00.000Z'), usdValue: '1000', isAcquisition: true, acquiredTier: null, isRoundTripClose: true, realizedLossUsd: null },
+    ]);
+
+    expect(violationCount).toBe(0);
   });
 });
 
