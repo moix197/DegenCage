@@ -418,6 +418,46 @@ export type PositionLotRow = typeof positionLots.$inferSelect;
 export type NewPositionLotRow = typeof positionLots.$inferInsert;
 
 /**
+ * Phase 8's timelocked-loosening mechanism (decision 12): a decrease writes straight into
+ * `constitutions.document`; an increase parks here for 48h instead, so an emotional
+ * in-the-moment edit cannot take effect faster than the friction the whole product exists to
+ * add. `limit_id` is the stable `LimitId` (`@degencage/rules`) inside
+ * `constitutions.document.limits[].id` — never a row index, which an unrelated edit to the
+ * same document could reorder or invalidate.
+ *
+ * `applied_at` null means still pending; non-null means already folded into `document` by
+ * `applyDuePendingChanges()` (`server/constitution/pending-changes.ts`). There is
+ * deliberately no `cancelled_at` column: cancelling deletes the row outright — the one-time
+ * `constitution.limit_increase_cancelled` event is the durable record that it happened, and
+ * `applyDuePendingChanges`'s `applied_at IS NULL` scan needs a *gone* row to never reconsider,
+ * not a soft-deleted one it has to keep filtering out forever.
+ */
+export const constitutionPendingChanges = pgTable(
+  'constitution_pending_changes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    constitutionId: uuid('constitution_id')
+      .notNull()
+      .references(() => constitutions.id),
+    limitId: text('limit_id').notNull(),
+    field: text('field').notNull(),
+    oldValue: text('old_value').notNull(),
+    newValue: text('new_value').notNull(),
+    effectiveAt: timestamp('effective_at', { withTimezone: true }).notNull(),
+    appliedAt: timestamp('applied_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // `applyDuePendingChanges`'s predicate: every not-yet-applied row whose time has come.
+    index('constitution_pending_changes_effective_at_idx').on(table.effectiveAt, table.appliedAt),
+    // The edit page's predicate: one constitution's in-flight pending changes.
+    index('constitution_pending_changes_constitution_id_idx').on(table.constitutionId, table.appliedAt),
+  ],
+);
+
+export type ConstitutionPendingChangeRow = typeof constitutionPendingChanges.$inferSelect;
+
+/**
  * Shared 1-minute USD OHLCV cache for majors (SOL, stablecoins), from
  * `server/pricing/binance-klines.ts`. Keyed by `(mint, minuteBucketUtc)` — one row serves
  * every user's trade priced in that minute, so the cache is populated once regardless of
