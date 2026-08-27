@@ -545,11 +545,11 @@ By this point all three limit types exist and are individually verified (Phases 
 
 **Steps:**
 
-- [ ] Rename/promote the Phase 4–6 status page into `dashboard/page.tsx`; no server logic changes, just the new route and polling behavior
-- [ ] Implement `violations-feed.ts`, reusing existing event data — no new event types needed
-- [ ] Implement the live-updating client polling (or a short-interval recompute) against the server-authoritative allowance figures — never a client-only countdown
-- [ ] Record `dashboard.viewed` event (also serves Phase 9's return-visit metric)
-- [ ] Copy review pass: confirm no blocking/punitive language anywhere on this screen
+- [x] Rename/promote the Phase 4–6 status page into `dashboard/page.tsx`; no server logic changes, just the new route and polling behavior
+- [x] Implement `violations-feed.ts`, reusing existing event data — no new event types needed
+- [x] Implement the live-updating client polling (or a short-interval recompute) against the server-authoritative allowance figures — never a client-only countdown
+- [x] Record `dashboard.viewed` event (also serves Phase 9's return-visit metric)
+- [x] Copy review pass: confirm no blocking/punitive language anywhere on this screen
 
 **Tests:**
 
@@ -561,22 +561,34 @@ No additional automated tests for the page component's polling behavior itself �
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] Manual: confirm the remaining-allowance figures visibly change as old trades age out of the rolling window without any new activity, without a manual reload; confirm baseline trades never appear in the feed; confirm copy review
+- [x] `pnpm test` passes
+- [x] Manual: confirm the remaining-allowance figures visibly change as old trades age out of the rolling window without any new activity, without a manual reload; confirm baseline trades never appear in the feed; confirm copy review
 - [~] Manual (**consolidated on-chain pass — moved out of Phase 0 to roadmap Phase 1**): this phase was originally where Phases 5 and 6 would run their deferred real-swap verifications. It no longer is. The dashboard makes rule outcomes observable, but a swap still has to be initiated outside the product, so the pass is deferred to roadmap Phase 1 (Jupiter terminal) where the full loop is local. What runs there: Phase 5 — a small swap into a low-cap token is flagged against a tight `MICRO_CAP` limit with correct reasoning, selling out of an over-limit tier is never itself flagged, and flipping `classification.jupiter_mcap` off degrades to `MICRO_CAP`/`unknown` rather than erroring; Phase 6 — a real round-trip realizes the expected FIFO loss and trips the rolling loss limit. That pass is also the first live exercise of the Jupiter Tokens v2 and Birdeye response shapes; treat an unexpected payload as a finding, not a test-setup problem.
 
+
+**As-built notes (deltas from the plan above):**
+
+- **Tailwind + shadcn/ui adopted here.** `apps/web` had no CSS framework — every page used inline `style={{}}`. Orchestrator approved adopting shadcn/ui as a *separate preceding commit* (`7312d95`) rather than folding it into the feature commit. Rationale recorded in `.ai/decisions/ui-framework.md`. Existing inline-style pages (`constitution-panel.tsx`, `app/page.tsx`) were deliberately **not** migrated.
+- **Extra files beyond the planned three:**
+  - `apps/web/src/app/dashboard/dashboard-panel.tsx` — client polling component; a Server Component can't hold polling hooks. Mirrors the existing `constitution-panel.tsx` split.
+  - `apps/web/src/server/dashboard/dashboard-state.ts` — added in review fix `8f7dab2`; `buildDashboardState` is the single source shared by the SSR page and the poll route, so the two can't drift.
+  - `apps/web/src/server/flags/feature-flags.ts`, `apps/web/src/server/db/seed.ts` — register + seed `dashboard.discipline_view`.
+  - `packages/rules` — `subtractUsd` moved beside `addUsd` rather than reimplemented locally.
+- **Commits:** `7312d95` (shadcn adoption) → `60c23d6` (feature) → `8f7dab2` (review findings) → `37ceddf` (unhandled-rejection fix + drop unused `skeleton.tsx`).
+- **Accepted follow-ups (not done here):** `VIOLATIONS_FEED_LIMIT` caps raw events rather than violations, so a run of clean trades can hide older violations; the loss disclaimer copy is duplicated between `dashboard-panel.tsx` and `constitution-panel.tsx`; `loadRecentTrades` + row formatting still inline in `dashboard/page.tsx`.
+- **Manual verification** was done against a scratchpad fixture that backdates trades to ~3 min inside the 24h edge; all three allowances were observed recovering live without a reload, and the `is_baseline=true` trade stayed out of the feed and out of every total.
 **Phase review:**
 
-- [ ] All Steps and Verification checkboxes above ticked in the plan file
-- [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
-- [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
-- [ ] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: live-updating discipline dashboard and violation feed`
-- [ ] Phase marked complete
+- [x] All Steps and Verification checkboxes above ticked in the plan file
+- [~] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn — **N/A: replaced by `/execute-prd`'s in-loop `code-reviewer` subagent dispatch**
+- [~] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session — **N/A: same reason; review ran in an isolated subagent context**
+- [x] Code-reviewer agent has verified this phase
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Tests for this phase written and passing
+- [x] Documentation updated
+- [x] Orchestrator (user) has verified and approved this phase
+- [x] Changes committed: `feat: live-updating discipline dashboard and violation feed`
+- [x] Phase marked complete
 
 ---
 
