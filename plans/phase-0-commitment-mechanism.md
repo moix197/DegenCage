@@ -605,16 +605,22 @@ No additional automated tests for the page component's polling behavior itself â
 |---|---|---|
 | modify | `apps/web/src/server/db/schema.ts` | `constitution_pending_changes` table: `id`, `constitution_id`, `limit_id`, `field`, `old_value`, `new_value`, `effective_at`, `applied_at` nullable, `created_at` |
 | create | `apps/web/src/server/constitution/pending-changes.ts` | `requestLimitChange()`: decreases apply immediately + `recordEvent('constitution.limit_decreased', ...)`; increases insert a pending row with `effective_at = now() + 48h` + `recordEvent('constitution.limit_increase_requested', ...)`; `applyDuePendingChanges()`: applied lazily on next reconciliation/app-open pass (no cron/worker in Phase 0, consistent with the app-open reconciliation pattern), applies any row where `effective_at <= now() AND applied_at IS NULL`, records `constitution.limit_increase_applied` |
-| modify | `apps/web/src/app/api/wallet/reconcile/route.ts` | calls `applyDuePendingChanges()` alongside chain reconciliation on app open |
+| modify | `apps/web/src/app/dashboard/page.tsx` | **(corrected)** calls `applyDuePendingChanges()` on app open â€” this is the real reconciliation entry point; `/api/wallet/reconcile` has no caller |
+| modify | `apps/web/src/app/constitution/edit/page.tsx` | also calls `applyDuePendingChanges()` before loading the document, so a due increase renders as applied |
+| modify | `apps/web/src/app/api/wallet/reconcile/route.ts` | calls `applyDuePendingChanges()` too; kept and documented as currently uncalled |
 | create | `apps/web/src/app/constitution/edit/page.tsx` | edit UI showing pending increases with their exact effective timestamp |
+
+| modify | `apps/web/src/server/db/seed.ts` | seeds `CONSTITUTION_PENDING_CHANGE_APPLY_FLAG` enabled (unseeded = permanently off = due changes never apply) |
+| create | `.ai/decisions/asymmetric-constitution-edits.md` | records why decrease is instant, increase is timelocked, lazy app-open apply over a scheduler, and the stale-value voiding rule |
+| modify | `.ai/index.md`, `apps/web/src/server/constitution/README.md` | index + module docs for the new surface |
 
 **Steps:**
 
-- [ ] Migration: `constitution_pending_changes`
-- [ ] Implement decrease-is-immediate path: mutate `constitutions.document`, bump nothing else, record event
-- [ ] Implement increase-is-delayed path: insert pending row referencing the limit's stable `id` (from Phase 3's schema design), record event; do not mutate `constitutions.document` yet
-- [ ] Implement `applyDuePendingChanges()`, called on app open (piggybacking on the existing reconciliation entry point rather than introducing a scheduler)
-- [ ] Edit UI shows current limits, in-flight pending increases with countdown-to-effective, and allows cancelling a pending increase before it applies (`constitution.limit_increase_cancelled` event)
+- [x] Migration: `constitution_pending_changes`
+- [x] Implement decrease-is-immediate path: mutate `constitutions.document`, bump nothing else, record event
+- [x] Implement increase-is-delayed path: insert pending row referencing the limit's stable `id` (from Phase 3's schema design), record event; do not mutate `constitutions.document` yet
+- [x] Implement `applyDuePendingChanges()`, called on app open (piggybacking on the existing reconciliation entry point rather than introducing a scheduler)
+- [x] Edit UI shows current limits, in-flight pending increases with countdown-to-effective, and allows cancelling a pending increase before it applies (`constitution.limit_increase_cancelled` event)
 
 **Tests:**
 
@@ -622,9 +628,15 @@ No additional automated tests for the page component's polling behavior itself â
 |---|---|---|
 | create | `apps/web/src/server/constitution/pending-changes.test.ts` | decrease applies immediately and is reflected in `constitutions.document`; increase does not apply before `effective_at` even if `applyDuePendingChanges` is called repeatedly; increase applies once `effective_at` has passed; a cancelled pending change never applies |
 
+**Post-review additions** (from the code-reviewer pass, reflected back here):
+- `constitution_pending_changes` gained a `voided_at` column: a pending increase whose `old_value` no longer matches the limit's current value is **voided, not applied** (emitting `constitution.limit_increase_voided`). Without this, requesting 100â†’500 then decreasing to 10 would silently jump to 500 48h later â€” a hole in the commitment mechanism.
+- Value comparison uses `compareUsd()`, not string equality, so `500` vs `500.00` cannot void a legitimate increase.
+- Dedicated kill switch `CONSTITUTION_PENDING_CHANGE_APPLY_FLAG`; off means pending changes **stay pending** (fails in the strict direction).
+- Due scan is ordered by `effective_at` ascending and capped at 50 rows; stranded rows (flag off, or backlog beyond the cap) emit a structured warning rather than silently returning zero.
+
 **Verification:**
 
-- [ ] `pnpm test` passes
+- [x] `pnpm test` passes
 - [ ] Manual: request a limit decrease, confirm immediate effect; request a limit increase, confirm it's pending and not yet in effect; simulate passing 48h (test harness clock or a shortened test-only threshold) and confirm it applies on next app open
 
 **Phase review:**
@@ -632,12 +644,12 @@ No additional automated tests for the page component's polling behavior itself â
 - [ ] All Steps and Verification checkboxes above ticked in the plan file
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
-- [ ] Documentation updated
+- [x] Code-reviewer agent has verified this phase
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Tests for this phase written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: asymmetric constitution edits â€” instant decrease, 48h delayed increase`
+- [x] Changes committed: `feat: asymmetric constitution edits â€” instant decrease, 48h delayed increase`
 - [ ] Phase marked complete
 
 ---
