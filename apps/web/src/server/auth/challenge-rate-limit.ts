@@ -49,13 +49,27 @@ function firstForwardedHop(request: Request, header: string): string | undefined
 }
 
 /**
+ * The one header this trust boundary actually relies on, named explicitly rather than left
+ * as a string literal buried in `readForwardedAddress` below: Vercel sets it itself and
+ * documents that a proxy layered in front of Vercel cannot rewrite it the way plain
+ * `x-forwarded-for` can (see that function's own comment). `x-forwarded-for`/`x-real-ip` are
+ * same-shape fallbacks for non-Vercel hosting, kept for that day, but on the platform this
+ * project actually deploys to today (Vercel — `.ai/decisions/hosting-and-growth-path.md`)
+ * this is the only one of the three whose value is not attacker-controlled. See
+ * `.ai/decisions/rate-limit-forwarded-header-trust.md` — MUST be re-audited before any
+ * non-Vercel deploy, and that doc now also covers `server/admin/login-rate-limit.ts`, which
+ * reuses this same function.
+ */
+const TRUSTED_PLATFORM_HEADER = 'x-vercel-forwarded-for';
+
+/**
  * The caller's address, as the platform in front of us reports it.
  *
  * **Deployment trust assumption: this process runs behind a proxy that sets these headers
  * itself.** Nothing below is verified — a header is only as trustworthy as whoever last
  * wrote it, and a caller that reaches this process directly writes all three.
  *
- * `x-vercel-forwarded-for` is preferred where it exists because it is the narrowest of the
+ * `TRUSTED_PLATFORM_HEADER` is preferred where it exists because it is the narrowest of the
  * three: Vercel sets it, and it survives a proxy layered in front of Vercel, which Vercel
  * documents may rewrite plain `x-forwarded-for`. XFF is the fallback for every other
  * platform, and `x-real-ip` for proxies that only set that.
@@ -67,7 +81,7 @@ function firstForwardedHop(request: Request, header: string): string | undefined
  */
 function readForwardedAddress(request: Request): string | undefined {
   return (
-    firstForwardedHop(request, 'x-vercel-forwarded-for') ||
+    firstForwardedHop(request, TRUSTED_PLATFORM_HEADER) ||
     firstForwardedHop(request, 'x-forwarded-for') ||
     request.headers.get('x-real-ip')?.trim() ||
     undefined

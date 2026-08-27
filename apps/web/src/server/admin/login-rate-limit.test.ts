@@ -1,20 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  ADMIN_LOGIN_RATE_LIMIT_MAX,
-  ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS,
-  AdminLoginRateLimited,
-  assertWithinAdminLoginRateLimit,
-  recordAdminLoginAttempt,
-  recordRateLimitedLoginEventOnce,
-} from './login-rate-limit';
+import { ADMIN_LOGIN_RATE_LIMIT_MAX, ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS, attemptAdminLogin, recordRateLimitedLoginEventOnce } from './login-rate-limit';
 
 /**
  * The throttle that closes the online-guessing oracle a security audit flagged on
- * `POST /api/admin/login`: repeated *failed* attempts from one client key must eventually be
- * rejected outright (`AdminLoginRateLimited`), before the route ever compares the caller's
- * guess against the real secret again.
+ * `POST /api/admin/login`, and the follow-up audit's TOCTOU fix: `attemptAdminLogin` runs
+ * the count check, the secret comparison, and the attempt insert inside one transaction, so
+ * concurrent callers can no longer all observe "under the limit" before any of their inserts
+ * land.
  */
+
+const { reapExpiredAdminLoginAttemptsMock } = vi.hoisted(() => ({ reapExpiredAdminLoginAttemptsMock: vi.fn() }));
+vi.mock('./login-attempt-reaper', () => ({ reapExpiredAdminLoginAttempts: reapExpiredAdminLoginAttemptsMock }));
 
 const { recordEventMock } = vi.hoisted(() => ({ recordEventMock: vi.fn() }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
@@ -22,70 +19,168 @@ vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
 const NOW = new Date('2026-08-26T12:00:00Z');
 const CLIENT_KEY = 'client-key-hash';
 
-const selectMock = vi.fn();
-const insertMock = vi.fn();
-
-/** Mimics drizzle's `select().from().where()` chain, which resolves without a `.limit()` — same shape as `challenge-rate-limit.test.ts`'s `countReturning`. */
-function countReturns(failed: number) {
-  selectMock.mockReturnValueOnce({ from: () => ({ where: () => Promise.resolve([{ failed }]) }) });
+interface FakeAttemptRow {
+  clientKey: string;
+  succeeded: boolean;
+  attemptedAt: Date;
 }
 
-function existenceReturns(rows: { payload: Record<string, unknown> }[]) {
-  selectMock.mockReturnValueOnce({ from: () => ({ where: () => Promise.resolve(rows) }) });
-}
+/**
+ * A minimal in-memory stand-in for `Database`, whose `.transaction()` genuinely serializes
+ * callback invocations one at a time (an async queue) — modeling the property
+ * `pg_advisory_xact_lock` guarantees in real Postgres. This is what makes the concurrency
+ * test below meaningful: it proves `attemptAdminLogin`'s own logic holds the budget to
+ * exactly `ADMIN_LOGIN_RATE_LIMIT_MAX` *given* a serializing transaction primitive. It does
+ * not, and cannot, prove Postgres's own lock semantics — that is out of scope for a
+ * hermetic unit test (`.ai/decisions/migration-and-test-tooling.md`: no test opens a real
+ * database connection).
+ */
+function createFakeDb() {
+  const rows: FakeAttemptRow[] = [];
+  let queue: Promise<unknown> = Promise.resolve();
 
-function insertReturns() {
-  const valuesSpy = vi.fn();
-  insertMock.mockReturnValueOnce({ values: (v: unknown) => { valuesSpy(v); return Promise.resolve(undefined); } });
-  return valuesSpy;
-}
+  const tx = {
+    execute: async () => undefined,
+    select: () => ({
+      from: () => ({
+        where: () => {
+          const since = new Date(NOW.getTime() - ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS);
+          const failed = rows.filter((row) => row.clientKey === CLIENT_KEY && !row.succeeded && row.attemptedAt > since).length;
 
-function executor() {
-  return { select: selectMock, insert: insertMock } as never;
+          return Promise.resolve([{ failed }]);
+        },
+      }),
+    }),
+    insert: () => ({
+      values: (value: FakeAttemptRow) => {
+        rows.push(value);
+
+        return Promise.resolve(undefined);
+      },
+    }),
+  };
+
+  return {
+    rows,
+    transaction: (callback: (transactionClient: typeof tx) => Promise<unknown>) => {
+      // Chains onto the shared queue so concurrent `transaction()` calls run their
+      // callbacks strictly one at a time, never interleaved — the property a real
+      // `pg_advisory_xact_lock` provides.
+      const run = queue.then(() => callback(tx));
+      queue = run.catch(() => undefined);
+
+      return run;
+    },
+  };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  reapExpiredAdminLoginAttemptsMock.mockResolvedValue(0);
 });
 
-describe('assertWithinAdminLoginRateLimit', () => {
-  it('resolves when this client is under the failed-attempt max', async () => {
-    countReturns(ADMIN_LOGIN_RATE_LIMIT_MAX - 1);
+describe('attemptAdminLogin', () => {
+  it('succeeds and records the attempt when under the limit and the secret is correct', async () => {
+    const db = createFakeDb();
 
-    await expect(assertWithinAdminLoginRateLimit(executor(), CLIENT_KEY, 'corr-1', NOW)).resolves.toBeUndefined();
+    const outcome = await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, () => true);
+
+    expect(outcome).toBe('succeeded');
+    expect(db.rows).toEqual([{ clientKey: CLIENT_KEY, attemptedAt: NOW, succeeded: true }]);
   });
 
-  it('throws AdminLoginRateLimited once this client has hit the max failed attempts — the oracle is closed', async () => {
-    countReturns(ADMIN_LOGIN_RATE_LIMIT_MAX);
+  it('fails and records the attempt when under the limit and the secret is wrong', async () => {
+    const db = createFakeDb();
 
-    await expect(assertWithinAdminLoginRateLimit(executor(), CLIENT_KEY, 'corr-1', NOW)).rejects.toBeInstanceOf(AdminLoginRateLimited);
+    const outcome = await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, () => false);
+
+    expect(outcome).toBe('failed');
+    expect(db.rows).toEqual([{ clientKey: CLIENT_KEY, attemptedAt: NOW, succeeded: false }]);
   });
 
-  it('throws for a count beyond the max too, not only exactly at it', async () => {
-    countReturns(ADMIN_LOGIN_RATE_LIMIT_MAX + 5);
+  it('rate-limits without ever calling verifySecret, once the failed budget is exhausted', async () => {
+    const db = createFakeDb();
+    for (let i = 0; i < ADMIN_LOGIN_RATE_LIMIT_MAX; i += 1) {
+      await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, () => false);
+    }
 
-    await expect(assertWithinAdminLoginRateLimit(executor(), CLIENT_KEY, 'corr-1', NOW)).rejects.toBeInstanceOf(AdminLoginRateLimited);
+    const verifySecret = vi.fn(() => true);
+    const outcome = await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, verifySecret);
+
+    expect(outcome).toBe('rate_limited');
+    // The whole point of closing the oracle: a throttled call never even reaches the secret
+    // comparison, and no new row is written for it.
+    expect(verifySecret).not.toHaveBeenCalled();
+    expect(db.rows).toHaveLength(ADMIN_LOGIN_RATE_LIMIT_MAX);
   });
 
-  it('propagates a database error rather than silently allowing the login through', async () => {
-    const dbError = new Error('database unreachable');
-    selectMock.mockReturnValueOnce({ from: () => ({ where: () => Promise.reject(dbError) }) });
+  it('a successful attempt does not reset or consume the failed-attempt budget', async () => {
+    const db = createFakeDb();
+    await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, () => false);
+    await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, () => true);
 
-    await expect(assertWithinAdminLoginRateLimit(executor(), CLIENT_KEY, 'corr-1', NOW)).rejects.toBe(dbError);
+    const since = new Date(NOW.getTime() - ADMIN_LOGIN_RATE_LIMIT_WINDOW_MS);
+    const failedCount = db.rows.filter((row) => !row.succeeded && row.attemptedAt > since).length;
+    expect(failedCount).toBe(1);
   });
-});
 
-describe('recordAdminLoginAttempt', () => {
-  it('inserts one row carrying the client key, outcome, and timestamp', async () => {
-    const valuesSpy = insertReturns();
+  it('reaps expired attempts opportunistically after deciding the outcome', async () => {
+    const db = createFakeDb();
 
-    await recordAdminLoginAttempt(executor(), CLIENT_KEY, false, NOW);
+    await attemptAdminLogin(db as never, CLIENT_KEY, 'corr-1', NOW, () => true);
 
-    expect(valuesSpy).toHaveBeenCalledWith({ clientKey: CLIENT_KEY, attemptedAt: NOW, succeeded: false });
+    expect(reapExpiredAdminLoginAttemptsMock).toHaveBeenCalledWith(db, 'corr-1', NOW);
+  });
+
+  /**
+   * The security-audit-requested test: fires many concurrent attempts (all with a wrong
+   * secret, so every one that gets through becomes a "failed" attempt) and asserts the
+   * 5-attempt budget holds exactly, rather than ballooning to the burst size — the TOCTOU
+   * this fix closes.
+   */
+  it('holds the budget at exactly ADMIN_LOGIN_RATE_LIMIT_MAX under a burst of concurrent attempts', async () => {
+    const db = createFakeDb();
+    const BURST_SIZE = 50;
+
+    const outcomes = await Promise.all(
+      Array.from({ length: BURST_SIZE }, () => attemptAdminLogin(db as never, CLIENT_KEY, 'corr-burst', NOW, () => false)),
+    );
+
+    const failedCount = outcomes.filter((outcome) => outcome === 'failed').length;
+    const rateLimitedCount = outcomes.filter((outcome) => outcome === 'rate_limited').length;
+
+    expect(failedCount).toBe(ADMIN_LOGIN_RATE_LIMIT_MAX);
+    expect(rateLimitedCount).toBe(BURST_SIZE - ADMIN_LOGIN_RATE_LIMIT_MAX);
+    expect(db.rows).toHaveLength(ADMIN_LOGIN_RATE_LIMIT_MAX);
+  });
+
+  it('different client keys never contend for the same budget', async () => {
+    const db = createFakeDb();
+
+    const outcomes = await Promise.all([
+      attemptAdminLogin(db as never, 'key-a', 'corr-1', NOW, () => false),
+      attemptAdminLogin(db as never, 'key-b', 'corr-1', NOW, () => false),
+    ]);
+
+    expect(outcomes).toEqual(['failed', 'failed']);
   });
 });
 
 describe('recordRateLimitedLoginEventOnce', () => {
+  const selectMock = vi.fn();
+
+  function existenceReturns(rows: unknown[]) {
+    selectMock.mockReturnValueOnce({ from: () => ({ where: () => ({ limit: () => Promise.resolve(rows) }) }) });
+  }
+
+  function executor() {
+    return { select: selectMock } as never;
+  }
+
+  beforeEach(() => {
+    selectMock.mockReset();
+  });
+
   it('records the event when none exists yet for this client key in the window', async () => {
     existenceReturns([]);
 
@@ -93,24 +188,16 @@ describe('recordRateLimitedLoginEventOnce', () => {
 
     expect(recordEventMock).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'admin.login_rate_limited', payload: { clientKey: CLIENT_KEY } }),
-      executor(),
+      expect.anything(),
     );
   });
 
-  it('skips recording when this client key already has one in the window — bounding growth under sustained hammering', async () => {
-    existenceReturns([{ payload: { clientKey: CLIENT_KEY } }]);
+  it('skips recording when a matching event already exists — the query itself is scoped to this client key, so any row found means "already recorded for this key"', async () => {
+    existenceReturns([{ id: 'evt-1' }]);
 
     await recordRateLimitedLoginEventOnce(executor(), CLIENT_KEY, 'corr-1', NOW);
 
     expect(recordEventMock).not.toHaveBeenCalled();
-  });
-
-  it("does not skip for a different client key's existing event", async () => {
-    existenceReturns([{ payload: { clientKey: 'someone-else' } }]);
-
-    await recordRateLimitedLoginEventOnce(executor(), CLIENT_KEY, 'corr-1', NOW);
-
-    expect(recordEventMock).toHaveBeenCalledTimes(1);
   });
 });
 

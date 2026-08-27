@@ -77,13 +77,12 @@ route's "wrong-secret redirect leaks nothing" reasoning as the whole story, but 
 consequence of `/admin/login` being a public 200 page: unlike `GET /api/admin/metrics`
 (obscured by the 404-not-403 gate above), the login page necessarily *advertises* that this
 endpoint exists — the only thing standing between a prober and the secret was the secret's
-own entropy, guessed at whatever rate the caller could send `POST` requests. `assertWithin
-AdminLoginRateLimited` (5 failed attempts / 15 minutes, per client key) closes that: past
-the limit, every subsequent call redirects to `/admin/login?error=rate_limited` *before the
-secret is ever read or compared* — the throttle check runs first in `route.ts`'s `POST`
-handler, ahead of `readSecretFromRequest`/`secretsMatch`, so a locked-out caller cannot
-distinguish "still guessing wrong" from "now throttled" by response shape or timing beyond
-the fixed rejection itself.
+own entropy, guessed at whatever rate the caller could send `POST` requests. `attemptAdmin
+Login` (5 failed attempts / 15 minutes, per client key) closes that: past the limit, every
+subsequent call redirects to `/admin/login?error=rate_limited` *before the secret is ever
+compared* — `verifySecret()` runs inside the same transaction as the throttle check (see
+the atomicity fix below), so a locked-out caller cannot distinguish "still guessing wrong"
+from "now throttled" by response shape or timing beyond the fixed rejection itself.
 
 This is a **sibling to `server/auth/challenge-rate-limit.ts`, not an extension of
 `server/constitution/rate-limit.ts`.** The constitution limiter is keyed by `(userId,
@@ -92,32 +91,75 @@ user yet to key on), and bending that column to accept an arbitrary hashed clien
 change what it means for `commitment.ts`/`pending-changes.ts`'s existing callers too, which
 was an explicit non-goal. Instead: `clientKeyForRequest` (`challenge-rate-limit.ts`) is
 reused as-is (already generic — hashes a forwarded client address, nothing SIWS-specific in
-its logic), and a small dedicated table, `admin_login_attempts` (migration `0015`), is the
-counting source — same shape as `siws_challenges`' own rate-limit use, for the same reason:
-an unauthenticated endpoint's throttle needs a key that isn't a user id.
+its logic; its trust boundary — see `.ai/decisions/rate-limit-forwarded-header-trust.md`,
+now updated to cover this throttle too — applies here unchanged), and a small dedicated
+table, `admin_login_attempts` (migration `0015`), is the counting source — same shape as
+`siws_challenges`' own rate-limit use, for the same reason: an unauthenticated endpoint's
+throttle needs a key that isn't a user id.
 
-**A throttled call writes no new `admin_login_attempts` row** (the assert throws before
-`recordAdminLoginAttempt` runs), which bounds that table's growth to `ADMIN_LOGIN_RATE_LIMIT
-_MAX` failed rows per client key per window — the same accepted-cost shape `siws_challenges`
-already has. The `admin.login_rate_limited` **event**, however, is self-throttled
-separately (`recordRateLimitedLoginEventOnce`, an existence check over a small bounded
-window rather than a second counting table): without it, every millisecond-spaced request
-from an already-locked-out caller would each write a new `events` row for the rest of the
-window, since the underlying attempt-count staying flat means nothing else bounds it.
-`admin.login_failed` needs no such guard — it can only be written after a call has already
-passed the throttle, so it's naturally capped at `ADMIN_LOGIN_RATE_LIMIT_MAX` per client key
-per window by the same mechanism that governs the throttle itself.
+**MEDIUM, found in the follow-up audit — the check-then-insert was itself TOCTOU, not
+atomic.** The first version of this fix had a real race: `assertWithinAdminLoginRateLimit`
+ran a `SELECT count(...)`, and the `INSERT` recording the attempt happened later in the
+route, after the secret was compared — no transaction spanned the two. A burst of N
+concurrent `POST`s could all read `failed < 5` before any of their inserts committed, so the
+*effective* budget under a burst was N, not 5 — not a break (the 32-char entropy floor
+below is what actually makes guessing infeasible), but a stated bound that isn't real is
+worse than none, since anyone reading "5/15min" would trust a number that doesn't hold.
+Fixed by collapsing the whole decision into one function, `attemptAdminLogin`: the count
+check, the `verifySecret()` call, and the `INSERT` all run inside one Postgres transaction,
+serialized per client key via `pg_advisory_xact_lock(hashtext(clientKey))` — the exact
+technique `challenge-rate-limit.ts`'s own doc comment already names as the fix for this
+class of race (that file leaves its own equivalent race open deliberately, for a
+lower-stakes resource; see the forwarded-header-trust doc's now-expanded "why the two
+throttles differ here" section). `hashtext` is a built-in Postgres function; no extension
+required. A concurrency test in `login-rate-limit.test.ts` fires many simultaneous
+`attemptAdminLogin` calls against a serializing fake transaction and asserts exactly
+`ADMIN_LOGIN_RATE_LIMIT_MAX` succeed — this proves the application logic holds the budget
+*given* a serializing transaction primitive (which `pg_advisory_xact_lock` provides in real
+Postgres); it is not a live-DB integration test, consistent with this codebase's hermetic-
+test rule (`.ai/decisions/migration-and-test-tooling.md`).
 
-**Secret entropy is enforced, not just documented.** `MIN_ADMIN_SECRET_LENGTH` (32 chars,
-`server/admin/access.ts`) makes a too-short `ADMIN_METRICS_SECRET` behave identically to an
-unset one everywhere — `getConfiguredAdminSecret()` is the one place that reads the env var,
-so this can't be checked in one gate and forgotten in another. `instrumentation.ts` also
-logs a startup warning (`warnIfAdminSecretMisconfigured`) if the secret is missing or weak —
-visible immediately, without crashing the app over a misconfigured admin-only surface (an
-admin gate failing closed is not worth taking the whole product down for). The throttle
-above and secret entropy are complementary, not substitutes: a strong secret makes online
-guessing infeasible in the time the throttle allows; the throttle bounds the *rate* even if
-the secret turns out to be weaker than intended.
+**A throttled call writes no new `admin_login_attempts` row** (the transaction returns
+`'rate_limited'` before the `INSERT` runs), which bounds that table's growth to
+`ADMIN_LOGIN_RATE_LIMIT_MAX` failed rows per client key per window. **This alone does not
+bound the table's *total* growth**, though — a distributed attacker with many distinct
+client keys (trivial over IPv6) opens a fresh small budget per key. `login-attempt-
+reaper.ts` (mirroring `challenge-reaper.ts`'s pattern exactly — opportunistic deletion on
+the write path, no scheduled job) deletes rows older than `ADMIN_LOGIN_ATTEMPT_RETENTION_MS`
+(1h, run from inside `attemptAdminLogin` after the transaction). This bounds *storage
+duration*, not the number of distinct keys an attacker can open within that hour — deferred
+as an accepted, documented cost (see "Constraints it creates" below), the same posture
+`siws_challenges` already has for the unauthenticated nonce endpoint.
+
+The `admin.login_rate_limited` **event** is self-throttled separately
+(`recordRateLimitedLoginEventOnce`): without it, every millisecond-spaced request from an
+already-locked-out caller would each write a new `events` row for the rest of the window,
+since the underlying attempt-count staying flat means nothing else bounds it. Its existence
+check is now filtered by `clientKey` **in the query itself**
+(`payload->>'clientKey' = ...`), not fetched broadly and filtered in JS across every client
+key — the first version's JS-side filter made its own "bounded set" claim true *per key*
+but false *across keys*, so a distributed attacker made every throttled request scan an
+ever-growing cross-key result set; a code review caught this. `admin.login_failed` needs no
+such guard — it can only be written after a call has already passed the throttle, so it's
+naturally capped at `ADMIN_LOGIN_RATE_LIMIT_MAX` per client key per window by the same
+mechanism that governs the throttle itself.
+
+**Secret entropy is enforced, not just documented — but only a length floor, not a real
+entropy check.** `MIN_ADMIN_SECRET_LENGTH` (32 chars, `server/admin/access.ts`) makes a
+too-short `ADMIN_METRICS_SECRET` behave identically to an unset one everywhere —
+`getConfiguredAdminSecret()` is the one place that reads the env var, so this can't be
+checked in one gate and forgotten in another. `instrumentation.ts` also logs a startup
+warning (`warnIfAdminSecretMisconfigured`) if the secret is missing or weak — visible
+immediately, without crashing the app over a misconfigured admin-only surface (an admin
+gate failing closed is not worth taking the whole product down for). **Do not read this as
+a strength guarantee: `"a".repeat(32)` passes the check and is still trivially guessable.**
+`MIN_ADMIN_SECRET_LENGTH` counts characters, not randomness — it catches "someone typed a
+short word" and nothing more; `.env.example`'s comment says so explicitly, telling the
+operator to use a real generator (`openssl rand -base64 32`), not just "32+ characters of
+anything." The throttle above and this length floor are complementary, not substitutes: a
+genuinely random secret makes online guessing infeasible in the time the throttle allows;
+the throttle bounds the *rate* even if the secret turns out weaker than the length check
+alone can catch.
 
 **LOW fixes from the same audit round:**
 
@@ -139,6 +181,15 @@ the secret turns out to be weaker than intended.
   in `api/admin/login/route.ts` and `api/admin/logout/route.ts` now uses a bare relative
   `Location` header (`relativeRedirect`) instead — a relative `Location` is resolved by the
   browser against the origin it actually connected to, which a spoofed `Host` cannot change.
+- **Logout had no CSRF protection** — a cross-site auto-submitting form pointed at
+  `/api/admin/logout` could force a re-login (impact only: it can't touch
+  `degencage_session`, the unrelated user-facing cookie). `POST /api/admin/logout` now only
+  issues a `Set-Cookie` when the *incoming* request already carries a currently-valid admin
+  session — which a cross-site `POST` can't: the cookie is `sameSite: 'lax'`, and Lax
+  cookies aren't attached to a cross-site `POST` at all, so a forged form's request arrives
+  with no cookie for the route to read, and `hasValidSession` is false before anything is
+  cleared. A same-origin check (`Origin` header, when present) sits on top as defense in
+  depth for the case `SameSite` handling is ever weakened, not as the primary gate.
 
 **Accepted, documented gap — timing:** the unauthorized path (an immediate `secretsMatch`
 compare) and the authorized path (`buildMetricsSnapshot`'s ~9 parallel queries) have a real,
@@ -162,10 +213,13 @@ way a per-character timing leak inside `secretsMatch` itself would (which is wha
   and "HMAC-sign the expiry" details get silently dropped from one of the two.
 - The moment a real role system exists, both surfaces should move to it instead of the
   secret/cookie split described here.
-- `admin_login_attempts` (migration `0015_sad_nightshade.sql`) has no reaper yet — rows
-  accumulate at a rate bounded by the throttle itself (at most `ADMIN_LOGIN_RATE_LIMIT_MAX`
-  failed rows per client key per window), same accepted-cost shape as `siws_challenges`
-  without `challenge-reaper.ts`'s cleanup. Add one if this table's growth ever actually
-  matters — deferred here as disproportionate to an admin-only, inherently low-traffic
-  surface.
+- `admin_login_attempts` (migration `0015_sad_nightshade.sql`) is reaped by
+  `login-attempt-reaper.ts` (1h retention, opportunistic on the write path — mirrors
+  `challenge-reaper.ts` exactly). That bounds *storage duration*, not the *number of
+  distinct client keys* an attacker can each open their own small budget under within that
+  hour — trivial to multiply over IPv6, where one actor controls a huge address block. This
+  is an accepted, unauthenticated-traffic cost the underlying header-trust boundary already
+  carries (`.ai/decisions/rate-limit-forwarded-header-trust.md`), not something the reaper
+  is meant to solve; revisit if this table's growth ever actually becomes operationally
+  relevant.
 - `ADMIN_METRICS_SECRET` must additionally be at least `MIN_ADMIN_SECRET_LENGTH` (32) characters — see `.env.example`'s comment and `server/admin/access.ts`. A secret shorter than that is treated as unset everywhere, including by whoever holds it.

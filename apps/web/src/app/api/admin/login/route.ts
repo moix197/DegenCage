@@ -12,12 +12,7 @@ import {
   getConfiguredAdminSecret,
   secretsMatch,
 } from '@/server/admin/access';
-import {
-  AdminLoginRateLimited,
-  assertWithinAdminLoginRateLimit,
-  recordAdminLoginAttempt,
-  recordRateLimitedLoginEventOnce,
-} from '@/server/admin/login-rate-limit';
+import { attemptAdminLogin, recordRateLimitedLoginEventOnce } from '@/server/admin/login-rate-limit';
 import { clientKeyForRequest } from '@/server/auth/challenge-rate-limit';
 import { getDb } from '@/server/db/client';
 
@@ -31,7 +26,8 @@ export const dynamic = 'force-dynamic';
  * JSON, and always redirects (303) rather than returning JSON, so it works with zero client
  * JS from `admin/login/page.tsx`.
  *
- * Rate limited per client (`server/admin/login-rate-limit.ts`), because unlike
+ * Rate limited per client (`server/admin/login-rate-limit.ts`'s `attemptAdminLogin`, which
+ * atomically checks-and-records one attempt per call), because unlike
  * `GET /api/admin/metrics` (obscured by the 404-not-403 gate), `admin/login/page.tsx` is a
  * public 200 page that necessarily advertises this endpoint's existence — the throttle, not
  * obscurity, is what makes online guessing against the secret infeasible here.
@@ -70,34 +66,35 @@ export async function POST(request: Request): Promise<Response> {
   const now = new Date();
   const db = getDb();
 
+  // Read once, up front — `verifySecret` below is a synchronous closure over these values so
+  // it can run *inside* `attemptAdminLogin`'s transaction without any further I/O.
+  const expected = getConfiguredAdminSecret();
+  const provided = await readSecretFromRequest(request);
+  const verifySecret = () => expected !== undefined && provided !== null && secretsMatch(provided, expected);
+
+  let outcome: 'rate_limited' | 'succeeded' | 'failed';
+
   try {
-    await assertWithinAdminLoginRateLimit(db, clientKey, correlationId, now);
+    outcome = await attemptAdminLogin(db, clientKey, correlationId, now, verifySecret);
   } catch (error) {
-    if (error instanceof AdminLoginRateLimited) {
-      await recordRateLimitedLoginEventOnce(db, clientKey, correlationId, now);
-
-      return relativeRedirect('/admin/login?error=rate_limited');
-    }
-
     captureError(error, { correlationId, route: 'admin.login' });
 
-    // Fail closed: cannot confirm this caller is under the limit, so the login does not proceed.
+    // Fail closed: cannot confirm this caller is under the limit (or record the attempt), so
+    // the login does not proceed.
     return relativeRedirect('/admin/login?error=1');
   }
 
-  const expected = getConfiguredAdminSecret();
-  const provided = await readSecretFromRequest(request);
-  const succeeded = expected !== undefined && provided !== null && secretsMatch(provided, expected);
+  if (outcome === 'rate_limited') {
+    try {
+      await recordRateLimitedLoginEventOnce(db, clientKey, correlationId, now);
+    } catch (error) {
+      captureError(error, { correlationId, route: 'admin.login', operation: 'recordRateLimitedLoginEventOnce' });
+    }
 
-  try {
-    // Recorded regardless of outcome — this is what makes the *next* call's throttle check
-    // accurate, and what bounds this table's growth to the throttle's own max per window.
-    await recordAdminLoginAttempt(db, clientKey, succeeded, now);
-  } catch (error) {
-    captureError(error, { correlationId, route: 'admin.login', operation: 'recordAdminLoginAttempt' });
+    return relativeRedirect('/admin/login?error=rate_limited');
   }
 
-  if (!succeeded) {
+  if (outcome === 'failed') {
     logger.warn('admin login rejected', { correlationId });
 
     try {
@@ -112,7 +109,9 @@ export async function POST(request: Request): Promise<Response> {
   try {
     const cookieStore = await cookies();
 
-    cookieStore.set(ADMIN_SESSION_COOKIE_NAME, createAdminSessionCookieValue(expected, ADMIN_SESSION_TTL_MS, now), {
+    // `outcome === 'succeeded'` is only reachable when `verifySecret()` returned true, which
+    // itself requires `expected !== undefined` — stable across this request, so this is safe.
+    cookieStore.set(ADMIN_SESSION_COOKIE_NAME, createAdminSessionCookieValue(expected!, ADMIN_SESSION_TTL_MS, now), {
       httpOnly: true,
       secure: !isPlainHttpLocalhost(request),
       sameSite: 'lax',
