@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CONSTITUTION_SCHEMA_VERSION, type Constitution } from './constitution';
-import { addUsd, compareUsd, evaluateTrade, sumTradeUsd, type EvaluableTrade } from './evaluate';
+import { addUsd, compareUsd, evaluateTrade, sumRealizedLosses, sumTradeUsd, type EvaluableTrade } from './evaluate';
 
 const NOW = new Date('2026-08-26T12:00:00Z');
 
@@ -113,19 +113,6 @@ describe('evaluateTrade — daily_notional_usd', () => {
     });
   });
 
-  it('returns unevaluable, not a silent allow, for a limit type not yet implemented', () => {
-    const constitution: Constitution = {
-      schemaVersion: CONSTITUTION_SCHEMA_VERSION,
-      limits: [{ id: 'limit-loss', type: 'rolling_loss_usd', maxUsd: '200', windowHours: 168 }],
-    };
-
-    const decision = evaluateTrade(constitution, [], trade());
-
-    expect(decision.evaluations).toEqual([
-      expect.objectContaining({ limitId: 'limit-loss', verdict: 'unevaluable', reason: 'limit_type_not_yet_implemented' }),
-    ]);
-  });
-
 });
 
 describe('evaluateTrade — asset_tier_acquisition_usd', () => {
@@ -216,6 +203,88 @@ describe('evaluateTrade — asset_tier_acquisition_usd', () => {
     );
 
     expect(decision.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'history_contains_unpriced_trade' });
+  });
+});
+
+describe('sumRealizedLosses', () => {
+  it('sums only the magnitude of negative realizedLossUsd on round-trip closes', () => {
+    expect(
+      sumRealizedLosses([
+        trade({ isRoundTripClose: true, realizedLossUsd: '-10.5' }),
+        trade({ isRoundTripClose: true, realizedLossUsd: '25' }), // a gain — never counted
+        trade({ isRoundTripClose: false, realizedLossUsd: '-999' }), // not a close — ignored regardless of value
+        trade({ isRoundTripClose: true, realizedLossUsd: null }), // decision 1's partial-coverage exclusion — not missing data
+      ]),
+    ).toBe('10.5');
+  });
+
+  it('is $0 — never null — when nothing qualifies', () => {
+    expect(sumRealizedLosses([])).toBe('0');
+    expect(sumRealizedLosses([trade({ isRoundTripClose: true, realizedLossUsd: null })])).toBe('0');
+  });
+});
+
+function rollingLossConstitution(maxUsd: string): Constitution {
+  return {
+    schemaVersion: CONSTITUTION_SCHEMA_VERSION,
+    limits: [{ id: 'limit-loss', type: 'rolling_loss_usd', maxUsd, windowHours: 168 }],
+  };
+}
+
+describe('evaluateTrade — rolling_loss_usd', () => {
+  it('flags a violation when a losing round-trip close pushes cumulative realized loss past the limit', () => {
+    const decision = evaluateTrade(
+      rollingLossConstitution('100'),
+      [trade({ isRoundTripClose: true, realizedLossUsd: '-80' })],
+      trade({ isRoundTripClose: true, realizedLossUsd: '-50' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({
+      verdict: 'violation',
+      priorUsd: '80',
+      totalUsd: '130',
+      reason: 'exceeds_rolling_loss_limit',
+    });
+  });
+
+  it('never counts a winning round-trip against the loss limit, no matter the amount', () => {
+    const decision = evaluateTrade(
+      rollingLossConstitution('10'),
+      [],
+      trade({ isRoundTripClose: true, realizedLossUsd: '999999' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '0', reason: 'within_rolling_loss_limit' });
+  });
+
+  it("a trade that isn't a round-trip close at all doesn't affect the loss sum", () => {
+    const decision = evaluateTrade(
+      rollingLossConstitution('10'),
+      [trade({ isRoundTripClose: true, realizedLossUsd: '-9' })],
+      trade({ isRoundTripClose: false, usdValue: '999999' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', priorUsd: '9', totalUsd: '9' });
+  });
+
+  it('a close excluded by decision 1\'s partial coverage (realizedLossUsd: null) never counts, even though it closed', () => {
+    const decision = evaluateTrade(
+      rollingLossConstitution('10'),
+      [],
+      trade({ isRoundTripClose: true, realizedLossUsd: null, usdValue: '999999' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '0' });
+  });
+
+  it('allows a cumulative loss that lands exactly on the limit — inclusive, not exclusive', () => {
+    const decision = evaluateTrade(
+      rollingLossConstitution('100'),
+      [trade({ isRoundTripClose: true, realizedLossUsd: '-60' })],
+      trade({ isRoundTripClose: true, realizedLossUsd: '-40' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '100' });
   });
 });
 

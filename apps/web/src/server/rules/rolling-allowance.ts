@@ -31,6 +31,13 @@ export interface WindowedTrade {
    */
   isAcquisition?: boolean;
   acquiredTier?: AssetTier | null;
+  /**
+   * Phase 6: carried through unchanged so `evaluateTrade`'s `rolling_loss_usd` case (and this
+   * module's own `sumRealizedLosses`-based reuse below) can filter to round-trip closes
+   * itself. Absent from a pre-Phase-6 read has no effect, same shape as `isAcquisition` above.
+   */
+  isRoundTripClose?: boolean;
+  realizedLossUsd?: string | null;
 }
 
 export interface RollingWindowParams {
@@ -67,6 +74,8 @@ export async function loadWindowedTrades(
       usdValue: trades.usdValue,
       isAcquisition: trades.isAcquisition,
       acquiredTier: trades.acquiredTier,
+      isRoundTripClose: trades.isRoundTripClose,
+      realizedLossUsd: trades.realizedLossUsd,
     })
     .from(trades)
     .where(

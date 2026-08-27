@@ -1,6 +1,6 @@
 import { desc, eq } from 'drizzle-orm';
 
-import { compareUsd, migrateConstitution, sumTradeUsd, type AssetTier } from '@degencage/rules';
+import { compareUsd, migrateConstitution, sumRealizedLosses, sumTradeUsd, type AssetTier } from '@degencage/rules';
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { getDb } from '@/server/db/client';
@@ -24,6 +24,8 @@ interface TradeRowView {
   excludedReason: string | null;
   acquiredTier: AssetTier | null;
   classification: TokenClassificationQuality | null;
+  isRoundTripClose: boolean;
+  realizedLossUsd: string | null;
 }
 
 async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
@@ -38,6 +40,8 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
       excludedReason: trades.excludedReason,
       acquiredTier: trades.acquiredTier,
       classification: trades.classification,
+      isRoundTripClose: trades.isRoundTripClose,
+      realizedLossUsd: trades.realizedLossUsd,
     })
     .from(trades)
     .where(eq(trades.walletId, walletId))
@@ -80,6 +84,35 @@ async function computeTierAllowance(walletId: string, limit: { tier: AssetTier; 
 function formatTierBadge(tier: AssetTier | null, classification: TokenClassificationQuality | null): string | null {
   if (tier === null) return null;
   return classification === 'unknown' ? `${tier} — counted as micro cap` : tier;
+}
+
+interface LossAllowanceView {
+  maxUsd: string;
+  totalUsd: string;
+  withinLimit: boolean;
+}
+
+/**
+ * Decision 1's partial coverage, stated plainly rather than implied as full P&L (this
+ * phase's success criteria) — shown unconditionally alongside the allowance figure, not only
+ * when a violation happens.
+ */
+const LOSS_LIMIT_COVERAGE_DISCLAIMER =
+  'Covers only round-trips — bought and later sold — where both sides happened after this constitution activated. Anything held from before, or still open, is not counted here — this is not your full P&L.';
+
+/**
+ * Mirrors `computeTierAllowance` above: `loadWindowedTrades` is reused, only the
+ * sign/magnitude sum is new — and that sum is `@degencage/rules`' `sumRealizedLosses`
+ * (`packages/rules/src/evaluate.ts`), not reimplemented here, same reuse discipline as
+ * `sumTradeUsd` elsewhere on this page. Unlike the notional/tier allowances above, this never
+ * reports "unknown": decision 1's exclusions (and an unpriced leg) are a deliberate scope
+ * boundary the disclaimer already discloses, not missing data to fail closed on.
+ */
+async function computeLossAllowance(walletId: string, limit: { maxUsd: string; windowHours: number }): Promise<LossAllowanceView> {
+  const windowed = await loadWindowedTrades({ walletId, windowHours: limit.windowHours, asOf: new Date() });
+  const totalUsd = sumRealizedLosses(windowed);
+
+  return { maxUsd: limit.maxUsd, totalUsd, withinLimit: compareUsd(totalUsd, limit.maxUsd) <= 0 };
 }
 
 async function loadReconciliationState(walletId: string): Promise<string | null> {
@@ -174,7 +207,11 @@ export default async function ConstitutionStatusPage() {
       limit.type === 'asset_tier_acquisition_usd',
   );
 
-  const [allowance, tierAllowance] = await Promise.all([
+  const lossLimit = constitution?.limits.find(
+    (limit): limit is Extract<typeof limit, { type: 'rolling_loss_usd' }> => limit.type === 'rolling_loss_usd',
+  );
+
+  const [allowance, tierAllowance, lossAllowance] = await Promise.all([
     dailyNotionalLimit
       ? computeRollingAllowance({
           walletId: session.walletId,
@@ -184,6 +221,7 @@ export default async function ConstitutionStatusPage() {
         })
       : null,
     tierLimit ? computeTierAllowance(session.walletId, tierLimit) : null,
+    lossLimit ? computeLossAllowance(session.walletId, lossLimit) : null,
   ]);
 
   return (
@@ -220,6 +258,16 @@ export default async function ConstitutionStatusPage() {
         )
       ) : null}
 
+      {lossAllowance ? (
+        <>
+          <p>
+            Realized loss this window: {formatUsd(lossAllowance.totalUsd)} of ${lossAllowance.maxUsd}
+            {!lossAllowance.withinLimit ? ' — over limit' : ''}
+          </p>
+          <p>{LOSS_LIMIT_COVERAGE_DISCLAIMER}</p>
+        </>
+      ) : null}
+
       <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Recent activity</h2>
       {tradesList.length === 0 ? (
         <p>No trade history yet.</p>
@@ -240,6 +288,12 @@ export default async function ConstitutionStatusPage() {
                       {' '}
                       [{formatTierBadge(trade.acquiredTier, trade.classification)}
                       {trade.isBaseline ? ', backfilled at today’s mcap — not a contemporaneous judgement' : ''}]
+                    </span>
+                  ) : null}
+                  {trade.isRoundTripClose ? (
+                    <span>
+                      {' '}
+                      [{trade.realizedLossUsd !== null ? `realized: ${formatUsd(trade.realizedLossUsd)}` : 'closed a position — not loss-limit-eligible (opened before activation, or a mixed close)'}]
                     </span>
                   ) : null}
                 </span>

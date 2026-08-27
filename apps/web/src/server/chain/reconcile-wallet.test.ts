@@ -75,6 +75,9 @@ function activeConstitutionRow() {
   return {
     status: 'active',
     document: { schemaVersion: 1, limits: [{ id: 'limit-1', type: 'daily_notional_usd', maxUsd: '1000000', windowHours: 24 }] },
+    // `loadActiveConstitutionInfo` (Phase 6) requires this alongside `status: 'active'` — real
+    // rows always have both together (`commitment.ts` sets them in the same UPDATE).
+    activatedAt: new Date('2026-08-01T00:00:00Z'),
   };
 }
 

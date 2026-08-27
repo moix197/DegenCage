@@ -6,15 +6,22 @@ import { ASSET_TIERS, type AssetTier } from '@degencage/rules';
 import type { SerializedConstitution } from '@/server/constitution/commitment';
 
 /**
- * The interactive half of `/constitution`: author a daily-notional limit and, since Phase 5,
- * an optional per-asset-tier acquisition limit, commit them, watch a server-driven countdown,
- * then activate.
+ * The interactive half of `/constitution`: author a daily-notional limit, an optional
+ * per-asset-tier acquisition limit (Phase 5) and, since Phase 6, an optional rolling-loss
+ * limit — commit them, watch a server-driven countdown, then activate.
  *
  * The countdown is cosmetic between polls only — `remainingMs` always comes from the last
  * `GET /api/constitution` response, never from a client-side clock counting down on its
  * own, and the "Activate" button being enabled is never itself the gate: the server
  * re-checks elapsed time from `commitment_started_at` the moment it is clicked.
  */
+
+/**
+ * Decision 1's partial-coverage boundary, stated plainly at authoring time — not only on the
+ * results page (this phase's success criteria) — so the limit is never mistaken for full P&L.
+ */
+const LOSS_LIMIT_COVERAGE_DISCLAIMER =
+  'Only counts round-trips — a token bought and later sold — where both the buy and the sell happen after you activate this constitution. A position you already held gets no credit or blame here: it is not full portfolio P&L.';
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -44,6 +51,7 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
   const [maxUsd, setMaxUsd] = useState('');
   const [tierMaxUsd, setTierMaxUsd] = useState('');
   const [tier, setTier] = useState<AssetTier>('MICRO_CAP');
+  const [lossMaxUsd, setLossMaxUsd] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   // Seeded from the stored limit's id when one already exists — Phase 8's pending-change
@@ -54,6 +62,9 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
   );
   const tierLimitIdRef = useRef<string>(
     initial?.document.limits.find((limit) => limit.type === 'asset_tier_acquisition_usd')?.id ?? crypto.randomUUID(),
+  );
+  const lossLimitIdRef = useRef<string>(
+    initial?.document.limits.find((limit) => limit.type === 'rolling_loss_usd')?.id ?? crypto.randomUUID(),
   );
 
   const refresh = useCallback(async () => {
@@ -100,6 +111,16 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
           tier,
           maxUsd: tierMaxUsd,
           windowHours: 24,
+        });
+      }
+
+      // The rolling-loss limit is optional too, same shape as the tier limit above.
+      if (lossMaxUsd.trim() !== '') {
+        limits.push({
+          id: lossLimitIdRef.current,
+          type: 'rolling_loss_usd',
+          maxUsd: lossMaxUsd,
+          windowHours: 168,
         });
       }
 
@@ -160,6 +181,9 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
       (rule): rule is Extract<typeof rule, { type: 'asset_tier_acquisition_usd' }> =>
         rule.type === 'asset_tier_acquisition_usd',
     );
+    const lossLimit = constitution.document.limits.find(
+      (rule): rule is Extract<typeof rule, { type: 'rolling_loss_usd' }> => rule.type === 'rolling_loss_usd',
+    );
 
     return (
       <section>
@@ -168,6 +192,14 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
           <p>
             {tierLimit.tier} acquisition limit: ${tierLimit.maxUsd}/{tierLimit.windowHours}h.
           </p>
+        ) : null}
+        {lossLimit ? (
+          <>
+            <p>
+              Rolling loss limit: ${lossLimit.maxUsd}/{lossLimit.windowHours}h.
+            </p>
+            <p>{LOSS_LIMIT_COVERAGE_DISCLAIMER}</p>
+          </>
         ) : null}
       </section>
     );
@@ -220,6 +252,20 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
             value={tierMaxUsd}
             onChange={(event) => setTierMaxUsd(event.target.value)}
             placeholder="100"
+          />
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Rolling loss limit (optional)</legend>
+        <p>{LOSS_LIMIT_COVERAGE_DISCLAIMER}</p>
+        <label>
+          Max realized loss per week (USD)
+          <input
+            type="text"
+            inputMode="decimal"
+            value={lossMaxUsd}
+            onChange={(event) => setLossMaxUsd(event.target.value)}
+            placeholder="200"
           />
         </label>
       </fieldset>

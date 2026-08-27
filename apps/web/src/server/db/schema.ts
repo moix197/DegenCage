@@ -306,6 +306,26 @@ export const trades = pgTable(
      * an excluded candidate, same as `acquired_tier`.
      */
     classification: text('classification').$type<TokenClassificationQuality>(),
+    /**
+     * `true` when this trade's disposal (SELL) leg drew down at least one existing
+     * `position_lots` row for `sold_mint` — a "close", regardless of whether it is
+     * loss-limit-*eligible* (that is `realized_loss_usd` below). `false` for a pure
+     * acquisition, an excluded candidate, or a disposal with no matching lot at all (e.g. the
+     * mint was never seen acquired within lot-matching's coverage — conservatively never
+     * eligible either, since `realized_loss_usd` is only ever set alongside `true` here).
+     */
+    isRoundTripClose: boolean('is_round_trip_close').notNull().default(false),
+    /**
+     * Realized P&L in USD for a round-trip close — negative is a loss, positive a gain —
+     * from `server/chain/lot-matching.ts`. `null` whenever this close is not loss-limit-
+     * eligible: any consumed lot opened before activation, this trade itself closed before
+     * activation, the disposal wasn't fully covered by known lots, or either leg was
+     * unpriced. Decision 1 treats all of these as the same "partial coverage" boundary —
+     * documented, not split/prorated — so `evaluateTrade`'s `rolling_loss_usd` case
+     * (`packages/rules/src/evaluate.ts`) simply skips a `null` row rather than failing the
+     * whole limit closed the way an unpriced `daily_notional_usd` trade does.
+     */
+    realizedLossUsd: numeric('realized_loss_usd', { precision: 38, scale: 12 }),
   },
   (table) => [
     // The rolling-window sum's predicate: one wallet's live trades in a time range.
@@ -318,6 +338,55 @@ export const trades = pgTable(
 
 export type TradeRow = typeof trades.$inferSelect;
 export type NewTradeRow = typeof trades.$inferInsert;
+
+/**
+ * One FIFO cost-basis lot, per `(wallet_id, mint)`, from
+ * `server/chain/lot-matching.ts`. Opened by the acquisition (BUY) leg of a real trade,
+ * drawn down oldest-first by later disposal (SELL) legs of the same mint — the mechanism
+ * behind `trades.is_round_trip_close`/`realized_loss_usd` below.
+ *
+ * Lot-matching runs for *every* real trade, baseline included: decision 1 scopes the loss
+ * limit to round-trips "opened and closed after activation", and the only way a later live
+ * disposal can correctly tell a baseline-era acquisition apart from a post-activation one is
+ * if the baseline acquisition was itself recorded as a lot. Skipping baseline lots would let
+ * a live disposal wrongly draw down whichever lot happens to exist (often a newer,
+ * post-activation one) instead of the economically-correct oldest lot, misclassifying an
+ * ineligible close as eligible. `opened_after_activation` is stamped once, from the trade's
+ * `occurred_at` vs. the wallet's active constitution's `activated_at` at match time
+ * (`null` activation, i.e. no active constitution yet, stamps `false` — fail-closed default,
+ * same shape as `trades.acquired_tier`'s `MICRO_CAP` fallback).
+ *
+ * `remaining_base_units` is a decimal-digit string, same convention as
+ * `trades.sold_amount_base_units`/`bought_amount_base_units` — never a float, and never
+ * SQL-filtered/ordered on directly (`lot-matching.ts`'s caller loads every lot for a mint and
+ * filters/sorts in application code, consistent with that convention). `cost_basis_usd` is
+ * the cost basis of *only* the remaining units — reduced proportionally, in exact BigInt-
+ * scaled arithmetic, as `lot-matching.ts` draws the lot down — and is `null` exactly when the
+ * opening trade itself was unpriced, in which case no later disposal that touches this lot
+ * can compute a `realized_loss_usd` either (folded into the same "not loss-limit-eligible"
+ * bucket as decision 1's pre-activation exclusion — see `trades.realized_loss_usd` below).
+ */
+export const positionLots = pgTable(
+  'position_lots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    walletId: uuid('wallet_id')
+      .notNull()
+      .references(() => wallets.id),
+    mint: text('mint').notNull(),
+    openedAt: timestamp('opened_at', { withTimezone: true }).notNull(),
+    openedAfterActivation: boolean('opened_after_activation').notNull(),
+    remainingBaseUnits: text('remaining_base_units').notNull(),
+    costBasisUsd: numeric('cost_basis_usd', { precision: 38, scale: 12 }),
+  },
+  (table) => [
+    // FIFO retrieval's predicate: one wallet's lots for one mint, oldest first.
+    index('position_lots_wallet_id_mint_opened_at_idx').on(table.walletId, table.mint, table.openedAt),
+  ],
+);
+
+export type PositionLotRow = typeof positionLots.$inferSelect;
+export type NewPositionLotRow = typeof positionLots.$inferInsert;
 
 /**
  * Shared 1-minute USD OHLCV cache for majors (SOL, stablecoins), from

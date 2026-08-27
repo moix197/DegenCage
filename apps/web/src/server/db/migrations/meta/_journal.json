@@ -71,6 +71,13 @@
       "when": 1787793013558,
       "tag": "0009_useful_living_lightning",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1787796210185,
+      "tag": "0010_hard_genesis",
+      "breakpoints": true
     }
   ]
 }

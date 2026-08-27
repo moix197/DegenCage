@@ -1,15 +1,26 @@
 import { evaluateTrade, migrateConstitution, type AssetTier, type Constitution } from '@degencage/rules';
-import { eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
 import { recordEvent, type DatabaseExecutor } from '../../observability/events';
 import { logger } from '../../observability/logger';
 import { resolveSession } from '../auth/session';
 import { getDb } from '../db/client';
-import { constitutions, trades, wallets, type NewTradeRow, type TokenClassificationQuality } from '../db/schema';
+import {
+  constitutions,
+  positionLots,
+  trades,
+  wallets,
+  type NewPositionLotRow,
+  type NewTradeRow,
+  type PositionLotRow,
+  type TokenClassificationQuality,
+} from '../db/schema';
+import { isFeatureEnabled } from '../flags/feature-flags';
 import { classifyTokens, type TokenClassification } from './classify-token';
 import { deriveSwapFromTransaction, type DerivedSwap } from './derive-swaps';
 import { getTransactionsForAddress, type HeliusTransaction } from './helius-client';
+import { matchDisposal, openLot, type DisposalMatchResult, type PositionLot } from './lot-matching';
 import { priceTrade } from '../pricing/price-trade';
 import { loadWindowedTrades } from '../rules/rolling-allowance';
 
@@ -32,6 +43,15 @@ import { loadWindowedTrades } from '../rules/rolling-allowance';
 
 /** Gates the route that triggers reconciliation (`app/api/wallet/reconcile/route.ts`) — checked there, same as every other route-level kill switch in this codebase. */
 export const CHAIN_HELIUS_RECONCILE_FLAG = 'chain.helius_reconcile';
+
+/**
+ * Independent of `CHAIN_HELIUS_RECONCILE_FLAG` and the tier/notional pipeline (Phase 5) —
+ * gates only `lot-matching.ts`'s wiring below. Off, no `position_lots` are read or written
+ * and every trade keeps `is_round_trip_close: false`/`realized_loss_usd: null`, so the
+ * highest-arithmetic-risk piece in this plan can be paused on its own if the matching logic
+ * needs fixing, without touching daily-notional or tier enforcement.
+ */
+export const LOSS_LIMIT_ENABLED_FLAG = 'rules.loss_limit_enabled';
 
 const BASELINE_WINDOW_DAYS = 90;
 /** Own DB transaction (and row lock) per this many derived swaps, so a long reconciliation never holds one lock for its whole duration and a mid-run failure only rolls back its own page. */
@@ -92,11 +112,26 @@ async function loadWalletReconciliationInfo(walletId: string): Promise<WalletRec
   return row;
 }
 
-async function loadActiveConstitution(userId: string): Promise<Constitution | null> {
+interface ActiveConstitutionInfo {
+  constitution: Constitution;
+  /** `constitutions.activated_at` for the active row — always non-null when `status === 'active'` (`commitment.ts` sets both together). */
+  activatedAt: Date;
+}
+
+/**
+ * `activatedAt` rides alongside `constitution` here rather than a second query: lot-matching
+ * needs it to tag `position_lots.opened_after_activation` (decision 1), and both come from
+ * the same row.
+ */
+async function loadActiveConstitutionInfo(userId: string): Promise<ActiveConstitutionInfo | null> {
   const rows = await getDb().select().from(constitutions).where(eq(constitutions.userId, userId)).limit(1);
   const row = rows[0];
 
-  return row && row.status === 'active' ? migrateConstitution(row.document) : null;
+  if (!row || row.status !== 'active' || !row.activatedAt) {
+    return null;
+  }
+
+  return { constitution: migrateConstitution(row.document), activatedAt: row.activatedAt };
 }
 
 function maxWindowHours(constitution: Constitution): number {
@@ -141,6 +176,7 @@ function toNewTradeRow(
     classification: TokenClassificationQuality | null;
   },
   isBaseline: boolean,
+  lotMatch: LotMatchResult | null,
 ): NewTradeRow {
   return {
     walletId,
@@ -159,7 +195,97 @@ function toNewTradeRow(
     acquiredTier: priced.acquiredTier,
     isAcquisition: priced.isAcquisition,
     classification: priced.classification,
+    isRoundTripClose: lotMatch?.disposal.isRoundTripClose ?? false,
+    realizedLossUsd: lotMatch?.disposal.realizedLossUsd ?? null,
   };
+}
+
+/** Maps a `position_lots` row to `lot-matching.ts`'s pure `PositionLot` — base units back to `BigInt`, never a float. */
+function toPositionLot(row: PositionLotRow): PositionLot {
+  return {
+    id: row.id,
+    mint: row.mint,
+    openedAt: row.openedAt,
+    openedAfterActivation: row.openedAfterActivation,
+    remainingBaseUnits: BigInt(row.remainingBaseUnits),
+    costBasisUsd: row.costBasisUsd,
+  };
+}
+
+/**
+ * This wallet's still-open lots for one mint, oldest first — the FIFO order `matchDisposal`
+ * requires. Exhausted lots (`remaining_base_units: 0`) are filtered out in application code
+ * rather than a SQL predicate, matching `remaining_base_units`'s `text` convention (see the
+ * schema comment on `position_lots`) — lot counts per mint are small in Phase 0's scope.
+ */
+async function loadOpenLots(tx: DatabaseExecutor, walletId: string, mint: string): Promise<PositionLot[]> {
+  const rows = await tx
+    .select()
+    .from(positionLots)
+    .where(and(eq(positionLots.walletId, walletId), eq(positionLots.mint, mint)))
+    .orderBy(asc(positionLots.openedAt));
+
+  return rows.map(toPositionLot).filter((lot) => lot.remainingBaseUnits > 0n);
+}
+
+interface LotMatchResult {
+  /** Whether *this* trade — both its disposal and its acquisition leg share one `occurredAt` — falls after the wallet's active constitution's `activated_at`. Decision 1 requires both halves of a round trip after activation; this is that check for the trade currently being persisted. */
+  tradeAfterActivation: boolean;
+  disposal: DisposalMatchResult;
+  newLot: Omit<PositionLot, 'id'>;
+}
+
+/**
+ * Computes (but does not yet persist) this trade's FIFO lot effects: draws down `soldMint`'s
+ * existing lots and opens a new `boughtMint` lot. Read-only against `position_lots` — the
+ * caller applies the result via `applyLotMatch` only after confirming (via the trade insert's
+ * `ON CONFLICT DO NOTHING` — the same idempotency gate every other side effect in
+ * `persistOneSwap` uses) that this trade is genuinely new, so a re-run never double-matches.
+ */
+async function computeLotMatch(
+  tx: DatabaseExecutor,
+  walletId: string,
+  swap: DerivedSwap,
+  usdValue: string | null,
+  activatedAt: Date | null,
+): Promise<LotMatchResult> {
+  const tradeAfterActivation = activatedAt !== null && swap.occurredAt.getTime() > activatedAt.getTime();
+  const openLots = await loadOpenLots(tx, walletId, swap.soldMint!);
+  const disposal = matchDisposal(openLots, BigInt(swap.soldAmountBaseUnits!), usdValue, tradeAfterActivation);
+  const newLot = openLot({
+    mint: swap.boughtMint!,
+    baseUnits: BigInt(swap.boughtAmountBaseUnits!),
+    costBasisUsd: usdValue,
+    openedAt: swap.occurredAt,
+    openedAfterActivation: tradeAfterActivation,
+  });
+
+  return { tradeAfterActivation, disposal, newLot };
+}
+
+/** Persists a computed `LotMatchResult`: updates every consumed lot's remaining balance/cost basis, then opens the new lot. Only ever called once the owning trade row is confirmed newly inserted. */
+async function applyLotMatch(tx: DatabaseExecutor, walletId: string, match: LotMatchResult): Promise<void> {
+  for (const consumption of match.disposal.consumptions) {
+    const updated = match.disposal.updatedLots.find((candidate) => candidate.id === consumption.lot.id);
+
+    if (!updated) continue;
+
+    await tx
+      .update(positionLots)
+      .set({ remainingBaseUnits: updated.remainingBaseUnits.toString(), costBasisUsd: updated.costBasisUsd })
+      .where(eq(positionLots.id, updated.id));
+  }
+
+  const newLotRow: NewPositionLotRow = {
+    walletId,
+    mint: match.newLot.mint,
+    openedAt: match.newLot.openedAt,
+    openedAfterActivation: match.newLot.openedAfterActivation,
+    remainingBaseUnits: match.newLot.remainingBaseUnits.toString(),
+    costBasisUsd: match.newLot.costBasisUsd,
+  };
+
+  await tx.insert(positionLots).values(newLotRow);
 }
 
 interface PricedSwap {
@@ -247,26 +373,41 @@ async function persistOneSwap(
   tx: DatabaseExecutor,
   walletId: string,
   constitution: Constitution | null,
+  activatedAt: Date | null,
   userId: string,
   correlationId: string,
   priced: PricedSwap,
   isBaseline: boolean,
+  lossLimitEnabled: boolean,
 ): Promise<{ tradePersisted: boolean; excludedPersisted: boolean }> {
   const { swap } = priced;
+  const isRealTrade = swap.excludedReason === null;
 
   const windowedHistory =
-    !isBaseline && constitution && swap.excludedReason === null
+    !isBaseline && constitution && isRealTrade
       ? await loadWindowedTrades({ walletId, windowHours: maxWindowHours(constitution), asOf: swap.occurredAt }, tx)
       : [];
 
+  // Runs for baseline trades too, same reasoning as classification below: a live disposal
+  // years later can only tell a baseline-era acquisition apart from a post-activation one if
+  // the baseline acquisition was itself recorded as a lot (see the `position_lots` schema
+  // comment). Read-only at this point — nothing is written to `position_lots` until the
+  // trade insert below confirms this is not an already-persisted re-run.
+  const lotMatch =
+    isRealTrade && lossLimitEnabled ? await computeLotMatch(tx, walletId, swap, priced.usdValue, activatedAt) : null;
+
   const inserted = await tx
     .insert(trades)
-    .values(toNewTradeRow(walletId, swap, priced, isBaseline))
+    .values(toNewTradeRow(walletId, swap, priced, isBaseline, lotMatch))
     .onConflictDoNothing({ target: [trades.walletId, trades.signature] })
     .returning({ id: trades.id });
 
   if (inserted.length === 0) {
     return { tradePersisted: false, excludedPersisted: false };
+  }
+
+  if (lotMatch) {
+    await applyLotMatch(tx, walletId, lotMatch);
   }
 
   // Baseline rows are a private behavioral record: no exclusion/decision event of any kind.
@@ -303,12 +444,36 @@ async function persistOneSwap(
     tx,
   );
 
+  // Same reasoning as `trade.classified` above: the audit trail (decision 17) needs the
+  // derived lot-matching decision on the record, on every real live trade, independent of
+  // whether a constitution/`rolling_loss_usd` limit exists yet to evaluate it against.
+  if (lotMatch) {
+    await recordEvent(
+      {
+        eventType: 'trade.lot_matched',
+        occurredAt: swap.occurredAt,
+        correlationId,
+        userId,
+        payload: {
+          signature: swap.signature,
+          mint: swap.boughtMint,
+          isRoundTripClose: lotMatch.disposal.isRoundTripClose,
+          realizedLossUsd: lotMatch.disposal.realizedLossUsd,
+          openedAfterActivation: lotMatch.tradeAfterActivation,
+        },
+      },
+      tx,
+    );
+  }
+
   if (constitution) {
     const decision = evaluateTrade(constitution, windowedHistory, {
       occurredAt: swap.occurredAt,
       usdValue: priced.usdValue,
       isAcquisition: priced.isAcquisition,
       acquiredTier: priced.acquiredTier,
+      isRoundTripClose: lotMatch?.disposal.isRoundTripClose ?? false,
+      realizedLossUsd: lotMatch?.disposal.realizedLossUsd ?? null,
     });
 
     await recordEvent(
@@ -341,10 +506,12 @@ interface BatchResult {
 async function persistBatch(
   walletId: string,
   constitution: Constitution | null,
+  activatedAt: Date | null,
   userId: string,
   correlationId: string,
   pricedBatch: PricedSwap[],
   isBaseline: boolean,
+  lossLimitEnabled: boolean,
   /**
    * Non-null only for the final batch of a baseline run: folds `baseline_completed_at`
    * into this batch's own cursor-advance UPDATE so the two commit or fail together. A
@@ -361,7 +528,7 @@ async function persistBatch(
     let excludedPersisted = 0;
 
     for (const priced of pricedBatch) {
-      const result = await persistOneSwap(tx, walletId, constitution, userId, correlationId, priced, isBaseline);
+      const result = await persistOneSwap(tx, walletId, constitution, activatedAt, userId, correlationId, priced, isBaseline, lossLimitEnabled);
       tradesPersisted += result.tradePersisted ? 1 : 0;
       excludedPersisted += result.excludedPersisted ? 1 : 0;
     }
@@ -426,7 +593,14 @@ async function runReconciliation(
     .map((tx) => deriveSwapFromTransaction(tx, walletAddress))
     .sort((a, b) => a.slot - b.slot || a.transactionIndex - b.transactionIndex);
 
-  const constitution = isBaseline ? null : await loadActiveConstitution(userId);
+  // `activatedAt` is safely `null` for a baseline run without a second, unconditional query:
+  // baseline is the 90-day window *before* this wallet was ever connected (decision 9), and
+  // with one wallet per user (decision 2) no constitution for this user could have been
+  // activated before that wallet existed.
+  const activeInfo = isBaseline ? null : await loadActiveConstitutionInfo(userId);
+  const constitution = activeInfo?.constitution ?? null;
+  const activatedAt = activeInfo?.activatedAt ?? null;
+  const lossLimitEnabled = await isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG);
   const batches = chunk(derivedInOrder, PERSIST_BATCH_SIZE);
   // Computed once, before persistence starts, so the final batch's in-transaction write and
   // this run's completion event agree on exactly when "done" was.
@@ -443,10 +617,12 @@ async function runReconciliation(
       const result = await persistBatch(
         walletId,
         constitution,
+        activatedAt,
         userId,
         correlationId,
         pricedBatch,
         isBaseline,
+        lossLimitEnabled,
         isBaseline && isFinalBatch ? completedAt : null,
       );
       tradesPersisted += result.tradesPersisted;

@@ -23,6 +23,22 @@ export interface EvaluableTrade {
   isAcquisition?: boolean;
   /** The market-cap tier this trade acquired, stamped at classification time. Only meaningful when `isAcquisition` is true. */
   acquiredTier?: AssetTier | null;
+  /**
+   * Whether this trade's disposal leg closed against ≥1 existing FIFO lot
+   * (`server/chain/lot-matching.ts`) — a "close", independent of loss-limit eligibility.
+   * Optional/undefined is treated as `false`, so Phase 4/5 callers that never evaluate
+   * `rolling_loss_usd` need not supply it.
+   */
+  isRoundTripClose?: boolean;
+  /**
+   * Realized P&L in USD, negative is a loss — only meaningful when `isRoundTripClose` is
+   * true. `null` whenever the close is not loss-limit-eligible (decision 1's partial
+   * coverage: a pre-activation lot, a pre-activation close, an unmatched disposal, or an
+   * unpriced leg) — a deliberate scope boundary, not missing data, so unlike an unpriced
+   * `daily_notional_usd` trade this does not fail the whole limit closed (see
+   * `evaluateRollingLoss` below).
+   */
+  realizedLossUsd?: string | null;
 }
 
 export type LimitVerdict = 'allow' | 'violation' | 'unevaluable';
@@ -216,6 +232,58 @@ function evaluateAssetTierAcquisition(
   };
 }
 
+/** `true` for a decimal string with a leading `-` and at least one non-zero digit — never confuses `"-0.00"` (which cannot occur here; see `lot-matching.ts`) with a real negative. */
+function isNegativeUsd(value: string): boolean {
+  return value.startsWith('-') && /[1-9]/.test(value);
+}
+
+/** Strips a leading `-`. Only ever called on a value already known negative (`isNegativeUsd`), so the sign is always present. */
+function absUsd(value: string): string {
+  return value.slice(1);
+}
+
+/** A round-trip close whose realized P&L is both known and a loss — the only rows `rolling_loss_usd` ever counts. */
+function isRealizedLossClose(trade: EvaluableTrade): trade is EvaluableTrade & { realizedLossUsd: string } {
+  return trade.isRoundTripClose === true && typeof trade.realizedLossUsd === 'string' && isNegativeUsd(trade.realizedLossUsd);
+}
+
+/**
+ * Sums the *magnitude* of realized losses across round-trip closes in `trades` — gains, non-
+ * closes, and `null` `realizedLossUsd` (decision 1's partial-coverage exclusions, or an
+ * unpriced leg) never contribute. Unlike `sumTradeUsd`, this never returns `null`: those
+ * exclusions are a deliberate scope boundary the UI discloses plainly (this phase's success
+ * criteria), not missing information that must fail the limit closed.
+ *
+ * Exported so `app/constitution-status/page.tsx` reuses this exact sum for the loss-
+ * allowance display rather than reimplementing the sign/magnitude filter — same reuse
+ * pattern as `sumTradeUsd` and `rolling-allowance.ts`.
+ */
+export function sumRealizedLosses(trades: EvaluableTrade[]): string {
+  return trades.filter(isRealizedLossClose).reduce((total, trade) => addUsd(total, absUsd(trade.realizedLossUsd)), '0');
+}
+
+function evaluateRollingLoss(
+  limit: LimitRule & { type: 'rolling_loss_usd' },
+  windowedHistory: EvaluableTrade[],
+  trade: EvaluableTrade,
+): LimitEvaluation {
+  const windowed = withinWindow(windowedHistory, limit.windowHours, trade.occurredAt);
+  const priorUsd = sumRealizedLosses(windowed);
+  const totalUsd = isRealizedLossClose(trade) ? addUsd(priorUsd, absUsd(trade.realizedLossUsd)) : priorUsd;
+  const verdict: LimitVerdict = compareUsd(totalUsd, limit.maxUsd) > 0 ? 'violation' : 'allow';
+
+  return {
+    limitId: limit.id,
+    type: 'rolling_loss_usd',
+    verdict,
+    maxUsd: limit.maxUsd,
+    windowHours: limit.windowHours,
+    priorUsd,
+    totalUsd,
+    reason: verdict === 'violation' ? 'exceeds_rolling_loss_limit' : 'within_rolling_loss_limit',
+  };
+}
+
 function evaluateLimit(limit: LimitRule, windowedHistory: EvaluableTrade[], trade: EvaluableTrade): LimitEvaluation {
   switch (limit.type) {
     case 'daily_notional_usd':
@@ -224,9 +292,8 @@ function evaluateLimit(limit: LimitRule, windowedHistory: EvaluableTrade[], trad
     case 'asset_tier_acquisition_usd':
       return evaluateAssetTierAcquisition(limit, windowedHistory, trade);
 
-    // Phase 6 adds its case here. Until then, fail closed rather than silently allow.
     case 'rolling_loss_usd':
-      return unevaluable(limit, 'limit_type_not_yet_implemented');
+      return evaluateRollingLoss(limit, windowedHistory, trade);
 
     default: {
       const exhaustive: never = limit;
