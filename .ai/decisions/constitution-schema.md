@@ -4,7 +4,9 @@
 `{ schemaVersion, limits: LimitRule[] }`, where `LimitRule` is a discriminated union whose
 **all three** members (`daily_notional_usd`, `asset_tier_acquisition_usd`,
 `rolling_loss_usd`) exist now, even though only the first is offered by the authoring UI
-and none is evaluated until Phase 4. It is stored whole in `constitutions.document jsonb`,
+and only the first is evaluated — `evaluateTrade` returns `unevaluable` (never a silent
+allow) for the other two until their phases land. It is stored whole in
+`constitutions.document jsonb`,
 with `schema_version` mirrored as a relational column. Each `LimitRule` carries a stable
 `id`, and `windowHours` is a plain number rather than a `24` literal.
 
@@ -49,7 +51,9 @@ limit type never does.
   not offer — Phases 5/6 add their UI with no server change.
 - `maxUsd` is a decimal **string**, and positivity is proven digit-by-digit, never through
   `parseFloat`: a long enough digit string parses to `Infinity`, which is `> 0`, so a float
-  check would pass a value it never actually read. Exact-decimal arithmetic is Phase 4+.
+  check would pass a value it never actually read. The evaluator keeps that discipline:
+  every USD sum and comparison is `BigInt` over decimal strings — see
+  [usd-pricing-source](usd-pricing-source.md).
 - Limit `id`s must be unique within a document (`duplicate_limit_id`) — Phase 8's identity
   depends on it.
 - All of this stays I/O-free, per

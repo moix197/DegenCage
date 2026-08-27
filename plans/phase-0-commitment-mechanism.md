@@ -352,7 +352,7 @@ Stored as `constitutions.document jsonb` (matches `single-source-of-truth-databa
 - [x] Code-reviewer agent has verified this phase
 - [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
-- [ ] Documentation updated
+- [x] Documentation updated
 - [x] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `feat: reconcile chain history and enforce the daily notional limit end to end`
 - [x] Phase marked complete

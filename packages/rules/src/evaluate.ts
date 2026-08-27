@@ -89,9 +89,10 @@ function unevaluable(limit: LimitRule, reason: string): LimitEvaluation {
  * is unpriced — a limit cannot be honestly compared against a total that is known to be an
  * undercount, and CLAUDE.md forbids ever showing a false "$0 spent today".
  *
- * Exported and reused as-is by `server/rules/rolling-allowance.ts`'s `sumWindowedUsd` — the
- * same "sum usd_value, null propagates" logic, needed both here (a limit's prior-window
- * total) and there (the status page's live total). One implementation, not two.
+ * Exported and imported as-is by `server/rules/rolling-allowance.ts`'s
+ * `computeRollingAllowance` — the same "sum usd_value, null propagates" logic, needed both
+ * here (a limit's prior-window total) and there (the status page's live total). One
+ * implementation, not two.
  */
 export function sumTradeUsd(trades: EvaluableTrade[]): string | null {
   let total = '0';

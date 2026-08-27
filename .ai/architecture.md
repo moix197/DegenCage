@@ -19,6 +19,11 @@ apps/web        Next.js App Router — UI + route handlers (Vercel), output: 'st
                              source of caller identity
   src/server/constitution/   draft -> commit -> activate lifecycle; the commitment window is
                              measured by Postgres' clock, not this process'
+  src/server/chain/          Helius pull -> swap derivation -> reconcileWallet(); the only
+                             writer of `trades`, triggered in-request on app open
+  src/server/pricing/        a swap's USD value + the shared token_prices minute cache
+  src/server/rules/          the I/O half of evaluation: windowed trade queries that feed
+                             packages/rules' pure evaluateTrade()
   src/client/wallet/         browser-only wallet code — the extension never reaches the
                              server tree, and identity is still rendered from the session
 packages/rules  the rule engine: pure, I/O-free, the product IP — and the constitution
@@ -26,7 +31,9 @@ packages/rules  the rule engine: pure, I/O-free, the product IP — and the cons
 
 later, only when the need is real:
 packages/db     schema + queries — only once a second consumer needs them
-apps/worker     Phase 4 wallet indexer (worker container, not a VPS)
+apps/worker     a scheduled sweep of every wallet, logged in or not (worker container, not
+                a VPS). The indexer itself already exists at src/server/chain — what a
+                worker adds is *when* it runs, not what it does
 ```
 
 `packages/db` was deliberately **not** introduced. `apps/web` is still the only consumer
@@ -58,6 +65,27 @@ wallet → apps/web (UI) → route handler → packages/rules → decision
                               ▼
                   allow → Jupiter → Solana (user signs)
 ```
+
+That pre-trade path is target shape. The flow that is **built** runs the other direction —
+observation, not interception, which is what the roadmap's "we saw that" accountability is:
+
+```
+Solana → Helius → src/server/chain (derive swap from net balance deltas)
+                        │
+                        ▼
+                  src/server/pricing (price the known leg)
+                        │
+                        ▼
+   src/server/rules (windowed history) → packages/rules evaluateTrade → Decision
+                        │                                                  │
+                        ▼                                                  ▼
+              Postgres `trades`                              rule.decision_recorded
+        (idempotent, row-locked, cursor-advanced)              (allows and violations)
+```
+
+Both directions end in the same place: `packages/rules` decides, Postgres records, an event
+carries the inputs. The reconciliation direction is triggered in-request on app open, so it
+runs inside the Vercel handler — there is no second process yet.
 
 Rules are evaluated server-side with server-authored timestamps, never in the client —
 see [decisions/server-side-rule-evaluation](decisions/server-side-rule-evaluation.md).
