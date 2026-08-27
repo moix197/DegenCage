@@ -1,6 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
-import { logger } from '../../observability/logger';
+import { getConfiguredAdminSecret } from './secret-config';
 
 /**
  * Shared admin-secret primitives — the one constant-time comparison and the one signed,
@@ -8,58 +8,19 @@ import { logger } from '../../observability/logger';
  * `api/admin/metrics/route.ts` (header-bearer, for programmatic/curl callers),
  * `api/admin/login/route.ts` (issues the cookie), and `admin/metrics/page.tsx` (verifies
  * it). One implementation, never copied — see `.ai/decisions/admin-metrics-secret-gate.md`.
+ *
+ * `getConfiguredAdminSecret` (and the length floor / startup warning it's paired with) lives
+ * in `./secret-config` instead, which has no `node:crypto` import — that keeps it importable
+ * from `src/instrumentation.ts`'s edge bundle. Re-exported here so every existing caller of
+ * `./access` keeps working unchanged.
  */
+
+export { getConfiguredAdminSecret, MIN_ADMIN_SECRET_LENGTH, warnIfAdminSecretMisconfigured } from './secret-config';
 
 export const ADMIN_SECRET_HEADER = 'x-admin-metrics-secret';
 export const ADMIN_SESSION_COOKIE_NAME = 'degencage_admin_session';
 /** How long a browser login lasts before the cookie stops verifying, regardless of activity — not sliding, no server-side revocation list to check (there is no session store; the signature itself is the only state). */
 export const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1_000;
-
-/**
- * Below this length, `ADMIN_METRICS_SECRET` is treated as **not configured at all** — the
- * gate refuses everyone, including whoever holds the weak value, rather than accept a
- * guessable one. 32 characters is a floor, not a target: generate with `openssl rand -base64
- * 32` (or equivalent), never a memorized phrase — see `.env.example`.
- */
-export const MIN_ADMIN_SECRET_LENGTH = 32;
-
-/**
- * The one place that reads `ADMIN_METRICS_SECRET` from the environment. Every gate calls
- * this rather than `process.env.ADMIN_METRICS_SECRET` directly, so a too-short value is
- * treated identically to an unset one everywhere at once — never valid in one check and
- * silently accepted in another.
- */
-export function getConfiguredAdminSecret(): string | undefined {
-  const secret = process.env.ADMIN_METRICS_SECRET;
-
-  if (!secret || secret.length < MIN_ADMIN_SECRET_LENGTH) {
-    return undefined;
-  }
-
-  return secret;
-}
-
-/**
- * Logged once at process startup (`instrumentation.ts`) — a weak/missing secret does not
- * crash the app (an admin-only surface failing closed is not worth taking the whole product
- * down for), but it must be visible in logs immediately, not discovered later while
- * debugging why `/api/admin/metrics` 404s for everyone including the real secret.
- */
-export function warnIfAdminSecretMisconfigured(): void {
-  const raw = process.env.ADMIN_METRICS_SECRET;
-
-  if (!raw) {
-    logger.warn('ADMIN_METRICS_SECRET is not set — the admin gate refuses every caller until it is');
-    return;
-  }
-
-  if (raw.length < MIN_ADMIN_SECRET_LENGTH) {
-    logger.warn('ADMIN_METRICS_SECRET is shorter than the minimum length — the admin gate refuses every caller, including the real value, until a stronger secret is set', {
-      length: raw.length,
-      minimumLength: MIN_ADMIN_SECRET_LENGTH,
-    });
-  }
-}
 
 /**
  * `timingSafeEqual` throws on a length mismatch rather than returning `false` — hashing both
