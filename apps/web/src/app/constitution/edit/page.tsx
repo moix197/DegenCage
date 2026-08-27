@@ -64,6 +64,19 @@ function describeRejection(reason: string): string {
   return REJECTION_MESSAGES[reason] ?? 'That request could not be completed.';
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Every `correlationId` this page ever generates is `randomUUID()`'s output, so a value that
+ * doesn't match that shape did not come from this page's own redirect — it is unvalidated
+ * query-string input. React already escapes it before render (no injection risk), but
+ * rendering an attacker-shaped string back as if it were a real trace id would be misleading
+ * on its own: a malformed "ref" is worse than none, since it looks traceable and isn't.
+ */
+function sanitizeCorrelationId(value: string | undefined): string | undefined {
+  return value !== undefined && UUID_PATTERN.test(value) ? value : undefined;
+}
+
 /**
  * Every redirect on the error path carries `correlationId` alongside `error` — CLAUDE.md
  * requires correlation end-to-end, and this is the one seam where a rejection leaves the
@@ -181,7 +194,9 @@ export default async function ConstitutionEditPage({
   const rawErrorReason = resolvedSearchParams.error;
   const errorReason = Array.isArray(rawErrorReason) ? rawErrorReason[0] : rawErrorReason;
   const rawErrorCorrelationId = resolvedSearchParams.correlationId;
-  const errorCorrelationId = Array.isArray(rawErrorCorrelationId) ? rawErrorCorrelationId[0] : rawErrorCorrelationId;
+  const errorCorrelationId = sanitizeCorrelationId(
+    Array.isArray(rawErrorCorrelationId) ? rawErrorCorrelationId[0] : rawErrorCorrelationId,
+  );
 
   if (!authorEnabled) {
     return (

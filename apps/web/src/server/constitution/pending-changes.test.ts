@@ -321,7 +321,14 @@ describe('requestLimitChange', () => {
     expect(inserted.limitId).toBe(LIMIT_ID);
     expect(inserted.newValue).toBe('900');
 
+    // The attempt is recorded first (unconditionally, ahead of any outcome-specific check),
+    // then the success event — see the module doc comment on why the attempt has to be its
+    // own write rather than reusing this one.
     expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
+      eventType: 'constitution.limit_increase_attempted',
+      correlationId: 'corr-6',
+    });
+    expect(recordEventMock.mock.calls[1]?.[0]).toMatchObject({
       eventType: 'constitution.limit_increase_requested',
       correlationId: 'corr-6',
     });
@@ -339,12 +346,24 @@ describe('requestLimitChange', () => {
     expect(transactionMock).not.toHaveBeenCalled();
   });
 
-  it('rejects a second increase request while one is already pending for the same limit', async () => {
+  /**
+   * The bug this test guards against: a success-only counter never sees a
+   * `pending_change_exists` rejection at all (no success event is ever written on that path),
+   * so hammering "loosen" while a pending increase already exists was both unthrottled *and*
+   * invisible to Phase 9. The attempt event must fire regardless of this later rejection.
+   */
+  it('rejects a second increase request while one is already pending for the same limit, but still records the attempt', async () => {
     selectReturns([activeRow()]);
     selectReturns([{ id: 'pending-existing' }]); // assertNoExistingPendingChange finds one
 
     await expect(requestLimitChange(LIMIT_ID, '900', 'corr-8')).rejects.toThrow(PendingChangeRejected);
     expect(insertMock).not.toHaveBeenCalled();
+
+    expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
+      eventType: 'constitution.limit_increase_attempted',
+      correlationId: 'corr-8',
+      payload: expect.objectContaining({ limitId: LIMIT_ID }),
+    });
   });
 });
 
@@ -545,7 +564,7 @@ describe('cancelPendingChange', () => {
   });
 });
 
-describe('rate limiting (loosening actions only)', () => {
+describe('rate limiting (increase requests only — decrease and cancel are always exempt)', () => {
   it('rejects an increase request once the loosening rate limit is exceeded, and records constitution.edit_rate_limited', async () => {
     selectReturns([activeRow()]); // loadActiveConstitutionForUser, reached before the gate
     assertWithinConstitutionActionRateLimitMock.mockRejectedValueOnce(new ConstitutionActionRateLimited());
@@ -562,21 +581,7 @@ describe('rate limiting (loosening actions only)', () => {
     });
   });
 
-  /** Cancelling a pending increase is gated too — it edits commitment state, the same reason a request is gated. */
-  it('rejects a cancel request once the loosening rate limit is exceeded, and records constitution.edit_rate_limited', async () => {
-    assertWithinConstitutionActionRateLimitMock.mockRejectedValueOnce(new ConstitutionActionRateLimited());
-
-    await expect(cancelPendingChange('pending-1', 'corr-rl-2')).rejects.toThrow(PendingChangeRejected);
-
-    expect(deleteMock).not.toHaveBeenCalled();
-    expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
-      eventType: 'constitution.edit_rate_limited',
-      correlationId: 'corr-rl-2',
-      payload: expect.objectContaining({ path: 'cancel_pending', pendingChangeId: 'pending-1' }),
-    });
-  });
-
-  /** Fail-closed direction: a limiter that cannot answer must REJECT the loosening it was asked to gate, never let it through. */
+  /** Fail-closed direction: a limiter that cannot answer must REJECT the increase it was asked to gate, never let it through. */
   it('fails closed on an increase when the rate limiter itself is unavailable — rejects, never lets the increase through', async () => {
     selectReturns([activeRow()]);
     const limiterOutage = new Error('rate limiter database unavailable');
@@ -588,21 +593,11 @@ describe('rate limiting (loosening actions only)', () => {
     expect(recordEventMock).not.toHaveBeenCalled();
   });
 
-  it('fails closed on a cancel when the rate limiter itself is unavailable', async () => {
-    const limiterOutage = new Error('rate limiter database unavailable');
-    assertWithinConstitutionActionRateLimitMock.mockRejectedValueOnce(limiterOutage);
-
-    await expect(cancelPendingChange('pending-1', 'corr-rl-4')).rejects.toBe(limiterOutage);
-
-    expect(deleteMock).not.toHaveBeenCalled();
-    expect(recordEventMock).not.toHaveBeenCalled();
-  });
-
   /**
    * The asymmetry's whole point: a decrease never calls the limiter at all, so a limiter
    * outage — even a permanent one, configured here to reject every call — can never block
-   * tightening. This is the opposite fail-closed direction from the increase/cancel tests
-   * above, and it is the important one: tightening must stay safe *unconditionally*.
+   * tightening. This is the opposite fail-closed direction from the increase test above, and
+   * it is the important one: tightening must stay safe *unconditionally*.
    */
   it('never calls the rate limiter on a decrease, even when the limiter is permanently unavailable', async () => {
     selectReturns([activeRow()]);
@@ -615,11 +610,30 @@ describe('rate limiting (loosening actions only)', () => {
     expect(assertWithinConstitutionActionRateLimitMock).not.toHaveBeenCalled();
   });
 
+  /**
+   * The scope correction: cancelling a pending increase *removes* a loosening rather than
+   * requesting one — same direction as a decrease — so it must be just as exempt, including
+   * when the limiter is permanently down. An earlier version of this rate limit incorrectly
+   * throttled cancel too; this is the regression test for that fix.
+   */
+  it('never calls the rate limiter on a cancel, even when the limiter is permanently unavailable', async () => {
+    selectReturns([activeRow()]);
+    const cancelled = pendingRow();
+    deleteReturns([cancelled]);
+    assertWithinConstitutionActionRateLimitMock.mockRejectedValue(new Error('rate limiter database unavailable'));
+
+    await cancelPendingChange(cancelled.id, 'corr-rl-6');
+
+    expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({ eventType: 'constitution.limit_increase_cancelled' });
+    expect(assertWithinConstitutionActionRateLimitMock).not.toHaveBeenCalled();
+  });
+
   /** The self-throttle: hammering past the limit must not also grow `constitution.edit_rate_limited` without bound. */
   it('does not record constitution.edit_rate_limited once that event type is itself already at its own throttle', async () => {
+    selectReturns([activeRow()]);
     assertWithinConstitutionActionRateLimitMock.mockRejectedValue(new ConstitutionActionRateLimited());
 
-    await expect(cancelPendingChange('pending-1', 'corr-rl-6')).rejects.toThrow(PendingChangeRejected);
+    await expect(requestLimitChange(LIMIT_ID, '900', 'corr-rl-7')).rejects.toThrow(PendingChangeRejected);
 
     expect(recordEventMock).not.toHaveBeenCalled();
     // Both calls happened — the gate, then `recordRateLimitedAttempt`'s own self-throttle

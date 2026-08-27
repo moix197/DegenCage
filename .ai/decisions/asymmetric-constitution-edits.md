@@ -51,51 +51,67 @@ is that action's durable record instead — voiding is reserved for the system d
 to honor a stale request, which is exactly the case that needs its own answer of "why didn't
 this apply" sitting in the events log.
 
-**Rate-limit asymmetry (the same shape, applied to the request itself):** Only the loosening
-actions are throttled — `requestLimitChange`'s increase path (`scheduleIncrease`) and
-`cancelPendingChange`. A decrease (`applyDecreaseImmediately`) never calls a rate limiter at
-all; the function is simply never invoked on that path. This reuses
-`assertWithinConstitutionActionRateLimit` (`server/constitution/rate-limit.ts`, already
-counting `constitution.drafted`/`constitution.activation_rejected_early` for the draft/commit
-flow) as an **action gate**, not only a write guard — `assertRateLimitForLoosening`
-(`pending-changes.ts`) calls it before doing anything else on the loosening path and turns a
+**Rate-limit asymmetry (the same shape, applied to the request itself):** Only genuine
+loosening is throttled — `requestLimitChange`'s increase path (`scheduleIncrease`). A decrease
+(`applyDecreaseImmediately`) **and** `cancelPendingChange` both never call a rate limiter at
+all; the function is simply never invoked on either path. Cancelling a pending increase
+*removes* a loosening rather than requesting one — it keeps the user at, or moves them toward,
+the stricter current state, exactly the direction a decrease also moves in — so it gets the
+same unconditional exemption as tightening, not the throttle. (An earlier version of this rule
+throttled cancel too, reasoning that "cancelling still edits commitment state." That inverted
+the safety direction: caught in review and corrected here.)
+
+This reuses `assertWithinConstitutionActionRateLimit` (`server/constitution/rate-limit.ts`,
+already counting `constitution.drafted`/`constitution.activation_rejected_early` for the
+draft/commit flow) as an **action gate**, not only a write guard — `assertRateLimitForLoosening`
+(`pending-changes.ts`) calls it before doing anything else in `scheduleIncrease` and turns a
 `ConstitutionActionRateLimited` into `PendingChangeRejected('rate_limited')`, rejecting the
 request outright rather than merely skipping an event write.
 
-Cancelling a pending increase is throttled too, on its *own* counter
-(`constitution.limit_increase_cancelled`, separate from `constitution.limit_increase_
-requested`): cancelling is still editing commitment state, not a passive read, and treating it
-as loosening-adjacent closes an obvious workaround — hammer "cancel" then "request" in a loop
-to route around a request-only limit.
+**The counter tracks attempts, not successes** (a second review finding): the gate counts
+`constitution.limit_increase_attempted`, a new event recorded unconditionally the moment a call
+passes the gate — *before* `assertNoExistingPendingChange` gets a chance to reject it with
+`pending_change_exists`. The first version counted `constitution.limit_increase_requested`
+instead, which is written only on a fully successful request. That made the exact case this
+throttle exists to catch — hammering "loosen" on a limit that already has a pending increase —
+invisible and unthrottleable: every such call failed on `pending_change_exists` before any
+success event was ever written, so the counter never moved and `ConstitutionActionRateLimited`
+never fired. `constitution.limit_increase_attempted` closes that gap and is itself a Phase 9
+signal — "how many times did this user try to loosen a limit," independent of whether any of
+those tries succeeded, which `constitution.limit_increase_requested` alone cannot answer.
 
 **Fail-closed direction is itself asymmetric**, mirroring the decrease/increase split above:
 - A limiter failure that *is* the expected `ConstitutionActionRateLimited` (the count query
-  ran, the caller is over the threshold) rejects the loosening action, same as any other
-  rejection reason.
+  ran, the caller is over the threshold) rejects the increase, same as any other rejection
+  reason.
 - A limiter failure that is *not* that — the database itself unreachable — is re-thrown as-is
   by `assertRateLimitForLoosening` rather than swallowed or treated as "allow": an unreachable
-  limiter must **reject** the loosening it was asked to gate (CLAUDE.md → fail closed), the
-  same direction every other kill-switch/limiter failure in this codebase fails.
-- The decrease path is unaffected by either case, because it never calls the limiter — there
-  is no failure mode there to fail closed (or open) about.
+  limiter must **reject** the increase it was asked to gate (CLAUDE.md → fail closed), the same
+  direction every other kill-switch/limiter failure in this codebase fails.
+- The decrease **and** cancel paths are unaffected by either case, because neither ever calls
+  the limiter — there is no failure mode there to fail closed (or open) about.
 
-**Behavioral signal:** every throttled loosening attempt records `constitution.edit_rate_
-limited` (payload: `path: 'increase_requested' | 'cancel_pending'`, plus the relevant
-`limitId`/`pendingChangeId`) — reused as one event type across both throttled paths rather than
-inventing two near-duplicates, since both mean the same thing for Phase 9's metrics: "wants
-looser rules, right now." That write is itself self-throttled (`recordRateLimitedAttempt`,
-same shape as `commitment.ts`'s private `recordEventWithinRateLimit`) so a caller hammering
-past the limit does not also grow this event type unbounded — the rejection still fires on
-every call, only the audit trail stops growing once it has enough rows to prove the pattern.
+**Behavioral signal:** a throttled increase attempt records `constitution.edit_rate_limited`
+(payload: `path: 'increase_requested'`, plus the relevant `limitId`). That write is itself
+self-throttled (`recordRateLimitedAttempt`, same shape as `commitment.ts`'s private
+`recordEventWithinRateLimit`) so a caller hammering past the limit does not also grow this
+event type unbounded — the rejection still fires on every call, only the audit trail stops
+growing once it has enough rows to prove the pattern.
 
 **Rejected:**
 
 - **Apply `new_value` unconditionally on schedule** — the stale-value hole above. Rejected
   after being found in code review on the first version of this phase.
+- **Rate-limiting `cancelPendingChange`** — inverts the safety direction: cancelling removes a
+  loosening, the same direction as a decrease, and must be exempt for the same reason. Shipped
+  once, caught in the next review round, removed here.
 - **Rate-limiting the decrease path too, "for symmetry"** — the opposite of the point. Tighten-
   ing your own constitution must be safe unconditionally, including when the rate limiter
   itself is down; the only way to guarantee that is to never call it on that path at all,
   which is what `applyDecreaseImmediately` does.
+- **Counting `constitution.limit_increase_requested` (successes) for the throttle** — the
+  attempt-vs-success bug above. Rejected after being found in the same review round as the
+  cancel-throttling mistake.
 - **Guarding only the event *write*, the same way `commitment.ts` uses this helper today** —
   would let someone spam increase requests as long as they don't mind the audit trail being
   incomplete; the edit surface is exactly where someone hammering "loosen my limits" shows up
