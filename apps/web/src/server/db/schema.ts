@@ -185,6 +185,31 @@ export interface StoredSignInInput {
 export type SiwsChallengeRow = typeof siwsChallenges.$inferSelect;
 
 /**
+ * The throttle `POST /api/admin/login` counts against (`server/admin/login-rate-limit.ts`) —
+ * same shape as `siws_challenges`' own rate-limit use (a dedicated table, not `events`,
+ * because this endpoint is unauthenticated and `events.user_id` is a real FK to `users`, not
+ * a place to park a hashed client key). One row per attempt that got past the throttle check
+ * itself (a call already over the limit writes no new row here, the same way
+ * `assertWithinChallengeRateLimit` throws before `issueSignInChallenge` ever inserts a
+ * challenge) — bounded growth per client key, per window.
+ */
+export const adminLoginAttempts = pgTable(
+  'admin_login_attempts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    clientKey: text('client_key').notNull(),
+    attemptedAt: timestamp('attempted_at', { withTimezone: true }).notNull().defaultNow(),
+    succeeded: boolean('succeeded').notNull(),
+  },
+  (table) => [
+    // The rate limiter's predicate: this client's *failed* attempts inside the current window.
+    index('admin_login_attempts_client_key_attempted_at_idx').on(table.clientKey, table.attemptedAt),
+  ],
+);
+
+export type AdminLoginAttemptRow = typeof adminLoginAttempts.$inferSelect;
+
+/**
  * The behavioral event log — product data, append-only, in the same Postgres as
  * everything else (`.ai/decisions/observability-stack.md`). No update, no delete: a
  * correction is a new row.

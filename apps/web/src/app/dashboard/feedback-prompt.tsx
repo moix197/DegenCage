@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { FEEDBACK_TEXT_MAX_LENGTH } from '@/server/feedback/constants';
 
 /**
  * The qualitative Phase 0 signal's only UI surface: "I know I can bypass this, but I don't
@@ -78,7 +79,7 @@ export function FeedbackPrompt() {
             value={text}
             onChange={(changeEvent) => setText(changeEvent.target.value)}
             placeholder="Optional — anything you want to tell us."
-            maxLength={2000}
+            maxLength={FEEDBACK_TEXT_MAX_LENGTH}
             rows={3}
             className="w-full rounded-md border border-input bg-background p-2 text-sm"
           />

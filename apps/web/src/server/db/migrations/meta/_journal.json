@@ -106,6 +106,13 @@
       "when": 1787838292821,
       "tag": "0014_famous_spirit",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1787849299603,
+      "tag": "0015_sad_nightshade",
+      "breakpoints": true
     }
   ]
 }

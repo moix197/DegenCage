@@ -415,6 +415,18 @@ async function loadBaselineTrades(walletId: string, executor: DatabaseExecutor =
     .orderBy(asc(trades.occurredAt));
 }
 
+export interface BaselineCounterfactualStats {
+  violationCount: number;
+  /**
+   * How many of this comparison's evaluations came back `unevaluable` (weak/missing
+   * historical pricing) — surfaced alongside `violationCount` rather than folded into it, so
+   * an unqualified violation count never silently understates a baseline that actually just
+   * couldn't be judged for lack of data. Excludes `rolling_loss_usd`'s structural exclusion
+   * (see `isComparableViolation`) — that is a known, already-labeled seam, not missing data.
+   */
+  unevaluableCount: number;
+}
+
 /**
  * Ad hoc, in-memory only: never stored as `rule.decision_recorded` (that event type is reserved
  * for real live trades — `reconcile-wallet.ts`), never surfaced to the user (decision 9). Sorts
@@ -429,11 +441,12 @@ async function loadBaselineTrades(walletId: string, executor: DatabaseExecutor =
  * `realizedLossUsd` is always `null`, so this limit type can only ever read `allow` here,
  * which would flatter the product if compared against live's real loss-limit verdicts).
  */
-export function computeBaselineCounterfactualViolationCount(constitution: Constitution, baselineTrades: BaselineTradeRow[]): number {
+export function computeBaselineCounterfactualViolationCount(constitution: Constitution, baselineTrades: BaselineTradeRow[]): BaselineCounterfactualStats {
   const sorted = [...baselineTrades].sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
   const evaluable: EvaluableTrade[] = sorted.map((trade) => ({ ...trade, lossLimitEnabled: true }));
 
   let violationCount = 0;
+  let unevaluableCount = 0;
 
   for (let index = 0; index < evaluable.length; index += 1) {
     const priorTrades = evaluable.slice(0, index);
@@ -442,9 +455,11 @@ export function computeBaselineCounterfactualViolationCount(constitution: Consti
     if (decision.evaluations.some(isComparableViolation)) {
       violationCount += 1;
     }
+
+    unevaluableCount += decision.evaluations.filter((evaluation) => evaluation.verdict === 'unevaluable' && evaluation.type !== 'rolling_loss_usd').length;
   }
 
-  return violationCount;
+  return { violationCount, unevaluableCount };
 }
 
 /**
@@ -454,13 +469,36 @@ export function computeBaselineCounterfactualViolationCount(constitution: Consti
  * anyone whose baseline activity was clustered (inflating their counterfactual rate) and
  * collapsed to `0` for a user with 0 or 1 baseline trades — neither is comparable to live's
  * denominator (calendar weeks since activation, unaffected by how trades cluster). Using the
- * same fixed 90 days for every user makes both sides genuinely comparable.
+ * same fixed 90 days for every user makes both sides genuinely comparable. A wallet connected
+ * less than 90 days before activation still divides by this same fixed window — a reviewed,
+ * accepted skew that only ever *dilutes* (never inflates) that wallet's own counterfactual
+ * rate, left as-is; `baselineActualSpanDays` below exists so the number can still be read
+ * correctly rather than trusted as "the same kind of 90 days" for every wallet.
  */
 const BASELINE_WINDOW_DAYS = 90;
 const BASELINE_WINDOW_WEEKS = BASELINE_WINDOW_DAYS / 7;
 
 /** A floor under `liveWeeksElapsed` so a just-activated user's rate is never computed against a literal `0` — `safeRate`'s zero-denominator guard would otherwise silently report `0/week` even if a violation happened in the very first hour, which reads as "clean" rather than "not enough time has passed". One hour is short enough to never meaningfully distort an established user's rate. */
 const MIN_WEEKS_ELAPSED = 1 / (24 * 7);
+
+/**
+ * Informational only — never fed into `baselineViolationsPerWeek`'s denominator (see
+ * `BASELINE_WINDOW_WEEKS`'s comment for why that stays fixed). This is "how many days of
+ * baseline activity do we actually have for this wallet", so a reader can tell a wallet with
+ * a full 90 days of history apart from one connected only a week before activating — both get
+ * the same fixed denominator, but they are not equally well-supported numbers. `0` for 0 or 1
+ * baseline trades (no span to measure), the same "not enough data" convention this file's
+ * other helpers use rather than a negative or `NaN`.
+ */
+function computeBaselineActualSpanDays(baselineTrades: { occurredAt: Date }[]): number {
+  if (baselineTrades.length < 2) return 0;
+
+  const sorted = [...baselineTrades].sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
+  const first = sorted[0]!.occurredAt.getTime();
+  const last = sorted[sorted.length - 1]!.occurredAt.getTime();
+
+  return (last - first) / (24 * 60 * 60 * 1_000);
+}
 
 interface LiveViolationEventRow {
   occurredAt: Date;
@@ -493,8 +531,12 @@ export interface ExternalViolationFrequencyComparison {
   liveWeeksElapsed: number;
   liveViolationsPerWeek: number;
   baselineViolationCount: number;
+  /** Evaluations the baseline counterfactual couldn't judge (weak/missing pricing) — a nonzero count here means `baselineViolationCount` is a floor, not an exact figure. */
+  baselineUnevaluableCount: number;
   /** Always `BASELINE_WINDOW_WEEKS` (90 days) — the fixed collection window, not measured from trade timestamps. See the constant's comment. */
   baselineWindowWeeks: number;
+  /** How many days of baseline trades this wallet actually has, informational only — see `computeBaselineActualSpanDays`. */
+  baselineActualSpanDays: number;
   baselineViolationsPerWeek: number;
 }
 
@@ -517,7 +559,10 @@ export async function getExternalViolationFrequencyComparison(
 
   const liveViolationCount = countViolationEvents(liveRows);
   const liveWeeksElapsed = Math.max(MIN_WEEKS_ELAPSED, (now.getTime() - activatedAt.getTime()) / WEEK_MS);
-  const baselineViolationCount = computeBaselineCounterfactualViolationCount(constitution, baselineTrades);
+  const { violationCount: baselineViolationCount, unevaluableCount: baselineUnevaluableCount } = computeBaselineCounterfactualViolationCount(
+    constitution,
+    baselineTrades,
+  );
 
   return {
     userId,
@@ -525,7 +570,9 @@ export async function getExternalViolationFrequencyComparison(
     liveWeeksElapsed,
     liveViolationsPerWeek: safeRate(liveViolationCount, liveWeeksElapsed),
     baselineViolationCount,
+    baselineUnevaluableCount,
     baselineWindowWeeks: BASELINE_WINDOW_WEEKS,
+    baselineActualSpanDays: computeBaselineActualSpanDays(baselineTrades),
     baselineViolationsPerWeek: safeRate(baselineViolationCount, BASELINE_WINDOW_WEEKS),
   };
 }

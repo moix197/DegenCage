@@ -71,6 +71,75 @@ wrong or missing secret, or an unset `ADMIN_METRICS_SECRET`, all redirect (303) 
 (only that a login attempt failed), so this endpoint doesn't need the API route's
 404-not-403 treatment; it's a login form, not silently-exists-or-not internal data.
 
+**HIGH — the login route was itself an unthrottled online-guessing oracle, closed by
+`server/admin/login-rate-limit.ts`.** The first version of this doc treated the login
+route's "wrong-secret redirect leaks nothing" reasoning as the whole story, but missed the
+consequence of `/admin/login` being a public 200 page: unlike `GET /api/admin/metrics`
+(obscured by the 404-not-403 gate above), the login page necessarily *advertises* that this
+endpoint exists — the only thing standing between a prober and the secret was the secret's
+own entropy, guessed at whatever rate the caller could send `POST` requests. `assertWithin
+AdminLoginRateLimited` (5 failed attempts / 15 minutes, per client key) closes that: past
+the limit, every subsequent call redirects to `/admin/login?error=rate_limited` *before the
+secret is ever read or compared* — the throttle check runs first in `route.ts`'s `POST`
+handler, ahead of `readSecretFromRequest`/`secretsMatch`, so a locked-out caller cannot
+distinguish "still guessing wrong" from "now throttled" by response shape or timing beyond
+the fixed rejection itself.
+
+This is a **sibling to `server/auth/challenge-rate-limit.ts`, not an extension of
+`server/constitution/rate-limit.ts`.** The constitution limiter is keyed by `(userId,
+eventType)` against `events.user_id`, a real FK to `users` — login is unauthenticated (no
+user yet to key on), and bending that column to accept an arbitrary hashed client key would
+change what it means for `commitment.ts`/`pending-changes.ts`'s existing callers too, which
+was an explicit non-goal. Instead: `clientKeyForRequest` (`challenge-rate-limit.ts`) is
+reused as-is (already generic — hashes a forwarded client address, nothing SIWS-specific in
+its logic), and a small dedicated table, `admin_login_attempts` (migration `0015`), is the
+counting source — same shape as `siws_challenges`' own rate-limit use, for the same reason:
+an unauthenticated endpoint's throttle needs a key that isn't a user id.
+
+**A throttled call writes no new `admin_login_attempts` row** (the assert throws before
+`recordAdminLoginAttempt` runs), which bounds that table's growth to `ADMIN_LOGIN_RATE_LIMIT
+_MAX` failed rows per client key per window — the same accepted-cost shape `siws_challenges`
+already has. The `admin.login_rate_limited` **event**, however, is self-throttled
+separately (`recordRateLimitedLoginEventOnce`, an existence check over a small bounded
+window rather than a second counting table): without it, every millisecond-spaced request
+from an already-locked-out caller would each write a new `events` row for the rest of the
+window, since the underlying attempt-count staying flat means nothing else bounds it.
+`admin.login_failed` needs no such guard — it can only be written after a call has already
+passed the throttle, so it's naturally capped at `ADMIN_LOGIN_RATE_LIMIT_MAX` per client key
+per window by the same mechanism that governs the throttle itself.
+
+**Secret entropy is enforced, not just documented.** `MIN_ADMIN_SECRET_LENGTH` (32 chars,
+`server/admin/access.ts`) makes a too-short `ADMIN_METRICS_SECRET` behave identically to an
+unset one everywhere — `getConfiguredAdminSecret()` is the one place that reads the env var,
+so this can't be checked in one gate and forgotten in another. `instrumentation.ts` also
+logs a startup warning (`warnIfAdminSecretMisconfigured`) if the secret is missing or weak —
+visible immediately, without crashing the app over a misconfigured admin-only surface (an
+admin gate failing closed is not worth taking the whole product down for). The throttle
+above and secret entropy are complementary, not substitutes: a strong secret makes online
+guessing infeasible in the time the throttle allows; the throttle bounds the *rate* even if
+the secret turns out to be weaker than intended.
+
+**LOW fixes from the same audit round:**
+
+- **The session cookie's `Secure` attribute was conditional on `NODE_ENV === 'production'`**,
+  which meant any staging/preview deploy (not `NODE_ENV=production` by default) sent the 12h
+  admin bearer token over plain HTTP. `isPlainHttpLocalhost(request)` in both
+  `api/admin/login/route.ts` and `api/admin/logout/route.ts` now keys the flag off the
+  request's actual hostname instead — `Secure` is unconditional everywhere except a bare
+  `localhost`/`127.0.0.1` dev server, which cannot read back a `Secure` cookie it set for
+  itself over plain HTTP at all.
+- **No logout existed** — rotating `ADMIN_METRICS_SECRET` (invalidating every cookie at
+  once, per the stateless design above) was the only way to end a session early. `POST
+  /api/admin/logout` now overwrites the cookie with `maxAge: 0`, matching every scoping
+  attribute (`path: '/admin'`, etc.) the original `set` used — a mismatched attribute would
+  make the browser treat it as a different cookie and leave the real one live.
+- **`new URL('/admin/metrics', request.url)` was a host-header open redirect** — Next.js
+  does not verify `request.url`'s host against a trusted proxy list here, so a forged `Host`
+  header could redirect a successful login to an attacker-controlled origin. Every redirect
+  in `api/admin/login/route.ts` and `api/admin/logout/route.ts` now uses a bare relative
+  `Location` header (`relativeRedirect`) instead — a relative `Location` is resolved by the
+  browser against the origin it actually connected to, which a spoofed `Host` cannot change.
+
 **Accepted, documented gap — timing:** the unauthorized path (an immediate `secretsMatch`
 compare) and the authorized path (`buildMetricsSnapshot`'s ~9 parallel queries) have a real,
 measurable timing delta. Closing it (e.g. a constant-time floor on every response) was
@@ -93,3 +162,10 @@ way a per-character timing leak inside `secretsMatch` itself would (which is wha
   and "HMAC-sign the expiry" details get silently dropped from one of the two.
 - The moment a real role system exists, both surfaces should move to it instead of the
   secret/cookie split described here.
+- `admin_login_attempts` (migration `0015_sad_nightshade.sql`) has no reaper yet — rows
+  accumulate at a rate bounded by the throttle itself (at most `ADMIN_LOGIN_RATE_LIMIT_MAX`
+  failed rows per client key per window), same accepted-cost shape as `siws_challenges`
+  without `challenge-reaper.ts`'s cleanup. Add one if this table's growth ever actually
+  matters — deferred here as disproportionate to an admin-only, inherently low-traffic
+  surface.
+- `ADMIN_METRICS_SECRET` must additionally be at least `MIN_ADMIN_SECRET_LENGTH` (32) characters — see `.env.example`'s comment and `server/admin/access.ts`. A secret shorter than that is treated as unset everywhere, including by whoever holds it.

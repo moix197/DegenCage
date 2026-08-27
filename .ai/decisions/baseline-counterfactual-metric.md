@@ -79,6 +79,48 @@ constant `BASELINE_WINDOW_DAYS / 7` (decision 9's 90-day backfill), for every us
 regardless of how many baseline trades exist or how they're distributed in time — making
 both sides genuinely the same kind of number: violations over a fixed calendar period.
 
+**Known methodological seam, labeled rather than fixed: baseline uses today's constitution;
+live used whatever was active at the time.** The baseline counterfactual always evaluates
+against the constitution's *current* `document` — read once, at query time, in
+`getExternalViolationFrequencyForAllUsers`. The live side's violations, by contrast, are
+whatever `rule.decision_recorded` already recorded *at the moment each trade was
+evaluated*, which reflects the constitution as it stood then — and Phase 8's asymmetric
+edits mean "then" and "now" can genuinely differ (a decrease applies immediately; an
+increase applies 48h later, after a review may already have run). The two sides are
+therefore not always evaluated against identically-versioned rules. This was flagged in
+code review and deliberately **not silently re-architected** — reconstructing the
+constitution's historical state at each past live decision would mean either storing a
+full document snapshot per decision event (a real schema change, out of scope for an
+internal metric) or trusting `rule.decision_recorded`'s own `payload.evaluations`, which
+already reflects whatever was current at write time and needs no reconstruction at all —
+i.e., the live side is already correct by construction; only the *baseline* side has this
+seam, since it recomputes rather than reads a stored decision. Labeled explicitly instead:
+`admin/metrics/page.tsx`'s "External violation frequency" section states this directly in
+its note, and this paragraph is that label's canonical source. If the constitution rarely
+changes after activation (the common case), the seam rarely matters in practice; it matters
+most for a user who has since loosened a limit, where the baseline counterfactual is
+retroactively judged against a laxer bar than their early live trades actually were.
+
+**Unevaluable evaluations are surfaced, not silently absorbed.**
+`computeBaselineCounterfactualViolationCount` returns `{ violationCount, unevaluableCount }`
+rather than a bare number — `unevaluableCount` counts evaluations that came back
+`unevaluable` (weak/missing historical pricing on a baseline trade; `rolling_loss_usd`'s
+structural exclusion is *not* counted here, since that's the already-labeled bias fix
+above, not missing data). Exposed on `ExternalViolationFrequencyComparison` as
+`baselineUnevaluableCount` and rendered on `/admin/metrics`. Without this, a baseline with
+poor historical price coverage would read as artificially clean — `violationCount` alone
+cannot distinguish "genuinely no violations" from "couldn't tell for several trades."
+
+**Baseline actual span is surfaced, informationally, alongside the fixed window.** The
+denominator fix above (fixed `BASELINE_WINDOW_WEEKS`) is deliberately left as-is per the
+reviewer's own read: a wallet connected less than 90 days before activation gets a diluted
+(never inflated) counterfactual rate, which errs conservative rather than wrong in a way
+that flatters the product. But a bare rate number can't be read correctly without knowing
+whether it's backed by a full 90 days of baseline trades or just a handful from a week-old
+connection — `computeBaselineActualSpanDays` (the span between a wallet's first and last
+baseline trade, `0` for fewer than 2) is exposed as `baselineActualSpanDays` for exactly
+this reason: never fed into the rate's own math, only into how a reader should weight it.
+
 **Constraints it creates:**
 
 - Any change to `EvaluableTrade`'s shape (`packages/rules/src/evaluate.ts`) must be

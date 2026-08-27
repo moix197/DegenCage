@@ -1,7 +1,7 @@
 import { cookies } from 'next/headers';
 import { notFound } from 'next/navigation';
 
-import { ADMIN_SESSION_COOKIE_NAME, verifyAdminSessionCookie } from '@/server/admin/access';
+import { ADMIN_SESSION_COOKIE_NAME, getConfiguredAdminSecret, verifyAdminSessionCookie } from '@/server/admin/access';
 import { buildMetricsSnapshot, type MetricsSnapshot } from '@/server/metrics/queries';
 
 export const dynamic = 'force-dynamic';
@@ -19,7 +19,7 @@ export const runtime = 'nodejs';
  * `.ai/decisions/admin-metrics-secret-gate.md`.
  */
 async function requireAdminSession(): Promise<void> {
-  const expected = process.env.ADMIN_METRICS_SECRET;
+  const expected = getConfiguredAdminSecret();
   const cookieStore = await cookies();
   const cookieValue = cookieStore.get(ADMIN_SESSION_COOKIE_NAME)?.value;
 
@@ -35,9 +35,19 @@ export default async function AdminMetricsPage() {
 
   return (
     <main style={{ maxWidth: '60rem', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '2rem', padding: '1.5rem' }}>
-      <div>
-        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Phase 0 success signals</h1>
-        <p>Computed live from the event log — {snapshot.generatedAt}</p>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div>
+          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Phase 0 success signals</h1>
+          <p>Computed live from the event log — {snapshot.generatedAt}</p>
+        </div>
+        <form method="POST" action="/api/admin/logout">
+          <button
+            type="submit"
+            style={{ padding: '0.4rem 0.75rem', border: '1px solid #ccc', borderRadius: '4px', background: 'transparent', cursor: 'pointer', fontSize: '0.85rem' }}
+          >
+            Log out
+          </button>
+        </form>
       </div>
 
       <OnboardingSection snapshot={snapshot} />
@@ -55,6 +65,11 @@ export default async function AdminMetricsPage() {
 
 function formatPercent(rate: number): string {
   return `${(rate * 100).toFixed(1)}%`;
+}
+
+/** A `0`-sample rate reads as "perfect non-compliance" if rendered as "0.0%" — render "no data" instead so an empty cohort is never mistaken for a clean one. */
+function formatPercentOrNoData(rate: number, sampleSize: number): string {
+  return sampleSize === 0 ? 'no data' : formatPercent(rate);
 }
 
 function formatNumber(value: number): string {
@@ -88,7 +103,7 @@ function OnboardingSection({ snapshot }: { snapshot: MetricsSnapshot }) {
     <Section title="Onboarding completion" note="Grouped by the UTC day of each user's first session.">
       <Stat label="Sessions" value={formatNumber(onboarding.sessionUserCount)} />
       <Stat label="Activated" value={formatNumber(onboarding.activatedUserCount)} />
-      <Stat label="Completion rate" value={formatPercent(onboarding.rate)} />
+      <Stat label="Completion rate" value={formatPercentOrNoData(onboarding.rate, onboarding.sessionUserCount)} />
       {cohortDays.length > 0 ? (
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
@@ -107,7 +122,7 @@ function OnboardingSection({ snapshot }: { snapshot: MetricsSnapshot }) {
                   <td style={{ paddingRight: '1rem' }}>{day}</td>
                   <td style={{ paddingRight: '1rem' }}>{formatNumber(cohort.sessionUserCount)}</td>
                   <td style={{ paddingRight: '1rem' }}>{formatNumber(cohort.activatedUserCount)}</td>
-                  <td>{formatPercent(cohort.rate)}</td>
+                  <td>{formatPercentOrNoData(cohort.rate, cohort.sessionUserCount)}</td>
                 </tr>
               );
             })}
@@ -137,9 +152,9 @@ function ActivationSection({ snapshot }: { snapshot: MetricsSnapshot }) {
     <Section title="Activation (commitment follow-through)">
       <Stat label="Commitments started" value={formatNumber(activation.commitmentStartedCount)} />
       <Stat label="Activated" value={formatNumber(activation.activatedCount)} />
-      <Stat label="Conversion rate" value={formatPercent(activation.conversionRate)} />
+      <Stat label="Conversion rate" value={formatPercentOrNoData(activation.conversionRate, activation.commitmentStartedCount)} />
       <Stat label="Early activation attempts" value={formatNumber(activation.earlyActivationAttemptCount)} />
-      <Stat label="Early attempt rate" value={formatPercent(activation.earlyActivationAttemptRate)} />
+      <Stat label="Early attempt rate" value={formatPercentOrNoData(activation.earlyActivationAttemptRate, activation.commitmentStartedCount)} />
     </Section>
   );
 }
@@ -152,7 +167,7 @@ function ReturnVisitsSection({ snapshot }: { snapshot: MetricsSnapshot }) {
       <Stat label="Avg distinct view-days per user" value={formatNumber(returnVisits.avgDistinctViewDaysPerUser)} />
       <Stat label="Week-2 eligible users" value={formatNumber(returnVisits.week2EligibleUserCount)} />
       <Stat label="Week-2 returning users" value={formatNumber(returnVisits.week2ReturningUserCount)} />
-      <Stat label="Week-2 return rate" value={formatPercent(returnVisits.week2ReturnRate)} />
+      <Stat label="Week-2 return rate" value={formatPercentOrNoData(returnVisits.week2ReturnRate, returnVisits.week2EligibleUserCount)} />
     </Section>
   );
 }
@@ -162,11 +177,11 @@ function RulesKeptSection({ snapshot }: { snapshot: MetricsSnapshot }) {
   const userIds = Object.keys(rulesKept.byUser).sort();
 
   return (
-    <Section title="Rules kept %" note="Denominator excludes `unevaluable` evaluations — those are undecided, not kept or broken.">
+    <Section title="Rules kept %" note="Denominator excludes `unevaluable` evaluations — those are undecided, not kept or broken. A user/row with zero decided evaluations reads &ldquo;no data&rdquo;, never 0%.">
       <Stat label="Decided evaluations" value={formatNumber(rulesKept.totalDecidedEvaluations)} />
       <Stat label="Allowed" value={formatNumber(rulesKept.allowedCount)} />
       <Stat label="Unevaluable (excluded)" value={formatNumber(rulesKept.unevaluableCount)} />
-      <Stat label="Rules kept rate" value={formatPercent(rulesKept.rulesKeptRate)} />
+      <Stat label="Rules kept rate" value={formatPercentOrNoData(rulesKept.rulesKeptRate, rulesKept.totalDecidedEvaluations)} />
       {userIds.length > 0 ? (
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
@@ -185,7 +200,7 @@ function RulesKeptSection({ snapshot }: { snapshot: MetricsSnapshot }) {
                   <td style={{ paddingRight: '1rem' }}>{userId}</td>
                   <td style={{ paddingRight: '1rem' }}>{formatNumber(user.totalDecidedEvaluations)}</td>
                   <td style={{ paddingRight: '1rem' }}>{formatNumber(user.allowedCount)}</td>
-                  <td>{formatPercent(user.rulesKeptRate)}</td>
+                  <td>{formatPercentOrNoData(user.rulesKeptRate, user.totalDecidedEvaluations)}</td>
                 </tr>
               );
             })}
@@ -200,7 +215,7 @@ function ExternalViolationsSection({ snapshot }: { snapshot: MetricsSnapshot }) 
   return (
     <Section
       title="External violation frequency: live vs. baseline counterfactual"
-      note="Baseline figures are an internal-only comparison — the 90-day pre-activation record is never shown to the user it belongs to. rolling_loss_usd is excluded from both sides (a baseline trade can never be loss-limit-eligible, so counting it would flatter the product)."
+      note="Baseline figures are an internal-only comparison — the 90-day pre-activation record is never shown to the user it belongs to. rolling_loss_usd is excluded from both sides (a baseline trade can never be loss-limit-eligible, so counting it would flatter the product). Known methodological seam: the baseline side is evaluated against the constitution's CURRENT limits, applied retroactively; the live side reflects whatever limits were actually active on each trade at the time (which can differ if limits were edited after activation) — the two are not evaluated against identically-versioned rules. Baseline span/unevaluable columns below qualify how much weight each row's counterfactual should carry."
     >
       {snapshot.externalViolations.length === 0 ? (
         <p>No active constitutions yet.</p>
@@ -210,7 +225,9 @@ function ExternalViolationsSection({ snapshot }: { snapshot: MetricsSnapshot }) 
             <tr>
               <th style={{ textAlign: 'left', paddingRight: '1rem' }}>User</th>
               <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Live violations/week</th>
-              <th style={{ textAlign: 'left' }}>Baseline counterfactual/week</th>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Baseline counterfactual/week</th>
+              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Baseline unevaluable</th>
+              <th style={{ textAlign: 'left' }}>Baseline span (days of 90)</th>
             </tr>
           </thead>
           <tbody>
@@ -218,7 +235,9 @@ function ExternalViolationsSection({ snapshot }: { snapshot: MetricsSnapshot }) 
               <tr key={row.userId}>
                 <td style={{ paddingRight: '1rem' }}>{row.userId}</td>
                 <td style={{ paddingRight: '1rem' }}>{formatNumber(row.liveViolationsPerWeek)}</td>
-                <td>{formatNumber(row.baselineViolationsPerWeek)}</td>
+                <td style={{ paddingRight: '1rem' }}>{formatNumber(row.baselineViolationsPerWeek)}</td>
+                <td style={{ paddingRight: '1rem' }}>{formatNumber(row.baselineUnevaluableCount)}</td>
+                <td>{formatNumber(row.baselineActualSpanDays)}</td>
               </tr>
             ))}
           </tbody>

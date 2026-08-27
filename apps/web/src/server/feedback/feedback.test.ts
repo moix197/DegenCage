@@ -112,16 +112,25 @@ describe('recordFeedback: rate limiting', () => {
 });
 
 describe('recordFeedbackPrompt', () => {
-  it('is throttled independently, keyed on feedback.prompt_shown', async () => {
+  /**
+   * `prompt_shown` was throttled under the same limit as `submitted` in an earlier version,
+   * which made an impression under-report relative to a submission on any session that also
+   * triggered other throttled writes — inflating the apparent "shown -> submitted" conversion
+   * rate. It is now deliberately exempt (see `feedback.ts`'s module doc comment): recording an
+   * impression never calls the limiter at all.
+   */
+  it('is never throttled — recording an impression never calls the limiter', async () => {
     await recordFeedbackPrompt({ correlationId: 'c1' });
 
-    expect(assertWithinConstitutionActionRateLimitMock).toHaveBeenCalledWith(SESSION_USER_ID, 'feedback.prompt_shown', 'c1', expect.any(Date));
+    expect(assertWithinConstitutionActionRateLimitMock).not.toHaveBeenCalled();
+    expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'feedback.prompt_shown' }));
   });
 
-  it('rejects once throttled', async () => {
-    assertWithinConstitutionActionRateLimitMock.mockRejectedValueOnce(new ConstitutionActionRateLimited());
+  it('still records the impression even when the submission limiter is (independently) exhausted', async () => {
+    assertWithinConstitutionActionRateLimitMock.mockRejectedValue(new ConstitutionActionRateLimited());
 
-    await expect(recordFeedbackPrompt({ correlationId: 'c1' })).rejects.toMatchObject({ reason: 'rate_limited' });
-    expect(recordEventMock).not.toHaveBeenCalled();
+    await recordFeedbackPrompt({ correlationId: 'c1' });
+
+    expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'feedback.prompt_shown' }));
   });
 });

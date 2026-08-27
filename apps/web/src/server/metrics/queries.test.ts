@@ -221,8 +221,11 @@ describe('getExternalViolationFrequencyComparison', () => {
     expect(result.liveViolationsPerWeek).toBeCloseTo(1 / expectedLiveWeeksElapsed, 10);
     // second baseline trade: $100 prior + $500 = $600 > $400 maxUsd -> one counterfactual violation
     expect(result.baselineViolationCount).toBe(1);
+    expect(result.baselineUnevaluableCount).toBe(0);
     expect(result.baselineWindowWeeks).toBeCloseTo(BASELINE_WINDOW_WEEKS, 10);
     expect(result.baselineViolationsPerWeek).toBeCloseTo(1 / BASELINE_WINDOW_WEEKS, 10);
+    // informational only — 1 hour apart, not fed into the rate's denominator (BASELINE_WINDOW_WEEKS above).
+    expect(result.baselineActualSpanDays).toBeCloseTo(1 / 24, 10);
   });
 
   it('floors liveWeeksElapsed for a just-activated user instead of reporting a vacuous 0/week', async () => {
@@ -278,7 +281,7 @@ describe('computeBaselineCounterfactualViolationCount', () => {
       limits: [{ id: 'limit-1', type: 'daily_notional_usd', maxUsd: '100', windowHours: 1 }],
     };
 
-    const violationCount = computeBaselineCounterfactualViolationCount(constitution, [
+    const stats = computeBaselineCounterfactualViolationCount(constitution, [
       { occurredAt: new Date('2025-10-01T00:00:00.000Z'), usdValue: '80', isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null },
       // Two hours later — outside the 1h window, so this does not stack with the first trade.
       { occurredAt: new Date('2025-10-01T02:00:00.000Z'), usdValue: '80', isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null },
@@ -286,7 +289,7 @@ describe('computeBaselineCounterfactualViolationCount', () => {
       { occurredAt: new Date('2025-10-01T02:10:00.000Z'), usdValue: '80', isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null },
     ]);
 
-    expect(violationCount).toBe(1);
+    expect(stats).toEqual({ violationCount: 1, unevaluableCount: 0 });
   });
 
   it('never counts a rolling_loss_usd evaluation as a violation, since a baseline trade can never be loss-eligible', () => {
@@ -295,11 +298,25 @@ describe('computeBaselineCounterfactualViolationCount', () => {
       limits: [{ id: 'limit-1', type: 'rolling_loss_usd', maxUsd: '1', windowHours: 168 }],
     };
 
-    const violationCount = computeBaselineCounterfactualViolationCount(constitution, [
+    const stats = computeBaselineCounterfactualViolationCount(constitution, [
       { occurredAt: new Date('2025-10-01T00:00:00.000Z'), usdValue: '1000', isAcquisition: true, acquiredTier: null, isRoundTripClose: true, realizedLossUsd: null },
     ]);
 
-    expect(violationCount).toBe(0);
+    expect(stats.violationCount).toBe(0);
+  });
+
+  it('surfaces unevaluable evaluations separately, so a weak-pricing baseline is never silently read as clean', () => {
+    const constitution: Constitution = {
+      schemaVersion: 1,
+      limits: [{ id: 'limit-1', type: 'daily_notional_usd', maxUsd: '100', windowHours: 24 }],
+    };
+
+    // usdValue: null -> `daily_notional_usd` reports 'unevaluable', not 'allow'.
+    const stats = computeBaselineCounterfactualViolationCount(constitution, [
+      { occurredAt: new Date('2025-10-01T00:00:00.000Z'), usdValue: null, isAcquisition: true, acquiredTier: null, isRoundTripClose: false, realizedLossUsd: null },
+    ]);
+
+    expect(stats).toEqual({ violationCount: 0, unevaluableCount: 1 });
   });
 });
 

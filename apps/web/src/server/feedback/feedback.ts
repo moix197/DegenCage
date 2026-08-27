@@ -5,6 +5,7 @@ import { resolveSession } from '../auth/session';
 import { ConstitutionActionRateLimited, assertWithinConstitutionActionRateLimit } from '../constitution/rate-limit';
 import { getDb } from '../db/client';
 import { events } from '../db/schema';
+import { FEEDBACK_CONTEXT_MAX_LENGTH, FEEDBACK_TEXT_MAX_LENGTH } from './constants';
 
 /**
  * The qualitative Phase 0 signal (plan's Phase 9): "I know I can bypass this, but I don't
@@ -18,15 +19,23 @@ import { events } from '../db/schema';
  * source of caller identity, same invariant `server/constitution/*` and `server/auth/*`
  * hold (no route may take a user id from a request body).
  *
- * Both writes are throttled per user, per event type, by reusing
+ * Only `recordFeedback` (the `feedback.submitted` write) is throttled, by reusing
  * `assertWithinConstitutionActionRateLimit` (`server/constitution/rate-limit.ts`) exactly as
- * `pending-changes.ts` does — not a new limiter. Without this, one wallet could flood
- * `feedback.submitted` and evict genuine quotes from `listRecentFeedback`'s 50-row window, and
- * either event type would otherwise bloat `events`, which every metric in
- * `server/metrics/queries.ts` full-scans. `.ai/index.md`'s "Authenticated write surfaces" row
- * already earmarked this module as the module's own name suggests: reused in place rather than
- * relocated to a shared path — a large-radius rename across `constitution/commitment.ts` and
- * `constitution/pending-changes.ts` for a cosmetic move, deferred as a documented trade-off.
+ * `pending-changes.ts` does — not a new limiter. Without it, one wallet could flood
+ * `feedback.submitted` and evict genuine quotes from `listRecentFeedback`'s 50-row window.
+ * `recordFeedbackPrompt` (`feedback.prompt_shown`) is deliberately **exempt**: it was
+ * throttled under the same limit in an earlier version, which shared one 10-per-5-min budget
+ * between impressions and submissions — since a prompt is always shown before it can be
+ * submitted, that made `prompt_shown` under-report relative to `submitted` on any session
+ * that also triggered other throttled writes, inflating the apparent "shown → submitted"
+ * conversion rate read off the raw counts. An impression carries no free text (no abuse
+ * surface `submitted`'s length/charset caps exist to guard), so exempting it costs nothing
+ * `submitted`'s own throttle doesn't already cover for the thing that actually matters (spam
+ * text, table eviction). `.ai/index.md`'s "Authenticated write surfaces" row already earmarked
+ * this module as the module's own name suggests: `assertWithinConstitutionActionRateLimit` is
+ * reused in place rather than relocated to a shared path — a large-radius rename across
+ * `constitution/commitment.ts` and `constitution/pending-changes.ts` for a cosmetic move,
+ * deferred as a documented trade-off.
  */
 
 /**
@@ -36,11 +45,8 @@ import { events } from '../db/schema';
  */
 export const FEEDBACK_CAPTURE_FLAG = 'feedback.capture';
 
-/** Enough room for the "killer signal" quote this exists to capture, capped against abuse — an explicit bound, not an unbounded text column. */
-export const FEEDBACK_TEXT_MAX_LENGTH = 2000;
+export { FEEDBACK_CONTEXT_MAX_LENGTH, FEEDBACK_TEXT_MAX_LENGTH };
 
-/** `context` is an internal label (e.g. `post_activation`, `after_violation`), not free text — short and closed-charset on purpose, unlike `text`. */
-export const FEEDBACK_CONTEXT_MAX_LENGTH = 64;
 const FEEDBACK_CONTEXT_PATTERN = /^[a-z0-9_-]+$/i;
 
 const FEEDBACK_LIST_LIMIT = 50;
@@ -120,16 +126,14 @@ export interface RecordFeedbackPromptParams {
   context?: string;
 }
 
+/** Not rate limited — see this module's doc comment for why an impression is exempt while `recordFeedback` (below) is not. */
 export async function recordFeedbackPrompt({ correlationId, context }: RecordFeedbackPromptParams): Promise<void> {
   const session = await requireSession();
   const validatedContext = validateContext(context);
-  const now = new Date();
-
-  await assertFeedbackRateLimit(session.userId, 'feedback.prompt_shown', correlationId, now);
 
   await recordEvent({
     eventType: 'feedback.prompt_shown',
-    occurredAt: now,
+    occurredAt: new Date(),
     correlationId,
     userId: session.userId,
     payload: validatedContext ? { context: validatedContext } : {},

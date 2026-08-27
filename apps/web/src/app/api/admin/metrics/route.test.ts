@@ -28,7 +28,7 @@ function requestWithHeader(method: string, headerValue?: string): Request {
 
 beforeEach(() => {
   buildMetricsSnapshotMock.mockReset();
-  process.env.ADMIN_METRICS_SECRET = 'correct-secret';
+  process.env.ADMIN_METRICS_SECRET = 'a-very-strong-secret-that-is-32-chars-plus';
 });
 
 afterEach(() => {
@@ -74,7 +74,7 @@ describe('GET /api/admin/metrics', () => {
     };
     buildMetricsSnapshotMock.mockResolvedValueOnce(snapshot);
 
-    const response = await GET(requestWithHeader('GET', 'correct-secret'));
+    const response = await GET(requestWithHeader('GET', 'a-very-strong-secret-that-is-32-chars-plus'));
     const body = await response.json();
 
     expect(response.status).toBe(200);
@@ -93,7 +93,7 @@ describe('non-GET methods on /api/admin/metrics', () => {
     ['HEAD', HEAD],
     ['OPTIONS', OPTIONS],
   ])('%s answers 404, not an auto-405 with an Allow header, even with the correct secret', async (method, handler) => {
-    const response = await handler(requestWithHeader(method, 'correct-secret'));
+    const response = await handler(requestWithHeader(method, 'a-very-strong-secret-that-is-32-chars-plus'));
 
     expect(response.status).toBe(404);
     expect(response.headers.get('allow')).toBeNull();
