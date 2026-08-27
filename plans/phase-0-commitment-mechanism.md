@@ -434,16 +434,16 @@ Thresholds live in one named exported constant so they are tunable without touch
 
 **Phase review:**
 
-- [ ] All Steps and Verification checkboxes above ticked in the plan file
-- [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
-- [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
+- [x] All Steps and Verification checkboxes above ticked in the plan file
+- [x] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
+- [x] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
 - [x] Code-reviewer agent has verified this phase
 - [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
 - [x] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
+- [x] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `feat: market-cap asset tiers and per-tier acquisition limits`
-- [ ] Phase marked complete
+- [x] Phase marked complete
 
 ---
 
@@ -470,13 +470,13 @@ Thresholds live in one named exported constant so they are tunable without touch
 
 **Steps:**
 
-- [ ] Migration: `position_lots`, `trades` loss columns
-- [ ] Implement FIFO lot-matching: on each acquisition, open/append a lot; on each disposal, consume the oldest lot(s) first, compute realized P&L per matched unit; tag `opened_after_activation` on the lot at creation time from the wallet's active constitution's `activated_at`
-- [ ] Enforce decision 1 precisely: a close is loss-limit-eligible only if **every** lot it consumes was opened after activation; if a close consumes a mix of pre- and post-activation lots, exclude it entirely from the loss sum (documented as the "partial coverage" behavior, not split/prorated — simpler and honestly conservative)
-- [ ] Add `rolling_loss_usd` to `evaluateTrade()`
-- [ ] Wire lot-matching into `reconcile-wallet.ts`, strictly ordered
-- [ ] Extend authoring UI and status page with the loss limit and its disclaimer copy
-- [ ] Kill switch: `rules.loss_limit_enabled`, independent of the tier/notional flags, so loss evaluation can be disabled on its own if the matching logic needs to be paused without affecting the other two limit types
+- [x] Migration: `position_lots`, `trades` loss columns
+- [x] Implement FIFO lot-matching: on each acquisition, open/append a lot; on each disposal, consume the oldest lot(s) first, compute realized P&L per matched unit; tag `opened_after_activation` on the lot at creation time from the wallet's active constitution's `activated_at`
+- [x] Enforce decision 1 precisely: a close is loss-limit-eligible only if **every** lot it consumes was opened after activation; if a close consumes a mix of pre- and post-activation lots, exclude it entirely from the loss sum (documented as the "partial coverage" behavior, not split/prorated — simpler and honestly conservative)
+- [x] Add `rolling_loss_usd` to `evaluateTrade()`
+- [x] Wire lot-matching into `reconcile-wallet.ts`, strictly ordered
+- [x] Extend authoring UI and status page with the loss limit and its disclaimer copy
+- [x] Kill switch: `rules.loss_limit_enabled`, independent of the tier/notional flags, so loss evaluation can be disabled on its own if the matching logic needs to be paused without affecting the other two limit types
 
 **Tests:**
 
@@ -487,20 +487,40 @@ Thresholds live in one named exported constant so they are tunable without touch
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] Manual: activate a loss-limit constitution, execute a real small round-trip at a loss on-chain, confirm it's counted; confirm a pre-existing position closed at a loss is *not* counted and the UI explains why
+- [x] `pnpm test` passes
+- [~] Manual (**deferred to Phase 7**): activate a loss-limit constitution, execute a real small round-trip at a loss on-chain, confirm it's counted; confirm a pre-existing position closed at a loss is *not* counted and the UI explains why.
+
+  **Why deferred:** same reason as Phase 5's — Phase 0 has no swap UI, so a live round-trip today means trading on Jupiter directly, waiting for reconcile, and reading realized P&L out of the database. Phase 7's dashboard makes these outcomes directly observable; the consolidated real-swap pass runs there, covering Phases 5 and 6 together (see Phase 7's Verification). Accepted risk: FIFO matching and the activation-boundary rule stay unexercised against live chain data until Phase 7 — mitigated by the unit tests scoped to `lot-matching.ts`.
+
+**Review follow-ups (what shipped beyond the original file list):**
+
+Three code-review rounds; the FIFO arithmetic itself was correct from round 1, but pre-existing-data and concurrency handling each needed a pass.
+
+| Commit | What it added |
+|---|---|
+| `099dcb0` | The phase as planned: `position_lots`, `lot-matching.ts`, `rolling_loss_usd`, reconcile wiring, authoring + status UI |
+| `4789d8c` | Fail-closed loss evaluation (`unevaluable('loss_matching_disabled')` when the flag is off, rather than summing `null` to `$0` and allowing); `rules.loss_limit_enabled` seeded, along with Phase 5's two unseeded flags; `wallets.lots_built_through_slot` + `backfillLotMatching` so enabling the flag rebuilds lot history instead of resuming mid-stream and leaving FIFO holes; `isQuoteMint` so SOL/LST/stablecoin legs never open or consume a lot |
+| `27ab245` | Migration 0011 resets `position_lots` and the `trades` loss columns before adding its NOT NULL columns (verified against a non-empty dev DB); composite `(lots_built_through_slot, lots_built_through_transaction_index)` watermark re-read inside the `FOR UPDATE` lock so concurrent runs can't double-open lots; tuple-comparison boundary in `loadUnmatchedTrades`; reconcile-level integration tests with the flag on |
+
+Accepted deviations from the plan's letter, confirmed by review: decision 1 requires both the lot's open **and** the disposal to be post-activation; `realized_loss_usd` collapses three distinct not-eligible cases to `null`; lot-matching runs over baseline trades too (correctness requires it); `constitution-panel.tsx`, `rolling-allowance.ts`, `packages/rules/src/index.ts` and the reconcile test were touched as necessary co-files.
+
+**Carried forward (not blocking, do not fix in this phase):**
+
+- Add a reason column distinguishing the three `realized_loss_usd IS NULL` cases before Phase 9's metrics need to tell them apart.
+- `reconcile-wallet.ts` `?? -1` on a NULL `lots_built_through_transaction_index`: unreachable today (0012 adds the column nullable but nothing populates a slot without an index), would re-process one slot if it ever occurred. Recommended fix if it becomes reachable: `UPDATE wallets SET lots_built_through_transaction_index = 2147483647 WHERE lots_built_through_slot IS NOT NULL;`
+- No reconcile-level test where a disposal *consumes* a lot — the existing coverage only opens them. Unit tests in `lot-matching.test.ts` cover consumption.
 
 **Phase review:**
 
-- [ ] All Steps and Verification checkboxes above ticked in the plan file
+- [x] All Steps and Verification checkboxes above ticked in the plan file
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase (flag the decimal-math and activation-boundary logic for extra scrutiny)
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
-- [ ] Documentation updated
+- [x] Code-reviewer agent has verified this phase (flag the decimal-math and activation-boundary logic for extra scrutiny)
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Tests for this phase written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: FIFO lot-matching and the rolling loss limit`
+- [x] Changes committed: `feat: FIFO lot-matching and the rolling loss limit`
 - [ ] Phase marked complete
 
 ---
