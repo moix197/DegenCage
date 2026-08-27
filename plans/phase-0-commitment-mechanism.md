@@ -634,6 +634,15 @@ No additional automated tests for the page component's polling behavior itself �
 - Dedicated kill switch `CONSTITUTION_PENDING_CHANGE_APPLY_FLAG`; off means pending changes **stay pending** (fails in the strict direction).
 - Due scan is ordered by `effective_at` ascending and capped at 50 rows; stranded rows (flag off, or backlog beyond the cap) emit a structured warning rather than silently returning zero.
 
+**Scope addition — rate limiting on the edit surface** (orchestrator-approved, not in the original plan):
+The edit surface is where a user hammering "loosen my limits" shows up, and `pending-changes.ts` had no rate limit under either invocation pattern. Reused the existing `assertWithinConstitutionActionRateLimit` as an action gate.
+- **Throttling applies to loosening attempts only.** Decreases and cancel-pending are *never* throttled — both tighten (or revert a loosening), and throttling those would be hostile in the exact direction the product exists to encourage. This is structural, not conventional: neither `applyDecreaseImmediately` nor `cancelPendingChange` calls the limiter at all, asserted by tests that make the limiter reject every call and check it is never invoked.
+- **Fail-closed is asymmetric too:** a limiter outage rejects an increase, but cannot block a decrease or a cancel (those paths never reach it).
+- Throttle counts `constitution.limit_increase_attempted`, written before the pending-exists check can reject it — so repeated loosening attempts blocked by an existing pending row are still counted and visible to Phase 9's metrics.
+- Correlation id propagated through the Server Action error redirect and rendered (UUID-validated) with the message.
+
+**Decision docs:** `.ai/decisions/asymmetric-constitution-edits.md` (extended with the throttle asymmetry), `.ai/decisions/server-actions-for-constitution-edit.md` (why this page uses Server Actions rather than the codebase's API-route + client-fetch pattern).
+
 **Verification:**
 
 - [x] `pnpm test` passes
