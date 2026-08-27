@@ -6,8 +6,8 @@ import { recordEvent, type DatabaseExecutor } from '../../observability/events';
 import { logger } from '../../observability/logger';
 import { resolveSession } from '../auth/session';
 import { getDb } from '../db/client';
-import { constitutions, trades, wallets, type NewTradeRow } from '../db/schema';
-import { classifyTokens } from './classify-token';
+import { constitutions, trades, wallets, type NewTradeRow, type TokenClassificationQuality } from '../db/schema';
+import { classifyTokens, type TokenClassification } from './classify-token';
 import { deriveSwapFromTransaction, type DerivedSwap } from './derive-swaps';
 import { getTransactionsForAddress, type HeliusTransaction } from './helius-client';
 import { priceTrade } from '../pricing/price-trade';
@@ -133,7 +133,13 @@ async function failReconciliation(walletId: string, userId: string, correlationI
 function toNewTradeRow(
   walletId: string,
   swap: DerivedSwap,
-  priced: { usdValue: string | null; priceSource: string | null; acquiredTier: AssetTier | null; isAcquisition: boolean },
+  priced: {
+    usdValue: string | null;
+    priceSource: string | null;
+    acquiredTier: AssetTier | null;
+    isAcquisition: boolean;
+    classification: TokenClassificationQuality | null;
+  },
   isBaseline: boolean,
 ): NewTradeRow {
   return {
@@ -152,6 +158,7 @@ function toNewTradeRow(
     excludedReason: swap.excludedReason,
     acquiredTier: priced.acquiredTier,
     isAcquisition: priced.isAcquisition,
+    classification: priced.classification,
   };
 }
 
@@ -163,6 +170,8 @@ interface PricedSwap {
   acquiredTier: AssetTier | null;
   /** `true` for every real (non-excluded) swap — see `trades.isAcquisition`'s schema comment. */
   isAcquisition: boolean;
+  /** Whether `acquiredTier` is a real mcap read or the fail-closed default; `null` for an excluded candidate. */
+  classification: TokenClassificationQuality | null;
 }
 
 /**
@@ -171,7 +180,7 @@ interface PricedSwap {
  * one per trade. Runs for baseline trades too: the status page shows a (clearly labeled,
  * non-contemporaneous) tier badge on backfilled history as well as live trades.
  */
-async function classifyBatch(batch: DerivedSwap[]): Promise<Map<string, { tier: AssetTier; classification: 'known' | 'unknown' }>> {
+async function classifyBatch(batch: DerivedSwap[]): Promise<Map<string, TokenClassification>> {
   const boughtMints = batch
     .filter((swap) => swap.excludedReason === null && swap.boughtMint !== null)
     .map((swap) => swap.boughtMint!);
@@ -192,7 +201,7 @@ async function priceBatch(batch: DerivedSwap[]): Promise<PricedSwap[]> {
 
   for (const swap of batch) {
     if (swap.excludedReason !== null) {
-      priced.push({ swap, usdValue: null, priceSource: null, acquiredTier: null, isAcquisition: false });
+      priced.push({ swap, usdValue: null, priceSource: null, acquiredTier: null, isAcquisition: false, classification: null });
       continue;
     }
 
@@ -208,9 +217,16 @@ async function priceBatch(batch: DerivedSwap[]): Promise<PricedSwap[]> {
 
     // `classifyTokens` returns an entry for every mint it was asked to classify — the
     // fallback here is defensive only, never expected to trigger.
-    const tier = classifications.get(swap.boughtMint!)?.tier ?? 'MICRO_CAP';
+    const classification = classifications.get(swap.boughtMint!) ?? { tier: 'MICRO_CAP' as const, classification: 'unknown' as const };
 
-    priced.push({ swap, usdValue: result.usdValue, priceSource: result.priceSource, acquiredTier: tier, isAcquisition: true });
+    priced.push({
+      swap,
+      usdValue: result.usdValue,
+      priceSource: result.priceSource,
+      acquiredTier: classification.tier,
+      isAcquisition: true,
+      classification: classification.classification,
+    });
   }
 
   return priced;
@@ -272,6 +288,20 @@ async function persistOneSwap(
 
     return { tradePersisted: false, excludedPersisted: true };
   }
+
+  // Structured audit trail for the classification decision itself (decision 7/17): the tier
+  // alone can't be told apart from the fail-closed default without `classification` riding
+  // alongside it, on every real live trade, regardless of whether a constitution exists yet.
+  await recordEvent(
+    {
+      eventType: 'trade.classified',
+      occurredAt: swap.occurredAt,
+      correlationId,
+      userId,
+      payload: { signature: swap.signature, boughtMint: swap.boughtMint, acquiredTier: priced.acquiredTier, classification: priced.classification },
+    },
+    tx,
+  );
 
   if (constitution) {
     const decision = evaluateTrade(constitution, windowedHistory, {

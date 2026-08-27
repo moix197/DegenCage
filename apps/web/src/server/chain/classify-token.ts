@@ -2,6 +2,7 @@ import type { AssetTier } from '@degencage/rules';
 
 import { captureError } from '../../observability/error-tracking';
 import { logger } from '../../observability/logger';
+import type { TokenClassificationQuality } from '../db/schema';
 import { isStablecoin } from './stablecoin-mints';
 import { lookupTokenMcaps } from './jupiter-tokens';
 
@@ -30,7 +31,7 @@ export const ASSET_TIER_MCAP_THRESHOLDS_USD = {
 export interface TokenClassification {
   tier: AssetTier;
   /** `unknown` whenever the tier was assigned by the fail-closed default rather than a real mcap read. */
-  classification: 'known' | 'unknown';
+  classification: TokenClassificationQuality;
 }
 
 const MICRO_CAP_UNKNOWN: TokenClassification = { tier: 'MICRO_CAP', classification: 'unknown' };

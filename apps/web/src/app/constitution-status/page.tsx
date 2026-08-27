@@ -4,7 +4,7 @@ import { compareUsd, migrateConstitution, sumTradeUsd, type AssetTier } from '@d
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { getDb } from '@/server/db/client';
-import { constitutions, trades, wallets } from '@/server/db/schema';
+import { constitutions, trades, wallets, type TokenClassificationQuality } from '@/server/db/schema';
 import { isFeatureEnabled } from '@/server/flags/feature-flags';
 import { computeRollingAllowance, loadWindowedTrades } from '@/server/rules/rolling-allowance';
 import { captureError } from '@/observability/error-tracking';
@@ -23,6 +23,7 @@ interface TradeRowView {
   isBaseline: boolean;
   excludedReason: string | null;
   acquiredTier: AssetTier | null;
+  classification: TokenClassificationQuality | null;
 }
 
 async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
@@ -36,6 +37,7 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
       isBaseline: trades.isBaseline,
       excludedReason: trades.excludedReason,
       acquiredTier: trades.acquiredTier,
+      classification: trades.classification,
     })
     .from(trades)
     .where(eq(trades.walletId, walletId))
@@ -69,10 +71,15 @@ async function computeTierAllowance(walletId: string, limit: { tier: AssetTier; 
   };
 }
 
-/** `[MICRO_CAP]`, except the fail-closed default is called out by name — success criteria requires an unlisted/unpriceable token to be "visibly tagged", and `MICRO_CAP` alone doesn't say whether that's a real reading or the fallback. */
-function formatTierBadge(tier: AssetTier | null): string | null {
+/**
+ * `[MICRO_CAP]`, except the fail-closed default is called out by name — success criteria
+ * requires an unlisted/unpriceable token to be "visibly tagged". Gated on `classification`,
+ * not on `tier === 'MICRO_CAP'` alone: a genuine sub-$10M mcap read is also `MICRO_CAP`, and
+ * tagging it "counted as micro cap" would misrepresent a real reading as the fallback.
+ */
+function formatTierBadge(tier: AssetTier | null, classification: TokenClassificationQuality | null): string | null {
   if (tier === null) return null;
-  return tier === 'MICRO_CAP' ? 'MICRO_CAP — counted as micro cap' : tier;
+  return classification === 'unknown' ? `${tier} — counted as micro cap` : tier;
 }
 
 async function loadReconciliationState(walletId: string): Promise<string | null> {
@@ -231,7 +238,7 @@ export default async function ConstitutionStatusPage() {
                   {trade.acquiredTier ? (
                     <span>
                       {' '}
-                      [{formatTierBadge(trade.acquiredTier)}
+                      [{formatTierBadge(trade.acquiredTier, trade.classification)}
                       {trade.isBaseline ? ', backfilled at today’s mcap — not a contemporaneous judgement' : ''}]
                     </span>
                   ) : null}

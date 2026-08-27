@@ -64,6 +64,13 @@
       "when": 1787791783734,
       "tag": "0008_burly_the_leader",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1787793013558,
+      "tag": "0009_useful_living_lightning",
+      "breakpoints": true
     }
   ]
 }

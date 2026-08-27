@@ -231,6 +231,9 @@ export const constitutions = pgTable(
 
 export type ConstitutionRow = typeof constitutions.$inferSelect;
 
+/** Whether a classification came from a real Jupiter mcap read or the fail-closed default. */
+export type TokenClassificationQuality = 'known' | 'unknown';
+
 /**
  * One derived on-chain swap, from `server/chain/reconcile-wallet.ts`. `signature` is
  * unique so `INSERT ... ON CONFLICT (signature) DO NOTHING` makes re-running reconciliation
@@ -294,6 +297,15 @@ export const trades = pgTable(
     acquiredTier: text('acquired_tier').$type<AssetTier>(),
     /** `true` for every real (non-excluded) trade; `false` for an excluded candidate. */
     isAcquisition: boolean('is_acquisition').notNull().default(false),
+    /**
+     * Whether `acquired_tier` came from a real Jupiter mcap read (`known`) or the
+     * fail-closed default (`unknown` — unlisted mint, missing/null `mcap`, or the
+     * `classification.jupiter_mcap` flag off). Without this column a `MICRO_CAP` badge
+     * cannot be told apart from a genuine sub-$10M read, which the audit trail (decision 17)
+     * and the status page's "counted as micro cap" tag both need to distinguish. `null` for
+     * an excluded candidate, same as `acquired_tier`.
+     */
+    classification: text('classification').$type<TokenClassificationQuality>(),
   },
   (table) => [
     // The rolling-window sum's predicate: one wallet's live trades in a time range.

@@ -28,6 +28,51 @@ function requireApiKey(): string {
   return key;
 }
 
+/**
+ * Converts a raw JSON number to a plain fixed-notation decimal string — never exponential.
+ * `Number.prototype.toString()` switches to exponential notation below 1e-6 (and above
+ * 1e21), and `price-trade.ts`'s `multiplyUsd`/`baseUnitsToDecimalString` feed this string
+ * straight into `BigInt(...)`, which throws on an exponent (`BigInt('12345e-7')`). Sub-1e-6
+ * prices are exactly what the long-tail MICRO_CAP mints this fallback targets tend to have,
+ * so this conversion is load-bearing, not defensive.
+ *
+ * `null` for non-finite input (`NaN`/`Infinity`) — fails closed exactly like every other
+ * unresolvable price in this module, never a guessed number.
+ */
+function toFixedDecimalString(value: number): string | null {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  const raw = value.toString();
+  const exponentIndex = raw.search(/e/i);
+
+  if (exponentIndex === -1) {
+    return raw;
+  }
+
+  const mantissa = raw.slice(0, exponentIndex);
+  const exponent = Number.parseInt(raw.slice(exponentIndex + 1), 10);
+  const negative = mantissa.startsWith('-');
+  const [intPart = '', fracPart = ''] = (negative ? mantissa.slice(1) : mantissa).split('.');
+  const digits = intPart + fracPart;
+  // Where the decimal point lands once `digits` is shifted by `exponent` places, measured
+  // from the point's original position right after `intPart`.
+  const pointIndex = intPart.length + exponent;
+
+  let magnitude: string;
+
+  if (pointIndex <= 0) {
+    magnitude = `0.${'0'.repeat(-pointIndex)}${digits}`;
+  } else if (pointIndex >= digits.length) {
+    magnitude = digits + '0'.repeat(pointIndex - digits.length);
+  } else {
+    magnitude = `${digits.slice(0, pointIndex)}.${digits.slice(pointIndex)}`;
+  }
+
+  return negative ? `-${magnitude}` : magnitude;
+}
+
 interface BirdeyeHistoricalPriceResponse {
   data?: { value?: number } | null;
 }
@@ -51,7 +96,7 @@ async function fetchHistoricalPrice(mint: string, unixSeconds: number): Promise<
     const json = (await response.json()) as BirdeyeHistoricalPriceResponse;
     const value = json.data?.value;
 
-    return typeof value === 'number' ? value.toString() : null;
+    return typeof value === 'number' ? toFixedDecimalString(value) : null;
   } catch (error) {
     captureError(error, { operation: 'fetchHistoricalPrice', mint, failedClosed: true });
     return null;
