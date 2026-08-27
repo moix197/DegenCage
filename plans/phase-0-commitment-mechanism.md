@@ -697,11 +697,11 @@ This phase is the plan's second key decision made concrete: the event set define
 
 **Steps:**
 
-- [ ] Implement each query in `metrics/queries.ts` directly against the event log (no precomputed/incremented counters, per the derive-not-increment invariant)
-- [ ] Implement the baseline-vs-post-activation violation comparison by running `evaluateTrade` against baseline trades ad hoc, purely for this internal metric — explicitly not stored as `rule.decision_recorded` events and never shown to the user (decision 9)
-- [ ] Implement the admin route's shared-secret gate; fail closed (404, not a 403 that confirms the route exists) on missing/wrong secret
-- [ ] Implement the feedback prompt + submission, surfaced at a natural moment (post-activation, or after a violation is shown), with an explicit max length on submitted text
-- [ ] Render the metrics page
+- [x] Implement each query in `metrics/queries.ts` directly against the event log (no precomputed/incremented counters, per the derive-not-increment invariant)
+- [x] Implement the baseline-vs-post-activation violation comparison by running `evaluateTrade` against baseline trades ad hoc, purely for this internal metric — explicitly not stored as `rule.decision_recorded` events and never shown to the user (decision 9)
+- [x] Implement the admin route's shared-secret gate; fail closed (404, not a 403 that confirms the route exists) on missing/wrong secret
+- [x] Implement the feedback prompt + submission, surfaced at a natural moment (post-activation, or after a violation is shown), with an explicit max length on submitted text
+- [x] Render the metrics page
 
 **Tests:**
 
@@ -710,9 +710,17 @@ This phase is the plan's second key decision made concrete: the event set define
 | create | `apps/web/src/server/metrics/queries.test.ts` | each query against a seeded fixture event set produces the expected number (one test per row in the mapping table) |
 | create | `apps/web/src/app/api/admin/metrics/route.test.ts` | missing/wrong secret → 404; correct secret → 200 with expected shape |
 
+**Post-review additions** (two reviewers — code review + security audit — both returned red on the first commit; recorded here because they changed the phase's shape):
+- **The admin surface was fully unauthenticated.** `/admin/metrics/page.tsx` is a Server Component that called `buildMetricsSnapshot()` directly, so the API route's shared-secret header protected nothing: any visitor to the URL got per-user ids, per-user violation rates, the private 90-day baseline counterfactual, and verbatim feedback quotes. Fixed with a signed httpOnly cookie (`server/admin/access.ts`, HMAC-SHA256 over the whole payload, signed+enforced expiry, constant-time compare), issued by `POST /api/admin/login`, checked before any query runs. Added `/api/admin/logout` (CSRF-safe). All methods on `/api/admin/metrics` now return an indistinguishable 404 — the original empty-body 404 was distinguishable from Next's default, and `POST` auto-returned 405 with `Allow: GET`.
+- **The baseline counterfactual was systematically biased in the product's favour.** It forced `lossLimitEnabled: true`, but baseline trades always have `realizedLossUsd = null`, so baseline could never register a loss-limit violation while live could. `rolling_loss_usd` is now excluded from *both* sides. The other two limit types were checked for the same latent class and are evaluable on both sides. Baseline and live denominators were also mismatched (first→last trade span vs calendar weeks since activation); both now use the fixed 90-day window.
+- **Login throttle.** Gating the page behind a login replaced a hidden surface with a public brute-force oracle, so `POST /api/admin/login` is throttled (5 attempts / 15 min per client key) atomically via `pg_advisory_xact_lock`, with a reaper for `admin_login_attempts`. Note: what actually makes online guessing infeasible is the enforced 32-char `MIN_ADMIN_SECRET_LENGTH` (length, not entropy — `"a"*32` passes); the throttle is defense-in-depth.
+- **Known limitation:** the client key trusts the platform-set `x-vercel-forwarded-for`. On any non-Vercel host the fallback accepts caller-supplied `x-forwarded-for` and the throttle becomes decorative. `next.config.ts` already ships `output: 'standalone'`, so **re-audit the client key before any non-Vercel deploy.**
+- **Methodological seam, surfaced in the UI:** baseline is evaluated against today's constitution while live uses historical limits. Baseline `unevaluable`/unpriced counts and baseline-window age are now displayed so the headline number can be read correctly.
+- Extra metric added beyond the plan's mapping table: repeated-loosening-attempts, from the Phase 8 events (`limit_increase_attempted`, `_voided`, `edit_rate_limited`) that postdate this plan. Every row in the plan's own mapping table was writable — no earlier phase's event set was found missing.
+
 **Verification:**
 
-- [ ] `pnpm test` passes
+- [x] `pnpm test` passes
 - [ ] Manual: seed a fixture dataset spanning baseline + post-activation trades across 2+ users, hit `/admin/metrics` with the correct secret, sanity-check every number against hand-computed expectations
 
 **Phase review:**
@@ -720,12 +728,12 @@ This phase is the plan's second key decision made concrete: the event set define
 - [ ] All Steps and Verification checkboxes above ticked in the plan file
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
-- [ ] Documentation updated
+- [x] Code-reviewer agent has verified this phase
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Tests for this phase written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: internal metrics view for Phase 0 success signals`
+- [x] Changes committed: `feat: internal metrics view for Phase 0 success signals`
 - [ ] Phase marked complete
 
 ---
