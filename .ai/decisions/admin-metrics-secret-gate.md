@@ -1,5 +1,12 @@
 # Admin metrics: shared-secret header + cookie, 404 not 403 everywhere
 
+> **This whole mechanism is provisional and frozen.** Everything below describes what exists
+> and why, and it is all still true — but it is closed to further development and will be
+> replaced by a maintained auth library. Read
+> [admin-auth-is-provisional](admin-auth-is-provisional.md) before extending anything here;
+> in particular it supersedes the "extend `server/admin/access.ts` rather than copying it"
+> constraint at the bottom of this doc as the forward guidance.
+
 **Decision:** Every surface under `/admin` and `/api/admin/metrics` is gated by
 `ADMIN_METRICS_SECRET`, in two forms sharing one comparison primitive
 (`server/admin/access.ts`'s `secretsMatch`, `createAdminSessionCookieValue`,
