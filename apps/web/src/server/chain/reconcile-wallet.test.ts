@@ -1,7 +1,9 @@
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ReconcileRejected, reconcileWallet } from './reconcile-wallet';
+import { isQuoteMint, needsLotBackfill, ReconcileRejected, reconcileWallet } from './reconcile-wallet';
+import { WSOL_MINT } from './lst-allowlist';
+import { STABLECOIN_MINTS } from './stablecoin-mints';
 
 const {
   resolveSessionMock,
@@ -85,10 +87,20 @@ interface WalletFixture {
   reconciledThroughSlot: number | null;
   reconciliationState: string;
   baselineCompletedAt: Date | null;
+  // `rules.loss_limit_enabled` always resolves `false` in this file (see `activeConstitutionRow`'s
+  // sibling comment on `selectMock`'s no-projection branch) so `backfillLotMatching` never
+  // actually runs here — `null` throughout is fine; `needsLotBackfill` has its own direct
+  // unit tests above.
+  lotsBuiltThroughSlot: number | null;
 }
 
-const NEVER_RECONCILED: WalletFixture = { reconciledThroughSlot: null, reconciliationState: 'never', baselineCompletedAt: null };
-const ALREADY_BASELINED: WalletFixture = { reconciledThroughSlot: 50, reconciliationState: 'current', baselineCompletedAt: new Date('2026-08-01T00:00:00Z') };
+const NEVER_RECONCILED: WalletFixture = { reconciledThroughSlot: null, reconciliationState: 'never', baselineCompletedAt: null, lotsBuiltThroughSlot: null };
+const ALREADY_BASELINED: WalletFixture = {
+  reconciledThroughSlot: 50,
+  reconciliationState: 'current',
+  baselineCompletedAt: new Date('2026-08-01T00:00:00Z'),
+  lotsBuiltThroughSlot: null,
+};
 
 /**
  * A shared, mutable fake `wallets` row plus a signature-deduplicating `trades` table —
@@ -117,7 +129,13 @@ function fakeDatabase(
       where: () => ({
         limit: async () =>
           projection
-            ? [{ reconciledThroughSlot: wallet.reconciledThroughSlot, baselineCompletedAt: wallet.baselineCompletedAt }]
+            ? [
+                {
+                  reconciledThroughSlot: wallet.reconciledThroughSlot,
+                  baselineCompletedAt: wallet.baselineCompletedAt,
+                  lotsBuiltThroughSlot: wallet.lotsBuiltThroughSlot,
+                },
+              ]
             : hasActiveConstitution
               ? [activeConstitutionRow()]
               : [],
@@ -202,6 +220,47 @@ beforeEach(() => {
   deriveSwapFromTransactionMock.mockImplementation((tx: { transaction: { signatures: string[] }; slot: number }) =>
     derivedSwap(tx.transaction.signatures[0]!, tx.slot),
   );
+});
+
+// `needsLotBackfill` is a pure predicate — no DB, no mocks — over `wallets.lots_built_through_slot`
+// vs. `reconciled_through_slot`. It is the gap-detection at the heart of BLOCKING 2's fix: a
+// wallet whose `rules.loss_limit_enabled` flag was off while trades kept reconciling must have
+// its FIFO lot history backfilled from the correct point when the flag is later turned on,
+// never resumed mid-stream (which would silently corrupt later disposals' FIFO order).
+describe('needsLotBackfill', () => {
+  it('needs a backfill when lots have never been built at all', () => {
+    expect(needsLotBackfill(null, 100)).toBe(true);
+  });
+
+  it('needs a backfill when the lots watermark trails the reconciled cursor — the flag-was-off gap', () => {
+    expect(needsLotBackfill(50, 100)).toBe(true);
+  });
+
+  it('needs no backfill once the lots watermark has caught up to the reconciled cursor', () => {
+    expect(needsLotBackfill(100, 100)).toBe(false);
+  });
+
+  it('needs no backfill when the lots watermark is already ahead (a concurrent run advanced it)', () => {
+    expect(needsLotBackfill(150, 100)).toBe(false);
+  });
+});
+
+// The predicate that keeps `computeLotMatch` from opening a SOL/stablecoin "position" for the
+// quote leg of a swap — without it, a TOKEN→SOL or TOKEN→USDC trade would track SOL/USDC
+// itself as a round trip and inflate the realized-loss figure with the quote leg's own price
+// movement, not the trader's actual bet.
+describe('isQuoteMint', () => {
+  it('is true for wrapped SOL', () => {
+    expect(isQuoteMint(WSOL_MINT)).toBe(true);
+  });
+
+  it('is true for a curated stablecoin', () => {
+    expect(isQuoteMint([...STABLECOIN_MINTS][0]!)).toBe(true);
+  });
+
+  it('is false for an ordinary token mint', () => {
+    expect(isQuoteMint('BONK1111111111111111111111111111111111111')).toBe(false);
+  });
 });
 
 describe('reconcileWallet', () => {

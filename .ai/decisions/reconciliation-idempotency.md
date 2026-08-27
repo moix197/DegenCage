@@ -2,7 +2,7 @@
 
 **Decision:** `apps/web/src/server/chain/reconcile-wallet.ts` is idempotent and
 concurrency-safe by construction, enforced by the **database**, not by application
-bookkeeping. Five invariants carry that, and Phases 5 and 6 add columns and rule types on
+bookkeeping. Six invariants carry that, and later phases add columns and rule types on
 top of them rather than re-deciding them.
 
 1. **Dedup key is `(wallet_id, signature)`, not `signature`.** Unique index +
@@ -18,6 +18,18 @@ top of them rather than re-deciding them.
 5. **`wallets.baseline_completed_at` — not `reconciliation_state` — decides "is this the
    baseline pull".** Written exactly once, only on a successful baseline run, and for the
    final batch it rides inside that batch's own cursor `UPDATE`.
+6. **`wallets.lots_built_through_slot` (Phase 6) is a second cursor for FIFO lot-matching
+   (`lot-matching.ts`), independent of `reconciled_through_slot` and never assumed to equal
+   it.** `rules.loss_limit_enabled` can be off while `reconciled_through_slot` keeps
+   advancing; a trade persisted during that window is deduplicated by (1) forever and a
+   normal re-run never revisits it, so it would simply never reach `position_lots`, leaving a
+   permanent hole in FIFO order. `reconcileWallet()` detects the gap
+   (`needsLotBackfill(lotsBuiltThroughSlot, reconciledThroughSlot)`, a pure predicate with its
+   own unit tests) and backfills exactly the missing range **from `trades`, not Helius** — in
+   the same true chronological order (`slot`, then `transaction_index`) live matching uses —
+   before any new trade in the current run is matched against `position_lots`. Only advances
+   when `rules.loss_limit_enabled` is actually on for the run doing the advancing, or the
+   cursor itself would falsely certify trades as lot-matched that were skipped.
 
 **Why:**
 
@@ -43,6 +55,18 @@ failed first run. Folding it into the final batch's `UPDATE` closes the same hol
 narrower: a crash between "cursor advanced" and "baseline marked" would have re-tagged
 genuinely live trades as baseline.
 
+(6) is Phase 6's own version of the same class of bug, caught in code review before it ever
+shipped live: a kill switch that gates *matching* but not *reconciliation* creates exactly
+the kind of gap (5) exists to prevent, just one column over. If `lots_built_through_slot`
+simply tracked `reconciled_through_slot` (or was inferred from it), flipping
+`rules.loss_limit_enabled` off then back on would silently resume matching mid-stream —
+every disposal after the gap would draw down whichever lot *happens* to still be in
+`position_lots` (usually a newer, wrongly-eligible one) instead of the true oldest lot sitting
+unmatched in the gap, misclassifying an ineligible close as eligible with no error, no failed
+test, and no visible symptom short of an audited-after-the-fact wrong number. A second,
+independently-advanced cursor plus a from-`trades` backfill is the only shape that makes
+"caught up" and "has a gap" both honestly answerable.
+
 **Rejected:**
 
 - **A global unique index on `signature`** — a signature is unique per *transaction*, and one
@@ -54,6 +78,8 @@ genuinely live trades as baseline.
   backfill.
 - **Deriving `is_baseline` from `reconciliation_state` or from `reconciled_through_slot`** —
   see above; both misclassify a retried first connect.
+- **Resuming lot-matching mid-stream off `reconciled_through_slot` when `rules.loss_limit_enabled`
+  flips on** — see (6); the gap is silent and the corruption is in money math, not a crash.
 
 **Constraints it creates:**
 
@@ -71,3 +97,14 @@ genuinely live trades as baseline.
   pull as baseline.
 - Wallet identity comes from `resolveSession()` only; no function in this pipeline accepts a
   caller-supplied wallet id.
+- Lot-matching runs for *baseline* trades too, not only live ones — the mechanism behind
+  decision 1's "opened and closed after activation": a live disposal years later can only
+  tell a baseline-era acquisition apart from a post-activation one if the baseline
+  acquisition was itself recorded as a lot. Baseline lots are still never surfaced as an
+  event (same privacy rule as everything else in this file); only `position_lots` itself and
+  `trades.is_round_trip_close`/`realized_loss_usd` are written for them.
+- FIFO lot ordering is `slot`, then `transaction_index` — never `opened_at`/`occurred_at`
+  alone, whose second-granularity `blockTime` cannot break a same-second tie.
+- The quote leg of a swap (SOL, an LST, or a stablecoin — `isQuoteMint`) never opens or
+  consumes a lot: a TOKEN→SOL swap tracks only TOKEN, or the realized-loss figure would be
+  inflated by the quote currency's own price movement, not the trader's actual bet.

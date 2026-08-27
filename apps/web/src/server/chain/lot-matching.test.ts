@@ -10,6 +10,8 @@ function lot(overrides: Partial<PositionLot> = {}): PositionLot {
     mint: 'BONK',
     openedAt: OPENED_AT,
     openedAfterActivation: true,
+    slot: 100,
+    transactionIndex: 0,
     remainingBaseUnits: 1_000n,
     costBasisUsd: '100.000000000000',
     ...overrides,
@@ -18,19 +20,32 @@ function lot(overrides: Partial<PositionLot> = {}): PositionLot {
 
 describe('openLot', () => {
   it('opens a lot with the full acquired base units as its remaining balance and cost basis', () => {
-    const opened = openLot({ mint: 'BONK', baseUnits: 500_000n, costBasisUsd: '42.5', openedAt: OPENED_AT, openedAfterActivation: true });
+    const opened = openLot({
+      mint: 'BONK',
+      baseUnits: 500_000n,
+      costBasisUsd: '42.5',
+      openedAt: OPENED_AT,
+      openedAfterActivation: true,
+      slot: 100,
+      transactionIndex: 3,
+    });
 
     expect(opened).toEqual({
       mint: 'BONK',
       openedAt: OPENED_AT,
       openedAfterActivation: true,
+      slot: 100,
+      transactionIndex: 3,
       remainingBaseUnits: 500_000n,
       costBasisUsd: '42.5',
     });
   });
 
   it('carries a null cost basis through from an unpriced opening trade — never coerced to 0', () => {
-    expect(openLot({ mint: 'BONK', baseUnits: 1n, costBasisUsd: null, openedAt: OPENED_AT, openedAfterActivation: true }).costBasisUsd).toBeNull();
+    expect(
+      openLot({ mint: 'BONK', baseUnits: 1n, costBasisUsd: null, openedAt: OPENED_AT, openedAfterActivation: true, slot: 1, transactionIndex: 0 })
+        .costBasisUsd,
+    ).toBeNull();
   });
 });
 

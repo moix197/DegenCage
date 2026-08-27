@@ -1,5 +1,5 @@
 import { evaluateTrade, migrateConstitution, type AssetTier, type Constitution } from '@degencage/rules';
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, isNull, lte, sql } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
 import { recordEvent, type DatabaseExecutor } from '../../observability/events';
@@ -15,12 +15,15 @@ import {
   type NewTradeRow,
   type PositionLotRow,
   type TokenClassificationQuality,
+  type TradeRow,
 } from '../db/schema';
 import { isFeatureEnabled } from '../flags/feature-flags';
 import { classifyTokens, type TokenClassification } from './classify-token';
 import { deriveSwapFromTransaction, type DerivedSwap } from './derive-swaps';
 import { getTransactionsForAddress, type HeliusTransaction } from './helius-client';
 import { matchDisposal, openLot, type DisposalMatchResult, type PositionLot } from './lot-matching';
+import { isSolOrLstMint } from './lst-allowlist';
+import { isStablecoin } from './stablecoin-mints';
 import { priceTrade } from '../pricing/price-trade';
 import { loadWindowedTrades } from '../rules/rolling-allowance';
 
@@ -86,6 +89,8 @@ function chunk<T>(items: T[], size: number): T[][] {
 interface WalletReconciliationInfo {
   reconciledThroughSlot: number | null;
   baselineCompletedAt: Date | null;
+  /** See the schema comment on `wallets.lots_built_through_slot` — `backfillLotMatching`'s starting point. */
+  lotsBuiltThroughSlot: number | null;
 }
 
 /**
@@ -98,7 +103,11 @@ interface WalletReconciliationInfo {
  */
 async function loadWalletReconciliationInfo(walletId: string): Promise<WalletReconciliationInfo> {
   const rows = await getDb()
-    .select({ reconciledThroughSlot: wallets.reconciledThroughSlot, baselineCompletedAt: wallets.baselineCompletedAt })
+    .select({
+      reconciledThroughSlot: wallets.reconciledThroughSlot,
+      baselineCompletedAt: wallets.baselineCompletedAt,
+      lotsBuiltThroughSlot: wallets.lotsBuiltThroughSlot,
+    })
     .from(wallets)
     .where(eq(wallets.id, walletId))
     .limit(1);
@@ -207,63 +216,100 @@ function toPositionLot(row: PositionLotRow): PositionLot {
     mint: row.mint,
     openedAt: row.openedAt,
     openedAfterActivation: row.openedAfterActivation,
+    slot: row.slot,
+    transactionIndex: row.transactionIndex,
     remainingBaseUnits: BigInt(row.remainingBaseUnits),
     costBasisUsd: row.costBasisUsd,
   };
 }
 
 /**
- * This wallet's still-open lots for one mint, oldest first — the FIFO order `matchDisposal`
- * requires. Exhausted lots (`remaining_base_units: 0`) are filtered out in application code
- * rather than a SQL predicate, matching `remaining_base_units`'s `text` convention (see the
- * schema comment on `position_lots`) — lot counts per mint are small in Phase 0's scope.
+ * This wallet's still-open lots for one mint, in true chronological order (`slot`, then
+ * `transaction_index` — see the schema comment on `position_lots` for why `opened_at` alone
+ * cannot break a same-second tie). Exhausted lots (`remaining_base_units: 0`) are filtered
+ * out in application code rather than a SQL predicate, matching `remaining_base_units`'s
+ * `text` convention — lot counts per mint are small in Phase 0's scope.
  */
 async function loadOpenLots(tx: DatabaseExecutor, walletId: string, mint: string): Promise<PositionLot[]> {
   const rows = await tx
     .select()
     .from(positionLots)
     .where(and(eq(positionLots.walletId, walletId), eq(positionLots.mint, mint)))
-    .orderBy(asc(positionLots.openedAt));
+    .orderBy(asc(positionLots.slot), asc(positionLots.transactionIndex));
 
   return rows.map(toPositionLot).filter((lot) => lot.remainingBaseUnits > 0n);
+}
+
+/**
+ * SOL, an LST, or a stablecoin — the quote currency, not a "position" whose loss/gain this
+ * module tracks. Reuses the same curated lists `derive-swaps.ts`/`classify-token.ts` already
+ * maintain rather than a third copy. Exported and unit-tested directly
+ * (`reconcile-wallet.test.ts`) — this is the exact predicate that keeps a TOKEN→SOL or
+ * TOKEN→USDC swap from opening a SOL/USDC "position" and inflating the realized-loss figure
+ * with the quote leg's own price movement.
+ */
+export function isQuoteMint(mint: string): boolean {
+  return isSolOrLstMint(mint) || isStablecoin(mint);
+}
+
+function emptyDisposal(): DisposalMatchResult {
+  return { consumptions: [], updatedLots: [], isRoundTripClose: false, unmatchedBaseUnits: 0n, realizedLossUsd: null };
+}
+
+interface LotMatchInput {
+  soldMint: string;
+  boughtMint: string;
+  soldAmountBaseUnits: string;
+  boughtAmountBaseUnits: string;
+  occurredAt: Date;
+  usdValue: string | null;
+  slot: number;
+  transactionIndex: number;
 }
 
 interface LotMatchResult {
   /** Whether *this* trade — both its disposal and its acquisition leg share one `occurredAt` — falls after the wallet's active constitution's `activated_at`. Decision 1 requires both halves of a round trip after activation; this is that check for the trade currently being persisted. */
   tradeAfterActivation: boolean;
   disposal: DisposalMatchResult;
-  newLot: Omit<PositionLot, 'id'>;
+  /** `null` when `boughtMint` is a quote mint (`isQuoteMint`) — the quote leg of a swap is never itself a tracked position. */
+  newLot: Omit<PositionLot, 'id'> | null;
 }
 
 /**
- * Computes (but does not yet persist) this trade's FIFO lot effects: draws down `soldMint`'s
- * existing lots and opens a new `boughtMint` lot. Read-only against `position_lots` — the
- * caller applies the result via `applyLotMatch` only after confirming (via the trade insert's
- * `ON CONFLICT DO NOTHING` — the same idempotency gate every other side effect in
- * `persistOneSwap` uses) that this trade is genuinely new, so a re-run never double-matches.
+ * Computes (but does not yet persist) one trade's FIFO lot effects: draws down `soldMint`'s
+ * existing lots and opens a new `boughtMint` lot — skipping either half when that leg is the
+ * quote currency (`isQuoteMint`), so a TOKEN→SOL or TOKEN→USDC swap only ever tracks TOKEN,
+ * never inflates the loss figure with SOL/USDC "round trips". Read-only against
+ * `position_lots`.
+ *
+ * Reused by both the live pipeline (`persistOneSwap`, from a freshly-derived swap, applied
+ * only after confirming via the trade insert's idempotency gate that this trade is genuinely
+ * new) and `backfillLotMatchingBatch` (from an already-persisted `trades` row, when
+ * `rules.loss_limit_enabled` was off at the time and is only now being turned on).
  */
-async function computeLotMatch(
-  tx: DatabaseExecutor,
-  walletId: string,
-  swap: DerivedSwap,
-  usdValue: string | null,
-  activatedAt: Date | null,
-): Promise<LotMatchResult> {
-  const tradeAfterActivation = activatedAt !== null && swap.occurredAt.getTime() > activatedAt.getTime();
-  const openLots = await loadOpenLots(tx, walletId, swap.soldMint!);
-  const disposal = matchDisposal(openLots, BigInt(swap.soldAmountBaseUnits!), usdValue, tradeAfterActivation);
-  const newLot = openLot({
-    mint: swap.boughtMint!,
-    baseUnits: BigInt(swap.boughtAmountBaseUnits!),
-    costBasisUsd: usdValue,
-    openedAt: swap.occurredAt,
-    openedAfterActivation: tradeAfterActivation,
-  });
+async function computeLotMatch(tx: DatabaseExecutor, walletId: string, input: LotMatchInput, activatedAt: Date | null): Promise<LotMatchResult> {
+  const tradeAfterActivation = activatedAt !== null && input.occurredAt.getTime() > activatedAt.getTime();
+
+  const disposal = isQuoteMint(input.soldMint)
+    ? emptyDisposal()
+    : matchDisposal(await loadOpenLots(tx, walletId, input.soldMint), BigInt(input.soldAmountBaseUnits), input.usdValue, tradeAfterActivation);
+
+  const newLot = isQuoteMint(input.boughtMint)
+    ? null
+    : openLot({
+        mint: input.boughtMint,
+        baseUnits: BigInt(input.boughtAmountBaseUnits),
+        costBasisUsd: input.usdValue,
+        openedAt: input.occurredAt,
+        openedAfterActivation: tradeAfterActivation,
+        slot: input.slot,
+        transactionIndex: input.transactionIndex,
+      });
 
   return { tradeAfterActivation, disposal, newLot };
 }
 
-/** Persists a computed `LotMatchResult`: updates every consumed lot's remaining balance/cost basis, then opens the new lot. Only ever called once the owning trade row is confirmed newly inserted. */
+/** Persists a computed `LotMatchResult`: updates every consumed lot's remaining balance/cost basis, then opens the new lot (when there is one — see `LotMatchResult.newLot`). Only ever called once the owning trade row is confirmed newly inserted or being backfilled. */
 async function applyLotMatch(tx: DatabaseExecutor, walletId: string, match: LotMatchResult): Promise<void> {
   for (const consumption of match.disposal.consumptions) {
     const updated = match.disposal.updatedLots.find((candidate) => candidate.id === consumption.lot.id);
@@ -276,16 +322,36 @@ async function applyLotMatch(tx: DatabaseExecutor, walletId: string, match: LotM
       .where(eq(positionLots.id, updated.id));
   }
 
+  if (match.newLot === null) {
+    return;
+  }
+
   const newLotRow: NewPositionLotRow = {
     walletId,
     mint: match.newLot.mint,
     openedAt: match.newLot.openedAt,
     openedAfterActivation: match.newLot.openedAfterActivation,
+    slot: match.newLot.slot,
+    transactionIndex: match.newLot.transactionIndex,
     remainingBaseUnits: match.newLot.remainingBaseUnits.toString(),
     costBasisUsd: match.newLot.costBasisUsd,
   };
 
   await tx.insert(positionLots).values(newLotRow);
+}
+
+/** Shared payload shape for `trade.lot_matched` — used by both the live pipeline and the backfill path so the audit trail looks identical regardless of which one produced it. */
+function lotMatchedEventPayload(signature: string, soldMint: string | null, boughtMint: string | null, lotMatch: LotMatchResult) {
+  return {
+    signature,
+    soldMint,
+    boughtMint,
+    isRoundTripClose: lotMatch.disposal.isRoundTripClose,
+    realizedLossUsd: lotMatch.disposal.realizedLossUsd,
+    unmatchedBaseUnits: lotMatch.disposal.unmatchedBaseUnits.toString(),
+    consumedLotIds: lotMatch.disposal.consumptions.map((consumption) => consumption.lot.id),
+    openedAfterActivation: lotMatch.tradeAfterActivation,
+  };
 }
 
 interface PricedSwap {
@@ -394,7 +460,23 @@ async function persistOneSwap(
   // comment). Read-only at this point — nothing is written to `position_lots` until the
   // trade insert below confirms this is not an already-persisted re-run.
   const lotMatch =
-    isRealTrade && lossLimitEnabled ? await computeLotMatch(tx, walletId, swap, priced.usdValue, activatedAt) : null;
+    isRealTrade && lossLimitEnabled
+      ? await computeLotMatch(
+          tx,
+          walletId,
+          {
+            soldMint: swap.soldMint!,
+            boughtMint: swap.boughtMint!,
+            soldAmountBaseUnits: swap.soldAmountBaseUnits!,
+            boughtAmountBaseUnits: swap.boughtAmountBaseUnits!,
+            occurredAt: swap.occurredAt,
+            usdValue: priced.usdValue,
+            slot: swap.slot,
+            transactionIndex: swap.transactionIndex,
+          },
+          activatedAt,
+        )
+      : null;
 
   const inserted = await tx
     .insert(trades)
@@ -454,13 +536,7 @@ async function persistOneSwap(
         occurredAt: swap.occurredAt,
         correlationId,
         userId,
-        payload: {
-          signature: swap.signature,
-          mint: swap.boughtMint,
-          isRoundTripClose: lotMatch.disposal.isRoundTripClose,
-          realizedLossUsd: lotMatch.disposal.realizedLossUsd,
-          openedAfterActivation: lotMatch.tradeAfterActivation,
-        },
+        payload: lotMatchedEventPayload(swap.signature, swap.soldMint, swap.boughtMint, lotMatch),
       },
       tx,
     );
@@ -474,6 +550,7 @@ async function persistOneSwap(
       acquiredTier: priced.acquiredTier,
       isRoundTripClose: lotMatch?.disposal.isRoundTripClose ?? false,
       realizedLossUsd: lotMatch?.disposal.realizedLossUsd ?? null,
+      lossLimitEnabled,
     });
 
     await recordEvent(
@@ -538,17 +615,153 @@ async function persistBatch(
     // GREATEST, not a blind SET: a concurrent run's batch may have already advanced the
     // cursor past this batch's own highest slot, and the cursor must never move backward.
     // `baselineCompletedAt` (when present) rides in this same statement — same transaction,
-    // same UPDATE, so it is all-or-nothing with the cursor advance.
+    // same UPDATE, so it is all-or-nothing with the cursor advance. `lotsBuiltThroughSlot`
+    // rides along too, but *only* when `lossLimitEnabled` — advancing it while the flag is
+    // off would falsely claim these trades were lot-matched, hiding the exact gap
+    // `backfillLotMatching` exists to close later (see the schema comment on
+    // `wallets.lots_built_through_slot`).
     await tx
       .update(wallets)
       .set({
         reconciledThroughSlot: sql`GREATEST(COALESCE(${wallets.reconciledThroughSlot}, 0), ${highestSlot})`,
         ...(baselineCompletedAt ? { baselineCompletedAt } : {}),
+        ...(lossLimitEnabled ? { lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${highestSlot})` } : {}),
       })
       .where(eq(wallets.id, walletId));
 
     return { tradesPersisted, excludedPersisted, highestSlot };
   });
+}
+
+/**
+ * Already-persisted, real (non-excluded) trades for `walletId` strictly after `afterSlot`
+ * (exclusive — `null` means "the beginning") through `throughSlot` (inclusive), in true
+ * chronological order — the gap `backfillLotMatching` needs to catch up. Reads from `trades`
+ * itself, never Helius: these rows were already reconciled, only never lot-matched.
+ */
+async function loadUnmatchedTrades(walletId: string, afterSlot: number | null, throughSlot: number): Promise<TradeRow[]> {
+  const conditions = [eq(trades.walletId, walletId), isNull(trades.excludedReason), lte(trades.slot, throughSlot)];
+
+  if (afterSlot !== null) {
+    conditions.push(gt(trades.slot, afterSlot));
+  }
+
+  return getDb()
+    .select()
+    .from(trades)
+    .where(and(...conditions))
+    .orderBy(asc(trades.slot), asc(trades.transactionIndex));
+}
+
+/**
+ * Lot-matches one batch of already-persisted trades and advances `lots_built_through_slot`
+ * to the highest slot in the batch — its own row-locked transaction, same shape as
+ * `persistBatch`, so a long backfill never holds one lock for its whole duration.
+ */
+async function backfillLotMatchingBatch(walletId: string, userId: string, correlationId: string, activatedAt: Date | null, batch: TradeRow[]): Promise<void> {
+  await getDb().transaction(async (tx) => {
+    await tx.select().from(wallets).where(eq(wallets.id, walletId)).for('update').limit(1);
+
+    let highestSlot = 0;
+
+    for (const tradeRow of batch) {
+      highestSlot = Math.max(highestSlot, tradeRow.slot);
+
+      // `loadUnmatchedTrades` only ever selects real (non-excluded) trades, and a real trade
+      // always has both legs populated (see the `trades` schema comment) — the `!`s below
+      // are as safe as the equivalent ones in `persistOneSwap`.
+      const lotMatch = await computeLotMatch(
+        tx,
+        walletId,
+        {
+          soldMint: tradeRow.soldMint!,
+          boughtMint: tradeRow.boughtMint!,
+          soldAmountBaseUnits: tradeRow.soldAmountBaseUnits!,
+          boughtAmountBaseUnits: tradeRow.boughtAmountBaseUnits!,
+          occurredAt: tradeRow.occurredAt,
+          usdValue: tradeRow.usdValue,
+          slot: tradeRow.slot,
+          transactionIndex: tradeRow.transactionIndex,
+        },
+        activatedAt,
+      );
+
+      await applyLotMatch(tx, walletId, lotMatch);
+
+      await tx
+        .update(trades)
+        .set({ isRoundTripClose: lotMatch.disposal.isRoundTripClose, realizedLossUsd: lotMatch.disposal.realizedLossUsd })
+        .where(eq(trades.id, tradeRow.id));
+
+      // Baseline rows are a private behavioral record: no event, same as everywhere else.
+      if (!tradeRow.isBaseline) {
+        await recordEvent(
+          {
+            eventType: 'trade.lot_matched',
+            occurredAt: tradeRow.occurredAt,
+            correlationId,
+            userId,
+            payload: lotMatchedEventPayload(tradeRow.signature, tradeRow.soldMint, tradeRow.boughtMint, lotMatch),
+          },
+          tx,
+        );
+      }
+    }
+
+    await tx
+      .update(wallets)
+      .set({ lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${highestSlot})` })
+      .where(eq(wallets.id, walletId));
+  });
+}
+
+/**
+ * Pure gap-detection, exported and unit-tested directly (`reconcile-wallet.test.ts`) per
+ * `.ai/decisions/migration-and-test-tooling.md`'s "DB-touching modules are split into a pure
+ * decision function plus a thin query" — `backfillLotMatching` below is the thin, I/O-heavy
+ * orchestration around this one true/false call.
+ */
+export function needsLotBackfill(lotsBuiltThroughSlot: number | null, reconciledThroughSlot: number): boolean {
+  return lotsBuiltThroughSlot === null || lotsBuiltThroughSlot < reconciledThroughSlot;
+}
+
+/**
+ * Closes the gap `wallets.lots_built_through_slot` falling behind `reconciled_through_slot`
+ * leaves — `rules.loss_limit_enabled` being off while trades kept reconciling, then later
+ * turned on. Reconstructs `position_lots` from the affected trades (in the same true
+ * chronological order live matching uses) *before* any new trade in this run is matched
+ * against them, so a later disposal is never wrongly ruled eligible against an incomplete
+ * lot history. A no-op when there is no gap.
+ */
+async function backfillLotMatching(
+  walletId: string,
+  userId: string,
+  correlationId: string,
+  lotsBuiltThroughSlot: number | null,
+  reconciledThroughSlot: number | null,
+  activatedAt: Date | null,
+): Promise<void> {
+  if (reconciledThroughSlot === null) {
+    return; // nothing has ever been reconciled for this wallet — nothing to backfill
+  }
+
+  if (!needsLotBackfill(lotsBuiltThroughSlot, reconciledThroughSlot)) {
+    return; // already caught up
+  }
+
+  const unmatched = await loadUnmatchedTrades(walletId, lotsBuiltThroughSlot, reconciledThroughSlot);
+
+  for (const batch of chunk(unmatched, PERSIST_BATCH_SIZE)) {
+    await backfillLotMatchingBatch(walletId, userId, correlationId, activatedAt, batch);
+  }
+
+  // Clamp all the way to `reconciledThroughSlot` even if the gap's tail was entirely
+  // excluded candidates (no real trade there to carry the watermark forward) — otherwise the
+  // next run rescans an already-confirmed-empty range forever.
+  await getDb()
+    .update(wallets)
+    .set({ lotsBuiltThroughSlot: sql`GREATEST(COALESCE(${wallets.lotsBuiltThroughSlot}, 0), ${reconciledThroughSlot})` })
+    .where(eq(wallets.id, walletId));
 }
 
 async function runReconciliation(
@@ -611,6 +824,13 @@ async function runReconciliation(
   let reconciledThroughSlot = cursor;
 
   try {
+    // Must complete before any of *this* run's own new trades are lot-matched below —
+    // otherwise a disposal in this very run could draw down the wrong (newer) lot for a mint
+    // whose true oldest lot is still sitting unmatched in the gap.
+    if (lossLimitEnabled) {
+      await backfillLotMatching(walletId, userId, correlationId, info.lotsBuiltThroughSlot, cursor, activatedAt);
+    }
+
     for (let index = 0; index < batches.length; index += 1) {
       const isFinalBatch = index === batches.length - 1;
       const pricedBatch = await priceBatch(batches[index]!);

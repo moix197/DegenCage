@@ -2,7 +2,7 @@ import { desc, eq } from 'drizzle-orm';
 
 import { compareUsd, migrateConstitution, sumRealizedLosses, sumTradeUsd, type AssetTier } from '@degencage/rules';
 import { resolveSession } from '@/server/auth/session';
-import { CHAIN_HELIUS_RECONCILE_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
+import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { getDb } from '@/server/db/client';
 import { constitutions, trades, wallets, type TokenClassificationQuality } from '@/server/db/schema';
 import { isFeatureEnabled } from '@/server/flags/feature-flags';
@@ -144,7 +144,11 @@ function formatUsd(usdValue: string | null): string {
  * state — never a false "$0 spent today" or a false "clean".
  */
 export default async function ConstitutionStatusPage() {
-  const [session, reconcileEnabled] = await Promise.all([resolveSession(), isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG)]);
+  const [session, reconcileEnabled, lossLimitEnabled] = await Promise.all([
+    resolveSession(),
+    isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG),
+    isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
+  ]);
 
   if (!reconcileEnabled) {
     return (
@@ -221,7 +225,11 @@ export default async function ConstitutionStatusPage() {
         })
       : null,
     tierLimit ? computeTierAllowance(session.walletId, tierLimit) : null,
-    lossLimit ? computeLossAllowance(session.walletId, lossLimit) : null,
+    // Never compute — let alone show — a loss allowance while the kill switch is off: every
+    // trade's `realizedLossUsd` would be `null` regardless of actual loss, so `totalUsd`
+    // would read as a clean `$0` that is not actually known to be clean (the fail-closed fix
+    // in `evaluateTrade`'s `rolling_loss_usd` case, mirrored here).
+    lossLimit && lossLimitEnabled ? computeLossAllowance(session.walletId, lossLimit) : null,
   ]);
 
   return (
@@ -258,7 +266,12 @@ export default async function ConstitutionStatusPage() {
         )
       ) : null}
 
-      {lossAllowance ? (
+      {lossLimit && !lossLimitEnabled ? (
+        <p>
+          Rolling loss limit set (${lossLimit.maxUsd}/{lossLimit.windowHours}h), but loss-matching is switched off right
+          now — status unknown, never shown as clean. Nothing is wrong with your wallet.
+        </p>
+      ) : lossAllowance ? (
         <>
           <p>
             Realized loss this window: {formatUsd(lossAllowance.totalUsd)} of ${lossAllowance.maxUsd}

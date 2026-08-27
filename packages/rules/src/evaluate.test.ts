@@ -235,8 +235,8 @@ describe('evaluateTrade — rolling_loss_usd', () => {
   it('flags a violation when a losing round-trip close pushes cumulative realized loss past the limit', () => {
     const decision = evaluateTrade(
       rollingLossConstitution('100'),
-      [trade({ isRoundTripClose: true, realizedLossUsd: '-80' })],
-      trade({ isRoundTripClose: true, realizedLossUsd: '-50' }),
+      [trade({ isRoundTripClose: true, realizedLossUsd: '-80', lossLimitEnabled: true })],
+      trade({ isRoundTripClose: true, realizedLossUsd: '-50', lossLimitEnabled: true }),
     );
 
     expect(decision.evaluations[0]).toMatchObject({
@@ -251,7 +251,7 @@ describe('evaluateTrade — rolling_loss_usd', () => {
     const decision = evaluateTrade(
       rollingLossConstitution('10'),
       [],
-      trade({ isRoundTripClose: true, realizedLossUsd: '999999' }),
+      trade({ isRoundTripClose: true, realizedLossUsd: '999999', lossLimitEnabled: true }),
     );
 
     expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '0', reason: 'within_rolling_loss_limit' });
@@ -260,8 +260,8 @@ describe('evaluateTrade — rolling_loss_usd', () => {
   it("a trade that isn't a round-trip close at all doesn't affect the loss sum", () => {
     const decision = evaluateTrade(
       rollingLossConstitution('10'),
-      [trade({ isRoundTripClose: true, realizedLossUsd: '-9' })],
-      trade({ isRoundTripClose: false, usdValue: '999999' }),
+      [trade({ isRoundTripClose: true, realizedLossUsd: '-9', lossLimitEnabled: true })],
+      trade({ isRoundTripClose: false, usdValue: '999999', lossLimitEnabled: true }),
     );
 
     expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', priorUsd: '9', totalUsd: '9' });
@@ -271,7 +271,7 @@ describe('evaluateTrade — rolling_loss_usd', () => {
     const decision = evaluateTrade(
       rollingLossConstitution('10'),
       [],
-      trade({ isRoundTripClose: true, realizedLossUsd: null, usdValue: '999999' }),
+      trade({ isRoundTripClose: true, realizedLossUsd: null, usdValue: '999999', lossLimitEnabled: true }),
     );
 
     expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '0' });
@@ -280,11 +280,32 @@ describe('evaluateTrade — rolling_loss_usd', () => {
   it('allows a cumulative loss that lands exactly on the limit — inclusive, not exclusive', () => {
     const decision = evaluateTrade(
       rollingLossConstitution('100'),
-      [trade({ isRoundTripClose: true, realizedLossUsd: '-60' })],
-      trade({ isRoundTripClose: true, realizedLossUsd: '-40' }),
+      [trade({ isRoundTripClose: true, realizedLossUsd: '-60', lossLimitEnabled: true })],
+      trade({ isRoundTripClose: true, realizedLossUsd: '-40', lossLimitEnabled: true }),
     );
 
     expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '100' });
+  });
+
+  it('fails closed — unevaluable, not a silent allow — when rules.loss_limit_enabled was off for this trade', () => {
+    const decision = evaluateTrade(
+      rollingLossConstitution('10'),
+      [],
+      trade({ isRoundTripClose: true, realizedLossUsd: '-999999', lossLimitEnabled: false }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({
+      verdict: 'unevaluable',
+      reason: 'loss_matching_disabled',
+      priorUsd: null,
+      totalUsd: null,
+    });
+  });
+
+  it('fails closed the same way when lossLimitEnabled is simply unset — never defaults to evaluating', () => {
+    const decision = evaluateTrade(rollingLossConstitution('10'), [], trade());
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'loss_matching_disabled' });
   });
 });
 

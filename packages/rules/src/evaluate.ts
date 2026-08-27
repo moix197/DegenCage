@@ -39,6 +39,17 @@ export interface EvaluableTrade {
    * `evaluateRollingLoss` below).
    */
   realizedLossUsd?: string | null;
+  /**
+   * Whether `rules.loss_limit_enabled` was on for the reconciliation run that produced
+   * `isRoundTripClose`/`realizedLossUsd` on this trade. This package does no I/O of its own
+   * (see the module doc comment) so it cannot read the flag itself — the caller
+   * (`server/chain/reconcile-wallet.ts`) reads it once per run and stamps it here. Optional/
+   * undefined is treated as `false` — fail closed, same as every other kill switch in this
+   * codebase — so `rolling_loss_usd` evaluates `unevaluable` rather than a silent `allow`
+   * when the flag is off (or unset by an older caller), instead of the vacuous "$0 loss so
+   * far" a flag-off `null`-everywhere trade would otherwise produce.
+   */
+  lossLimitEnabled?: boolean;
 }
 
 export type LimitVerdict = 'allow' | 'violation' | 'unevaluable';
@@ -267,6 +278,14 @@ function evaluateRollingLoss(
   windowedHistory: EvaluableTrade[],
   trade: EvaluableTrade,
 ): LimitEvaluation {
+  // Fail closed, not a silent allow: with the flag off, every trade's `realizedLossUsd` is
+  // `null` and `sumRealizedLosses` would report `$0` — indistinguishable from a genuinely
+  // clean window. `rules.loss_limit_enabled` being off means lot-matching itself did not run
+  // (`reconcile-wallet.ts`), so this limit's true status is unknown, not zero.
+  if (trade.lossLimitEnabled !== true) {
+    return unevaluable(limit, 'loss_matching_disabled');
+  }
+
   const windowed = withinWindow(windowedHistory, limit.windowHours, trade.occurredAt);
   const priorUsd = sumRealizedLosses(windowed);
   const totalUsd = isRealizedLossClose(trade) ? addUsd(priorUsd, absUsd(trade.realizedLossUsd)) : priorUsd;

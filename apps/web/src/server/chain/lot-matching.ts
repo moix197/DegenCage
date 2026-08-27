@@ -28,6 +28,14 @@ export interface PositionLot {
   mint: string;
   openedAt: Date;
   openedAfterActivation: boolean;
+  /**
+   * The opening trade's `slot`/`transactionIndex` — the actual FIFO ordering key. The caller
+   * (`reconcile-wallet.ts`'s `loadOpenLots`) is responsible for sorting `lotsForMint` by these
+   * before calling `matchDisposal`; this module trusts that order rather than re-deriving it,
+   * same as it trusts caller-supplied ordering for everything else.
+   */
+  slot: number;
+  transactionIndex: number;
   /** Decimal-digit string of base units remaining — never a float, same convention as `trades.*_amount_base_units`. */
   remainingBaseUnits: bigint;
   /** `null` exactly when the opening trade was unpriced — see the schema comment on `position_lots.cost_basis_usd`. */
@@ -41,6 +49,8 @@ export interface NewLotInput {
   costBasisUsd: string | null;
   openedAt: Date;
   openedAfterActivation: boolean;
+  slot: number;
+  transactionIndex: number;
 }
 
 /** Opens a lot from an acquisition (BUY) leg. Trivial, but named and exported so the open/close halves of matching read symmetrically at call sites. */
@@ -49,6 +59,8 @@ export function openLot(input: NewLotInput): Omit<PositionLot, 'id'> {
     mint: input.mint,
     openedAt: input.openedAt,
     openedAfterActivation: input.openedAfterActivation,
+    slot: input.slot,
+    transactionIndex: input.transactionIndex,
     remainingBaseUnits: input.baseUnits,
     costBasisUsd: input.costBasisUsd,
   };

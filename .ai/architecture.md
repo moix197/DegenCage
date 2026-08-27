@@ -19,8 +19,9 @@ apps/web        Next.js App Router — UI + route handlers (Vercel), output: 'st
                              source of caller identity
   src/server/constitution/   draft -> commit -> activate lifecycle; the commitment window is
                              measured by Postgres' clock, not this process'
-  src/server/chain/          Helius pull -> swap derivation -> reconcileWallet(); the only
-                             writer of `trades`, triggered in-request on app open
+  src/server/chain/          Helius pull -> swap derivation -> FIFO lot-matching (pure,
+                             lot-matching.ts) -> reconcileWallet(); the only writer of
+                             `trades`/`position_lots`, triggered in-request on app open
   src/server/pricing/        a swap's USD value + the shared token_prices minute cache
   src/server/rules/          the I/O half of evaluation: windowed trade queries that feed
                              packages/rules' pure evaluateTrade()
@@ -76,10 +77,13 @@ Solana → Helius → src/server/chain (derive swap from net balance deltas)
                   src/server/pricing (price the known leg)
                         │
                         ▼
+          src/server/chain/lot-matching.ts (pure FIFO cost-basis, per mint)
+                        │
+                        ▼
    src/server/rules (windowed history) → packages/rules evaluateTrade → Decision
                         │                                                  │
                         ▼                                                  ▼
-              Postgres `trades`                              rule.decision_recorded
+    Postgres `trades` / `position_lots`                       rule.decision_recorded
         (idempotent, row-locked, cursor-advanced)              (allows and violations)
 ```
 

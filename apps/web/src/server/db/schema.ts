@@ -86,6 +86,20 @@ export const wallets = pgTable('wallets', {
    * still recognized as baseline.
    */
   baselineCompletedAt: timestamp('baseline_completed_at', { withTimezone: true }),
+  /**
+   * Highest slot whose real (non-excluded) trades are fully reflected in `position_lots` —
+   * `lot-matching.ts`'s own cursor, deliberately separate from `reconciled_through_slot`.
+   *
+   * `rules.loss_limit_enabled` can be off while trades keep reconciling (`reconciled_through_slot`
+   * keeps advancing), which would otherwise leave a permanent gap in FIFO lot history: a trade
+   * persisted while the flag was off is already deduplicated by `trades`' unique signature and
+   * is never revisited by a normal re-run, so its acquisition/disposal would simply never be
+   * lot-matched, silently corrupting every later disposal's FIFO order. This column is how
+   * `reconcile-wallet.ts` detects that gap — `lots_built_through_slot < reconciled_through_slot`
+   * — and backfills exactly the missing range from `trades` (not Helius) before trusting any
+   * new lot match. Null until lot-matching has ever run for this wallet.
+   */
+  lotsBuiltThroughSlot: bigint('lots_built_through_slot', { mode: 'number' }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -365,6 +379,11 @@ export type NewTradeRow = typeof trades.$inferInsert;
  * opening trade itself was unpriced, in which case no later disposal that touches this lot
  * can compute a `realized_loss_usd` either (folded into the same "not loss-limit-eligible"
  * bucket as decision 1's pre-activation exclusion — see `trades.realized_loss_usd` below).
+ *
+ * `slot`/`transaction_index` mirror `trades`' own columns and are the *actual* FIFO ordering
+ * key `loadOpenLots` sorts by — `opened_at` alone (second-granularity `blockTime`) cannot
+ * break a tie between two lots opened in the same second, so a slot/transaction-index-free
+ * sort would make draw-down order nondeterministic exactly when it matters most.
  */
 export const positionLots = pgTable(
   'position_lots',
@@ -376,12 +395,14 @@ export const positionLots = pgTable(
     mint: text('mint').notNull(),
     openedAt: timestamp('opened_at', { withTimezone: true }).notNull(),
     openedAfterActivation: boolean('opened_after_activation').notNull(),
+    slot: bigint('slot', { mode: 'number' }).notNull(),
+    transactionIndex: integer('transaction_index').notNull(),
     remainingBaseUnits: text('remaining_base_units').notNull(),
     costBasisUsd: numeric('cost_basis_usd', { precision: 38, scale: 12 }),
   },
   (table) => [
-    // FIFO retrieval's predicate: one wallet's lots for one mint, oldest first.
-    index('position_lots_wallet_id_mint_opened_at_idx').on(table.walletId, table.mint, table.openedAt),
+    // FIFO retrieval's predicate: one wallet's lots for one mint, in true chronological order.
+    index('position_lots_wallet_id_mint_slot_tx_idx').on(table.walletId, table.mint, table.slot, table.transactionIndex),
   ],
 );
 

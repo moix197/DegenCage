@@ -3,10 +3,13 @@
 **Decision:** `packages/rules/src/constitution.ts` defines the constitution as
 `{ schemaVersion, limits: LimitRule[] }`, where `LimitRule` is a discriminated union whose
 **all three** members (`daily_notional_usd`, `asset_tier_acquisition_usd`,
-`rolling_loss_usd`) exist now. `daily_notional_usd` and `asset_tier_acquisition_usd` are
-offered by the authoring UI and evaluated; `evaluateTrade` returns `unevaluable` (never a
-silent allow) for `rolling_loss_usd` until its phase lands. It is stored whole in
-`constitutions.document jsonb`,
+`rolling_loss_usd`) exist now and are all offered by the authoring UI and evaluated —
+Phase 6 landed the last of the three. `evaluateTrade` still returns `unevaluable` (never a
+silent allow) for `rolling_loss_usd` specifically, whenever `rules.loss_limit_enabled` is
+off: every trade then carries `realizedLossUsd: null` regardless of actual loss, and
+`unevaluable` is what keeps that from reading as a false "$0 lost" (see
+[reconciliation-idempotency](reconciliation-idempotency.md)'s lot-matching invariant). It is
+stored whole in `constitutions.document jsonb`,
 with `schema_version` mirrored as a relational column. Each `LimitRule` carries a stable
 `id`, and `windowHours` is a plain number rather than a `24` literal.
 
@@ -47,9 +50,9 @@ limit type never does.
   input (the draft/save path) and returns a reason; `migrateConstitution` validates our own
   *stored* row and **throws**, because a failure there means the row is corrupt. Never
   substitute one for the other.
-- The server validator accepts any well-formed `LimitRule`, including one the UI does not
+- The server validator accepts any well-formed `LimitRule`, including one the UI did not
   yet offer — Phase 5 added `asset_tier_acquisition_usd`'s UI with no server-validator
-  change, and Phase 6 adds `rolling_loss_usd`'s the same way.
+  change, and Phase 6 added `rolling_loss_usd`'s the same way.
 - **The `AssetTier` *vocabulary* is not covered by the stability argument above.** Phase 5
   replaced the identity tiers with market-cap tiers
   ([asset-tier-by-market-cap](asset-tier-by-market-cap.md)) — a change to the set of legal
