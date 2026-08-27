@@ -54,6 +54,8 @@ below $Y mcap" rule is a threshold change, not a new tier vocabulary.
   and never enters USD or allowance arithmetic, which remains exact-decimal `BigInt`
   ([usd-pricing-source](usd-pricing-source.md)).
 - Per-mint lookups are comma-batched into one Jupiter call per reconcile batch and cached by
-  mint; the cache is currently unbounded (known, accepted at Phase 0 scale).
+  mint under a TTL and a hard entry ceiling — the long tail of mints is effectively unbounded,
+  and the process outlives any one reconcile run. Evicting a live entry only costs a refetch;
+  the cache is an optimisation, never a source of truth.
 - Disposals never consume a tier allowance — selling out of a tier is not a bet, regardless
   of size. Enforced in `evaluateTrade`'s `asset_tier_acquisition_usd` case.

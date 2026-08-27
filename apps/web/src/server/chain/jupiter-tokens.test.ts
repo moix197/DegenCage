@@ -88,4 +88,28 @@ describe('lookupTokenMcaps', () => {
     expect(result.size).toBe(0);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+  it('bounds the cache so a long tail of mints cannot grow it without limit', async () => {
+    // One request per call keeps this cheap: the cache is what's under test, not the batching.
+    const mintAt = (index: number) => `MintEvict${index.toString().padStart(34, '0')}`;
+    const overflow = 5_200;
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const query = new URL(input as string).searchParams.get('query') ?? '';
+      return jupiterResponse(query.split(',').map((id) => ({ id, mcap: 1 })));
+    });
+
+    for (let index = 0; index < overflow; index += 1) {
+      await lookupTokenMcaps([mintAt(index)]);
+    }
+
+    // The most recent mint is still cached, so a repeat lookup issues no new request...
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockClear();
+    await lookupTokenMcaps([mintAt(overflow - 1)]);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // ...while the oldest was evicted, so it costs a refetch rather than living forever.
+    await lookupTokenMcaps([mintAt(0)]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

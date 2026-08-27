@@ -23,6 +23,11 @@ const JUPITER_BASE_URL = 'https://lite-api.jup.ag';
 const REQUEST_TIMEOUT_MS = 8_000;
 /** Mcap moves continuously; this only bounds how often one reconcile run re-fetches the same mint. */
 const CACHE_TTL_MS = 5 * 60 * 1_000;
+/**
+ * The process outlives any one reconcile run, and the long tail of mints is effectively
+ * unbounded — without a ceiling this map is a slow leak in a long-lived server.
+ */
+const CACHE_MAX_ENTRIES = 5_000;
 
 interface CacheEntry {
   mcap: number | null;
@@ -38,6 +43,24 @@ interface JupiterTokenSearchItem {
 
 function isFresh(entry: CacheEntry | undefined, now: number): entry is CacheEntry {
   return entry !== undefined && entry.expiresAt > now;
+}
+
+/**
+ * Drops expired entries first; if that alone doesn't get under the ceiling, drops oldest-
+ * inserted until it does (`Map` iterates in insertion order). Losing a live entry only costs
+ * a refetch — the cache is an optimisation, never a source of truth.
+ */
+function evictIfOversized(now: number): void {
+  if (mcapCache.size <= CACHE_MAX_ENTRIES) return;
+
+  for (const [mint, entry] of mcapCache) {
+    if (!isFresh(entry, now)) mcapCache.delete(mint);
+  }
+
+  for (const mint of mcapCache.keys()) {
+    if (mcapCache.size <= CACHE_MAX_ENTRIES) break;
+    mcapCache.delete(mint);
+  }
 }
 
 async function fetchMcaps(mints: string[]): Promise<Map<string, number>> {
@@ -94,6 +117,8 @@ export async function lookupTokenMcaps(mints: string[]): Promise<Map<string, num
       for (const mint of uncached) {
         mcapCache.set(mint, { mcap: fetched.get(mint) ?? null, expiresAt: now + CACHE_TTL_MS });
       }
+
+      evictIfOversized(now);
     } catch (error) {
       captureError(error, { operation: 'lookupTokenMcaps', mintCount: uncached.length, failedClosed: true });
       // Leave the uncached mints out of `mcapCache` — the loop below reads them as "no

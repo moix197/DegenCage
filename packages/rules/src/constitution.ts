@@ -25,7 +25,10 @@ export const CONSTITUTION_SCHEMA_VERSION = 1 as const;
 export type AssetTier = 'STABLE' | 'LARGE_CAP' | 'MID_CAP' | 'SMALL_CAP' | 'MICRO_CAP';
 export type LimitId = string; // stable uuid, survives edits
 
-const ASSET_TIERS: readonly AssetTier[] = ['STABLE', 'LARGE_CAP', 'MID_CAP', 'SMALL_CAP', 'MICRO_CAP'];
+/** The legal `AssetTier` values, in ascending-risk order — exported so the authoring UI
+ * offers exactly what the validator accepts, and a change to the vocabulary cannot leave
+ * the two disagreeing. */
+export const ASSET_TIERS: readonly AssetTier[] = ['STABLE', 'LARGE_CAP', 'MID_CAP', 'SMALL_CAP', 'MICRO_CAP'];
 
 export type LimitRule =
   | { id: LimitId; type: 'daily_notional_usd'; maxUsd: string; windowHours: number }

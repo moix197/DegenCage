@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { AssetTier } from '@degencage/rules';
+import { ASSET_TIERS, type AssetTier } from '@degencage/rules';
 import type { SerializedConstitution } from '@/server/constitution/commitment';
 
 /**
@@ -17,14 +17,6 @@ import type { SerializedConstitution } from '@/server/constitution/commitment';
  */
 
 const POLL_INTERVAL_MS = 5_000;
-
-/**
- * Hardcoded here rather than imported: `packages/rules` keeps `ASSET_TIERS` internal (its
- * public surface is unchanged in shape by Phase 5 — only the `AssetTier` type's members
- * changed), and the daily-notional limit's `type` literal is already hardcoded the same way
- * just below.
- */
-const ASSET_TIER_OPTIONS: readonly AssetTier[] = ['STABLE', 'LARGE_CAP', 'MID_CAP', 'SMALL_CAP', 'MICRO_CAP'];
 
 interface ConstitutionResponse {
   constitution: SerializedConstitution | null;
@@ -213,7 +205,7 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
         <label>
           Tier
           <select value={tier} onChange={(event) => setTier(event.target.value as AssetTier)}>
-            {ASSET_TIER_OPTIONS.map((option) => (
+            {ASSET_TIERS.map((option) => (
               <option key={option} value={option}>
                 {option}
               </option>

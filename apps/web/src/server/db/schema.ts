@@ -1,4 +1,5 @@
 import type { AssetTier, Constitution } from '@degencage/rules';
+import type { TokenClassificationQuality } from '../chain/classify-token';
 import {
   bigint,
   boolean,
@@ -231,8 +232,7 @@ export const constitutions = pgTable(
 
 export type ConstitutionRow = typeof constitutions.$inferSelect;
 
-/** Whether a classification came from a real Jupiter mcap read or the fail-closed default. */
-export type TokenClassificationQuality = 'known' | 'unknown';
+export type { TokenClassificationQuality } from '../chain/classify-token';
 
 /**
  * One derived on-chain swap, from `server/chain/reconcile-wallet.ts`. `signature` is

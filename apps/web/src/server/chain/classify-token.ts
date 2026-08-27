@@ -2,7 +2,6 @@ import type { AssetTier } from '@degencage/rules';
 
 import { captureError } from '../../observability/error-tracking';
 import { logger } from '../../observability/logger';
-import type { TokenClassificationQuality } from '../db/schema';
 import { isStablecoin } from './stablecoin-mints';
 import { lookupTokenMcaps } from './jupiter-tokens';
 
@@ -27,6 +26,9 @@ export const ASSET_TIER_MCAP_THRESHOLDS_USD = {
   MID_CAP: 100_000_000,
   SMALL_CAP: 10_000_000,
 } as const;
+
+/** Whether a classification came from a real Jupiter mcap read or the fail-closed default. */
+export type TokenClassificationQuality = 'known' | 'unknown';
 
 export interface TokenClassification {
   tier: AssetTier;

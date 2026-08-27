@@ -15,6 +15,7 @@ export function identityDecision<TDecision>(decision: TDecision): TDecision {
 }
 
 export {
+  ASSET_TIERS,
   CONSTITUTION_SCHEMA_VERSION,
   migrateConstitution,
   parseConstitution,
