@@ -29,11 +29,21 @@ const POLL_INTERVAL_MS = 15_000;
  * client component has to load it lazily, same gate `instrumentation-client.ts` uses, or
  * every dashboard visit pays for Sentry's client runtime whether or not a poll ever fails
  * (`.ai/decisions/observability-stack.md`).
+ *
+ * The `.catch` below matters more here than it usually would: a poll typically fails
+ * because the network is down, which is exactly when this dynamic `import()` also fails to
+ * load — an unhandled rejection there would swallow the original error instead of reporting
+ * it (CLAUDE.md's no-silent-failures rule). `console.error` is the fallback specifically for
+ * that case, not a general-purpose logging path.
  */
 function reportRefreshFailure(error: unknown): void {
-  void import('@/observability/error-tracking').then(({ captureError }) => {
-    captureError(error, { component: 'dashboard-panel', route: '/api/dashboard' });
-  });
+  import('@/observability/error-tracking')
+    .then(({ captureError }) => {
+      captureError(error, { component: 'dashboard-panel', route: '/api/dashboard' });
+    })
+    .catch((importError: unknown) => {
+      console.error('dashboard-panel: failed to load error-tracking module', importError, error);
+    });
 }
 
 interface SimpleAllowance {
