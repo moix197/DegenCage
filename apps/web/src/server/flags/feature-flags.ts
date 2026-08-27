@@ -21,6 +21,9 @@ export interface FeatureFlagContext {
 /** The home page's own kill switch — seeded enabled by `src/server/db/seed.ts`. */
 export const HOME_STATUS_PANEL_FLAG = 'web.home_status_panel';
 
+/** The discipline dashboard's kill switch (Phase 7) — seeded enabled by `src/server/db/seed.ts`. */
+export const DASHBOARD_DISCIPLINE_VIEW_FLAG = 'dashboard.discipline_view';
+
 /** Pure decision: given the stored row (or none), is this feature on for this caller? */
 export function resolveFeatureFlag(
   row: FeatureFlagRow | undefined,

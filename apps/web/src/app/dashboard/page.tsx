@@ -5,12 +5,25 @@ import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { getDb } from '@/server/db/client';
 import { constitutions, trades, wallets, type TokenClassificationQuality } from '@/server/db/schema';
-import { isFeatureEnabled } from '@/server/flags/feature-flags';
+import { loadViolationsFeed } from '@/server/dashboard/violations-feed';
+import { DASHBOARD_DISCIPLINE_VIEW_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
 import { computeRollingAllowance, loadWindowedTrades } from '@/server/rules/rolling-allowance';
 import { captureError } from '@/observability/error-tracking';
+import { recordEvent } from '@/observability/events';
+import type { DashboardApiResponse } from '@/app/api/dashboard/route';
+import { DashboardPanel } from './dashboard-panel';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+
+/**
+ * The Phase 4–6 status page (`constitution-status/page.tsx`), promoted into the real
+ * dashboard (Phase 7): same server-side reconciliation-on-open and allowance computation,
+ * plus the live-polling `DashboardPanel` and the violations feed. This component only
+ * builds the *initial* server-rendered snapshot — `GET /api/dashboard`
+ * (`app/api/dashboard/route.ts`) is the sole place that recomputes it afterwards, so the two
+ * intentionally mirror each other's combinators rather than sharing one.
+ */
 
 const TRADE_LIST_LIMIT = 50;
 
@@ -60,7 +73,8 @@ interface TierAllowanceView {
  * Mirrors `computeRollingAllowance` (Phase 4) but scoped to one tier's qualifying
  * acquisitions — `loadWindowedTrades` is reused rather than duplicated; only the
  * tier-filter-then-sum step is new, composed here rather than inside
- * `rolling-allowance.ts` (which stays limit-type-agnostic).
+ * `rolling-allowance.ts` (which stays limit-type-agnostic). `app/api/dashboard/route.ts`
+ * has its own identically-named combinator for the same reason.
  */
 async function computeTierAllowance(walletId: string, limit: { tier: AssetTier; maxUsd: string; windowHours: number }): Promise<TierAllowanceView> {
   const windowed = await loadWindowedTrades({ walletId, windowHours: limit.windowHours, asOf: new Date() });
@@ -92,22 +106,7 @@ interface LossAllowanceView {
   withinLimit: boolean;
 }
 
-/**
- * Decision 1's partial coverage, stated plainly rather than implied as full P&L (this
- * phase's success criteria) — shown unconditionally alongside the allowance figure, not only
- * when a violation happens.
- */
-const LOSS_LIMIT_COVERAGE_DISCLAIMER =
-  'Covers only round-trips — bought and later sold — where both sides happened after this constitution activated. Anything held from before, or still open, is not counted here — this is not your full P&L.';
-
-/**
- * Mirrors `computeTierAllowance` above: `loadWindowedTrades` is reused, only the
- * sign/magnitude sum is new — and that sum is `@degencage/rules`' `sumRealizedLosses`
- * (`packages/rules/src/evaluate.ts`), not reimplemented here, same reuse discipline as
- * `sumTradeUsd` elsewhere on this page. Unlike the notional/tier allowances above, this never
- * reports "unknown": decision 1's exclusions (and an unpriced leg) are a deliberate scope
- * boundary the disclaimer already discloses, not missing data to fail closed on.
- */
+/** Mirrors `computeTierAllowance` above; `app/api/dashboard/route.ts` has the same combinator for the poll path. */
 async function computeLossAllowance(walletId: string, limit: { maxUsd: string; windowHours: number }): Promise<LossAllowanceView> {
   const windowed = await loadWindowedTrades({ walletId, windowHours: limit.windowHours, asOf: new Date() });
   const totalUsd = sumRealizedLosses(windowed);
@@ -135,26 +134,68 @@ function formatUsd(usdValue: string | null): string {
 }
 
 /**
- * "Today's notional" against the caller's active `daily_notional_usd` limit, plus a bare
- * trade list. Reconciliation runs synchronously on every page load — "triggered on app
- * open" (this phase's success criteria), not on a schedule.
- *
- * Fails closed throughout: a reconciliation error, a disabled flag, or no active
- * `daily_notional_usd` limit all render an explicit "not yet reconciled" / "no limit set"
- * state — never a false "$0 spent today" or a false "clean".
+ * Builds the same shape `GET /api/dashboard` returns, so `DashboardPanel` can treat its
+ * `initial` prop and every subsequent poll response identically.
  */
-export default async function ConstitutionStatusPage() {
-  const [session, reconcileEnabled, lossLimitEnabled] = await Promise.all([
+async function buildInitialDashboardState(
+  walletId: string,
+  userId: string,
+  lossLimitEnabled: boolean,
+): Promise<DashboardApiResponse> {
+  const constitutionRow = await getDb().select().from(constitutions).where(eq(constitutions.userId, userId)).limit(1);
+  const constitution = constitutionRow[0] && constitutionRow[0].status === 'active' ? migrateConstitution(constitutionRow[0].document) : null;
+
+  const dailyNotionalLimit = constitution?.limits.find(
+    (limit): limit is Extract<typeof limit, { type: 'daily_notional_usd' }> => limit.type === 'daily_notional_usd',
+  );
+  const tierLimit = constitution?.limits.find(
+    (limit): limit is Extract<typeof limit, { type: 'asset_tier_acquisition_usd' }> => limit.type === 'asset_tier_acquisition_usd',
+  );
+  const lossLimit = constitution?.limits.find(
+    (limit): limit is Extract<typeof limit, { type: 'rolling_loss_usd' }> => limit.type === 'rolling_loss_usd',
+  );
+
+  const [allowance, tierAllowance, lossAllowance, violations] = await Promise.all([
+    dailyNotionalLimit
+      ? computeRollingAllowance({ walletId, windowHours: dailyNotionalLimit.windowHours, asOf: new Date(), maxUsd: dailyNotionalLimit.maxUsd })
+      : null,
+    tierLimit ? computeTierAllowance(walletId, tierLimit) : null,
+    lossLimit && lossLimitEnabled ? computeLossAllowance(walletId, lossLimit) : null,
+    loadViolationsFeed({ walletId, userId }),
+  ]);
+
+  return {
+    now: new Date().toISOString(),
+    allowance: allowance ? { totalUsd: allowance.totalUsd, maxUsd: allowance.maxUsd, withinLimit: allowance.withinLimit } : null,
+    tierAllowance,
+    lossAllowance: lossLimit
+      ? lossLimitEnabled && lossAllowance
+        ? { ...lossAllowance, enabled: true }
+        : { enabled: false, maxUsd: lossLimit.maxUsd }
+      : null,
+    violations: violations.map((violation) => ({ ...violation, occurredAt: violation.occurredAt.toISOString() })),
+    correlationId: crypto.randomUUID(),
+  };
+}
+
+/**
+ * Reconciliation runs synchronously on every page load — "triggered on app open", not on a
+ * schedule. Fails closed throughout: a reconciliation error, a disabled flag, or no active
+ * `daily_notional_usd` limit all render an explicit state — never a false "$0 spent today".
+ */
+export default async function DashboardPage() {
+  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled] = await Promise.all([
     resolveSession(),
+    isFeatureEnabled(DASHBOARD_DISCIPLINE_VIEW_FLAG),
     isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG),
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
   ]);
 
-  if (!reconcileEnabled) {
+  if (!dashboardEnabled || !reconcileEnabled) {
     return (
       <main>
-        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Constitution status</h1>
-        <p>Wallet reconciliation is switched off right now. Nothing is wrong with your wallet.</p>
+        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
+        <p>The dashboard is switched off right now. Nothing is wrong with your wallet.</p>
       </main>
     );
   }
@@ -162,7 +203,7 @@ export default async function ConstitutionStatusPage() {
   if (!session) {
     return (
       <main>
-        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Constitution status</h1>
+        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
         <p>
           Connect your wallet on <a href="/connect">/connect</a> first.
         </p>
@@ -171,13 +212,18 @@ export default async function ConstitutionStatusPage() {
   }
 
   const correlationId = crypto.randomUUID();
+
+  // Serves Phase 9's return-visit metric — fired for every authenticated view, independent
+  // of whether reconciliation below succeeds.
+  await recordEvent({ eventType: 'dashboard.viewed', occurredAt: new Date(), correlationId, userId: session.userId });
+
   let reconcileFailed = false;
 
   try {
     await reconcileWallet(correlationId);
   } catch (error) {
     if (!(error instanceof ReconcileRejected)) {
-      captureError(error, { correlationId, page: 'constitution-status' });
+      captureError(error, { correlationId, page: 'dashboard' });
     }
     reconcileFailed = true;
   }
@@ -190,96 +236,22 @@ export default async function ConstitutionStatusPage() {
   if (reconcileFailed || reconciliationState !== 'current') {
     return (
       <main>
-        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Constitution status</h1>
+        <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
         <p>Not yet reconciled. We could not confirm your wallet&apos;s trade history just now — try reopening this page.</p>
       </main>
     );
   }
 
-  const [constitutionRow, tradesList] = await Promise.all([
-    getDb().select().from(constitutions).where(eq(constitutions.userId, session.userId)).limit(1),
+  const [initial, tradesList] = await Promise.all([
+    buildInitialDashboardState(session.walletId, session.userId, lossLimitEnabled),
     loadRecentTrades(session.walletId),
   ]);
 
-  const constitution = constitutionRow[0] && constitutionRow[0].status === 'active' ? migrateConstitution(constitutionRow[0].document) : null;
-  const dailyNotionalLimit = constitution?.limits.find(
-    (limit): limit is Extract<typeof limit, { type: 'daily_notional_usd' }> => limit.type === 'daily_notional_usd',
-  );
-
-  const tierLimit = constitution?.limits.find(
-    (limit): limit is Extract<typeof limit, { type: 'asset_tier_acquisition_usd' }> =>
-      limit.type === 'asset_tier_acquisition_usd',
-  );
-
-  const lossLimit = constitution?.limits.find(
-    (limit): limit is Extract<typeof limit, { type: 'rolling_loss_usd' }> => limit.type === 'rolling_loss_usd',
-  );
-
-  const [allowance, tierAllowance, lossAllowance] = await Promise.all([
-    dailyNotionalLimit
-      ? computeRollingAllowance({
-          walletId: session.walletId,
-          windowHours: dailyNotionalLimit.windowHours,
-          asOf: new Date(),
-          maxUsd: dailyNotionalLimit.maxUsd,
-        })
-      : null,
-    tierLimit ? computeTierAllowance(session.walletId, tierLimit) : null,
-    // Never compute — let alone show — a loss allowance while the kill switch is off: every
-    // trade's `realizedLossUsd` would be `null` regardless of actual loss, so `totalUsd`
-    // would read as a clean `$0` that is not actually known to be clean (the fail-closed fix
-    // in `evaluateTrade`'s `rolling_loss_usd` case, mirrored here).
-    lossLimit && lossLimitEnabled ? computeLossAllowance(session.walletId, lossLimit) : null,
-  ]);
-
   return (
-    <main>
-      <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Constitution status</h1>
+    <main className="mx-auto flex max-w-3xl flex-col gap-6">
+      <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
 
-      {allowance ? (
-        allowance.totalUsd === null ? (
-          <p>
-            Today&apos;s notional: unknown of ${allowance.maxUsd} — some trades in the window could not be priced, so the
-            limit status is unknown (never assumed clean, never assumed over).
-          </p>
-        ) : (
-          <p>
-            Today&apos;s notional: {formatUsd(allowance.totalUsd)} of ${allowance.maxUsd}
-            {!allowance.withinLimit ? ' — over limit' : ''}
-          </p>
-        )
-      ) : (
-        <p>No daily notional limit set on your active constitution.</p>
-      )}
-
-      {tierAllowance ? (
-        tierAllowance.totalUsd === null ? (
-          <p>
-            {tierAllowance.tier} acquisitions: unknown of ${tierAllowance.maxUsd} — some trades in the window could not be
-            priced, so the limit status is unknown (never assumed clean, never assumed over).
-          </p>
-        ) : (
-          <p>
-            {tierAllowance.tier} acquisitions: {formatUsd(tierAllowance.totalUsd)} of ${tierAllowance.maxUsd}
-            {!tierAllowance.withinLimit ? ' — over limit' : ''}
-          </p>
-        )
-      ) : null}
-
-      {lossLimit && !lossLimitEnabled ? (
-        <p>
-          Rolling loss limit set (${lossLimit.maxUsd}/{lossLimit.windowHours}h), but loss-matching is switched off right
-          now — status unknown, never shown as clean. Nothing is wrong with your wallet.
-        </p>
-      ) : lossAllowance ? (
-        <>
-          <p>
-            Realized loss this window: {formatUsd(lossAllowance.totalUsd)} of ${lossAllowance.maxUsd}
-            {!lossAllowance.withinLimit ? ' — over limit' : ''}
-          </p>
-          <p>{LOSS_LIMIT_COVERAGE_DISCLAIMER}</p>
-        </>
-      ) : null}
+      <DashboardPanel initial={initial} />
 
       <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Recent activity</h2>
       {tradesList.length === 0 ? (
@@ -288,7 +260,7 @@ export default async function ConstitutionStatusPage() {
         <ul>
           {tradesList.map((trade) => (
             <li key={trade.signature}>
-              <span>{trade.isBaseline ? '[baseline — private]' : '[live]'}</span>{' '}
+              <span>{trade.isBaseline ? '[pre-commitment activity — private]' : '[live]'}</span>{' '}
               {trade.excludedReason ? (
                 <span>
                   excluded ({trade.excludedReason}) — {formatMint(trade.soldMint)} → {formatMint(trade.boughtMint)}

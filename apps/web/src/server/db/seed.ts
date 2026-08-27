@@ -5,7 +5,7 @@ import { CHAIN_HELIUS_FLAG } from '../chain/helius-client';
 import { CLASSIFICATION_JUPITER_MCAP_FLAG } from '../chain/jupiter-tokens';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
 import { CONSTITUTION_AUTHOR_FLAG } from '../constitution/commitment';
-import { HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
+import { DASHBOARD_DISCIPLINE_VIEW_FLAG, HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
 import { PRICING_BINANCE_FLAG } from '../pricing/binance-klines';
 import { PRICING_BIRDEYE_FLAG } from '../pricing/birdeye-price';
 import {
@@ -37,6 +37,9 @@ const SEED_FLAGS: { key: string; enabled: boolean }[] = [
   // every trade would carry `realizedLossUsd: null` and `evaluateTrade`'s `rolling_loss_usd`
   // case would (correctly, per the fail-closed fix) report `unevaluable` forever.
   { key: LOSS_LIMIT_ENABLED_FLAG, enabled: true },
+  // Phase 7's dashboard is the real replacement for `/constitution-status` — same
+  // ship-enabled-by-default posture as the other user-facing pages above.
+  { key: DASHBOARD_DISCIPLINE_VIEW_FLAG, enabled: true },
 ];
 
 async function seedFeatureFlags(): Promise<void> {

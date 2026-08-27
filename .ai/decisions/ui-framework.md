@@ -6,13 +6,13 @@ one at a time with `pnpm dlx shadcn@latest add <name>` — `card`, `badge`, `tab
 `separator`, `skeleton`, `alert` to start (Phase 7's dashboard), more only as a real screen
 needs them.
 
-**Why:** Every screen shipped through Phase 6 (`/`, `/connect`, `/constitution`,
-`/constitution-status`) hand-rolls its markup with inline `style={{}}` objects — fine for a
-handful of status paragraphs and a form, but Phase 7's dashboard is the first screen with
-real layout: cards, a table-shaped violations feed, badges for tier/verdict state, loading
-skeletons for the live-polled figures. Building that from scratch in inline styles is where
-"no CSS framework" stops paying for itself and starts costing real time per screen, with no
-consistency guarantee between them.
+**Why:** Every screen shipped through Phase 6 (`/`, `/connect`, `/constitution`, and the
+Phase 4–6 status page since renamed to `/dashboard`) hand-rolls its markup with inline
+`style={{}}` objects — fine for a handful of status paragraphs and a form, but Phase 7's
+dashboard is the first screen with real layout: cards, a table-shaped violations feed,
+badges for tier/verdict state, loading skeletons for the live-polled figures. Building that
+from scratch in inline styles is where "no CSS framework" stops paying for itself and
+starts costing real time per screen, with no consistency guarantee between them.
 
 Tailwind is the smallest, most widely adopted answer to "utility classes instead of
 per-element style objects," and shadcn/ui rides on top of it rather than being a second,
@@ -46,9 +46,9 @@ differentiator. The rule engine, commitment logic, and violation detection stay 
   utility classes to resolve anywhere in the app, including on pages that don't otherwise
   use them. The existing inline `style={{}}` on `<body>` is untouched and keeps winning on
   specificity (inline style beats the `@layer base` rules Tailwind adds), so this import
-  causes no visible change to `/`, `/connect`, `/constitution`, or `/constitution-status`.
-- **Existing inline-style pages (`app/page.tsx`, `constitution-status/page.tsx`,
-  `constitution/constitution-panel.tsx`) are left exactly as they are.** They are not
+  causes no visible change to `/`, `/connect`, or `/constitution`.
+- **Existing inline-style pages (`app/page.tsx`, `constitution/constitution-panel.tsx`) are
+  left exactly as they are.** They are not
   migrated to Tailwind/shadcn as part of this change — that is a separate, opportunistic
   cleanup, done page-by-page when a page is touched for other reasons anyway, never a
   standing "port everything now" task.
