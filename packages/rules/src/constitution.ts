@@ -15,10 +15,17 @@
 
 export const CONSTITUTION_SCHEMA_VERSION = 1 as const;
 
-export type AssetTier = 'STABLE' | 'SOL' | 'BTC' | 'ETH' | 'ALT' | 'MEMECOIN';
+/**
+ * Market-cap tiers (Phase 5 — supersedes the identity-based tiers decision 7 originally
+ * shipped in Phase 3). A tier answers "how much am I gambling?" by market cap, not by asset
+ * identity: `classify-token.ts` (`apps/web/src/server/chain/classify-token.ts`) is the sole
+ * place that assigns one, and `MICRO_CAP` is the fail-closed default for anything unlisted,
+ * unpriceable, or classified with the kill switch off.
+ */
+export type AssetTier = 'STABLE' | 'LARGE_CAP' | 'MID_CAP' | 'SMALL_CAP' | 'MICRO_CAP';
 export type LimitId = string; // stable uuid, survives edits
 
-const ASSET_TIERS: readonly AssetTier[] = ['STABLE', 'SOL', 'BTC', 'ETH', 'ALT', 'MEMECOIN'];
+const ASSET_TIERS: readonly AssetTier[] = ['STABLE', 'LARGE_CAP', 'MID_CAP', 'SMALL_CAP', 'MICRO_CAP'];
 
 export type LimitRule =
   | { id: LimitId; type: 'daily_notional_usd'; maxUsd: string; windowHours: number }

@@ -1,4 +1,4 @@
-import { compareUsd, sumTradeUsd } from '@degencage/rules';
+import { compareUsd, sumTradeUsd, type AssetTier } from '@degencage/rules';
 import { and, eq, gte, isNull, lt } from 'drizzle-orm';
 
 import type { DatabaseExecutor } from '../../observability/events';
@@ -23,6 +23,14 @@ import { trades } from '../db/schema';
 export interface WindowedTrade {
   occurredAt: Date;
   usdValue: string | null;
+  /**
+   * Phase 5: carried through unchanged so `evaluateTrade`'s `asset_tier_acquisition_usd`
+   * case can filter this wallet's window down to qualifying acquisitions itself
+   * (`packages/rules` does no I/O of its own — see that module's invariant). Absent from a
+   * `daily_notional_usd`-only read has no effect: that evaluator never looks at either field.
+   */
+  isAcquisition?: boolean;
+  acquiredTier?: AssetTier | null;
 }
 
 export interface RollingWindowParams {
@@ -54,7 +62,12 @@ export async function loadWindowedTrades(
   const windowStart = new Date(asOf.getTime() - windowHours * 60 * 60 * 1_000);
 
   const rows = await executor
-    .select({ occurredAt: trades.occurredAt, usdValue: trades.usdValue })
+    .select({
+      occurredAt: trades.occurredAt,
+      usdValue: trades.usdValue,
+      isAcquisition: trades.isAcquisition,
+      acquiredTier: trades.acquiredTier,
+    })
     .from(trades)
     .where(
       and(

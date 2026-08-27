@@ -15,7 +15,7 @@ function wellFormedConstitution(): Constitution {
       {
         id: 'limit-2',
         type: 'asset_tier_acquisition_usd',
-        tier: 'MEMECOIN',
+        tier: 'MICRO_CAP',
         maxUsd: '100',
         windowHours: 24,
       },
@@ -121,7 +121,7 @@ describe('parseConstitution', () => {
     const doc = {
       schemaVersion: CONSTITUTION_SCHEMA_VERSION,
       limits: [
-        { id: 'limit-1', type: 'asset_tier_acquisition_usd', tier: 'DOGE', maxUsd: '100', windowHours: 24 },
+        { id: 'limit-1', type: 'asset_tier_acquisition_usd', tier: 'MEMECOIN', maxUsd: '100', windowHours: 24 },
       ],
     };
 

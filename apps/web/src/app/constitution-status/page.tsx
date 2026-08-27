@@ -1,12 +1,12 @@
 import { desc, eq } from 'drizzle-orm';
 
-import { migrateConstitution } from '@degencage/rules';
+import { compareUsd, migrateConstitution, sumTradeUsd, type AssetTier } from '@degencage/rules';
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { getDb } from '@/server/db/client';
 import { constitutions, trades, wallets } from '@/server/db/schema';
 import { isFeatureEnabled } from '@/server/flags/feature-flags';
-import { computeRollingAllowance } from '@/server/rules/rolling-allowance';
+import { computeRollingAllowance, loadWindowedTrades } from '@/server/rules/rolling-allowance';
 import { captureError } from '@/observability/error-tracking';
 
 export const dynamic = 'force-dynamic';
@@ -22,6 +22,7 @@ interface TradeRowView {
   usdValue: string | null;
   isBaseline: boolean;
   excludedReason: string | null;
+  acquiredTier: AssetTier | null;
 }
 
 async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
@@ -34,11 +35,44 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
       usdValue: trades.usdValue,
       isBaseline: trades.isBaseline,
       excludedReason: trades.excludedReason,
+      acquiredTier: trades.acquiredTier,
     })
     .from(trades)
     .where(eq(trades.walletId, walletId))
     .orderBy(desc(trades.occurredAt))
     .limit(TRADE_LIST_LIMIT);
+}
+
+interface TierAllowanceView {
+  tier: AssetTier;
+  maxUsd: string;
+  totalUsd: string | null;
+  withinLimit: boolean;
+}
+
+/**
+ * Mirrors `computeRollingAllowance` (Phase 4) but scoped to one tier's qualifying
+ * acquisitions — `loadWindowedTrades` is reused rather than duplicated; only the
+ * tier-filter-then-sum step is new, composed here rather than inside
+ * `rolling-allowance.ts` (which stays limit-type-agnostic).
+ */
+async function computeTierAllowance(walletId: string, limit: { tier: AssetTier; maxUsd: string; windowHours: number }): Promise<TierAllowanceView> {
+  const windowed = await loadWindowedTrades({ walletId, windowHours: limit.windowHours, asOf: new Date() });
+  const qualifying = windowed.filter((trade) => trade.isAcquisition === true && trade.acquiredTier === limit.tier);
+  const totalUsd = sumTradeUsd(qualifying);
+
+  return {
+    tier: limit.tier,
+    maxUsd: limit.maxUsd,
+    totalUsd,
+    withinLimit: totalUsd !== null && compareUsd(totalUsd, limit.maxUsd) <= 0,
+  };
+}
+
+/** `[MICRO_CAP]`, except the fail-closed default is called out by name — success criteria requires an unlisted/unpriceable token to be "visibly tagged", and `MICRO_CAP` alone doesn't say whether that's a real reading or the fallback. */
+function formatTierBadge(tier: AssetTier | null): string | null {
+  if (tier === null) return null;
+  return tier === 'MICRO_CAP' ? 'MICRO_CAP — counted as micro cap' : tier;
 }
 
 async function loadReconciliationState(walletId: string): Promise<string | null> {
@@ -128,14 +162,22 @@ export default async function ConstitutionStatusPage() {
     (limit): limit is Extract<typeof limit, { type: 'daily_notional_usd' }> => limit.type === 'daily_notional_usd',
   );
 
-  const allowance = dailyNotionalLimit
-    ? await computeRollingAllowance({
-        walletId: session.walletId,
-        windowHours: dailyNotionalLimit.windowHours,
-        asOf: new Date(),
-        maxUsd: dailyNotionalLimit.maxUsd,
-      })
-    : null;
+  const tierLimit = constitution?.limits.find(
+    (limit): limit is Extract<typeof limit, { type: 'asset_tier_acquisition_usd' }> =>
+      limit.type === 'asset_tier_acquisition_usd',
+  );
+
+  const [allowance, tierAllowance] = await Promise.all([
+    dailyNotionalLimit
+      ? computeRollingAllowance({
+          walletId: session.walletId,
+          windowHours: dailyNotionalLimit.windowHours,
+          asOf: new Date(),
+          maxUsd: dailyNotionalLimit.maxUsd,
+        })
+      : null,
+    tierLimit ? computeTierAllowance(session.walletId, tierLimit) : null,
+  ]);
 
   return (
     <main>
@@ -157,6 +199,20 @@ export default async function ConstitutionStatusPage() {
         <p>No daily notional limit set on your active constitution.</p>
       )}
 
+      {tierAllowance ? (
+        tierAllowance.totalUsd === null ? (
+          <p>
+            {tierAllowance.tier} acquisitions: unknown of ${tierAllowance.maxUsd} — some trades in the window could not be
+            priced, so the limit status is unknown (never assumed clean, never assumed over).
+          </p>
+        ) : (
+          <p>
+            {tierAllowance.tier} acquisitions: {formatUsd(tierAllowance.totalUsd)} of ${tierAllowance.maxUsd}
+            {!tierAllowance.withinLimit ? ' — over limit' : ''}
+          </p>
+        )
+      ) : null}
+
       <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>Recent activity</h2>
       {tradesList.length === 0 ? (
         <p>No trade history yet.</p>
@@ -172,6 +228,13 @@ export default async function ConstitutionStatusPage() {
               ) : (
                 <span>
                   {formatMint(trade.soldMint)} → {formatMint(trade.boughtMint)} — {formatUsd(trade.usdValue)}
+                  {trade.acquiredTier ? (
+                    <span>
+                      {' '}
+                      [{formatTierBadge(trade.acquiredTier)}
+                      {trade.isBaseline ? ', backfilled at today’s mcap — not a contemporaneous judgement' : ''}]
+                    </span>
+                  ) : null}
                 </span>
               )}{' '}
               <span>({trade.occurredAt.toISOString()})</span>

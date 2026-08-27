@@ -1,11 +1,12 @@
-import type { Constitution, LimitId, LimitRule } from './constitution';
+import type { AssetTier, Constitution, LimitId, LimitRule } from './constitution';
 
 /**
  * The rule engine's decision function — pure, I/O-free, same invariant as the rest of this
  * package (`src/index.ts`). Phase 4 implements only `daily_notional_usd`; every other
  * `LimitRule.type` a stored constitution may already contain (the union was defined whole
  * up front — `.ai/decisions/constitution-schema.md`) evaluates to `unevaluable` rather than
- * being silently skipped or silently allowed. Phases 5/6 add their cases to this same file.
+ * being silently skipped or silently allowed. Phase 5 adds `asset_tier_acquisition_usd`;
+ * Phase 6 adds `rolling_loss_usd` to this same file.
  */
 
 /** The minimal shape `evaluateTrade` needs from a persisted or proposed trade. */
@@ -13,6 +14,15 @@ export interface EvaluableTrade {
   occurredAt: Date;
   /** Never `0` for an unpriceable trade — `null` fails the limit closed (CLAUDE.md). */
   usdValue: string | null;
+  /**
+   * Whether this trade is the BUY side of a swap. Disposals never consume a tier's
+   * acquisition allowance regardless of amount (decision 6) — optional/undefined is treated
+   * as `false`, so callers that only ever evaluate `daily_notional_usd` (Phase 4's tests)
+   * need not supply it.
+   */
+  isAcquisition?: boolean;
+  /** The market-cap tier this trade acquired, stamped at classification time. Only meaningful when `isAcquisition` is true. */
+  acquiredTier?: AssetTier | null;
 }
 
 export type LimitVerdict = 'allow' | 'violation' | 'unevaluable';
@@ -149,13 +159,72 @@ function evaluateDailyNotional(
   };
 }
 
+/** True only for the BUY side into exactly `tier` — the sole thing this limit ever counts (decision 6). */
+function isQualifyingAcquisition(trade: EvaluableTrade, tier: AssetTier): boolean {
+  return trade.isAcquisition === true && trade.acquiredTier === tier;
+}
+
+function evaluateAssetTierAcquisition(
+  limit: LimitRule & { type: 'asset_tier_acquisition_usd' },
+  windowedHistory: EvaluableTrade[],
+  trade: EvaluableTrade,
+): LimitEvaluation {
+  const qualifyingHistory = withinWindow(windowedHistory, limit.windowHours, trade.occurredAt).filter((historyTrade) =>
+    isQualifyingAcquisition(historyTrade, limit.tier),
+  );
+
+  // A disposal, or an acquisition into a different tier, never consumes this allowance —
+  // regardless of its own price, so an unpriced non-qualifying trade must not fail this
+  // limit closed the way it would `daily_notional_usd`.
+  if (!isQualifyingAcquisition(trade, limit.tier)) {
+    const priorUsd = sumTradeUsd(qualifyingHistory);
+
+    return {
+      limitId: limit.id,
+      type: 'asset_tier_acquisition_usd',
+      verdict: 'allow',
+      maxUsd: limit.maxUsd,
+      windowHours: limit.windowHours,
+      priorUsd,
+      totalUsd: priorUsd,
+      reason: 'not_an_acquisition_into_this_tier',
+    };
+  }
+
+  if (trade.usdValue === null) {
+    return unevaluable(limit, 'trade_unpriced');
+  }
+
+  const priorUsd = sumTradeUsd(qualifyingHistory);
+
+  if (priorUsd === null) {
+    return unevaluable(limit, 'history_contains_unpriced_trade');
+  }
+
+  const totalUsd = addUsd(priorUsd, trade.usdValue);
+  const verdict: LimitVerdict = compareUsd(totalUsd, limit.maxUsd) > 0 ? 'violation' : 'allow';
+
+  return {
+    limitId: limit.id,
+    type: 'asset_tier_acquisition_usd',
+    verdict,
+    maxUsd: limit.maxUsd,
+    windowHours: limit.windowHours,
+    priorUsd,
+    totalUsd,
+    reason: verdict === 'violation' ? 'exceeds_asset_tier_acquisition_limit' : 'within_asset_tier_acquisition_limit',
+  };
+}
+
 function evaluateLimit(limit: LimitRule, windowedHistory: EvaluableTrade[], trade: EvaluableTrade): LimitEvaluation {
   switch (limit.type) {
     case 'daily_notional_usd':
       return evaluateDailyNotional(limit, windowedHistory, trade);
 
-    // Phases 5/6 add cases here. Until then, fail closed rather than silently allow.
     case 'asset_tier_acquisition_usd':
+      return evaluateAssetTierAcquisition(limit, windowedHistory, trade);
+
+    // Phase 6 adds its case here. Until then, fail closed rather than silently allow.
     case 'rolling_loss_usd':
       return unevaluable(limit, 'limit_type_not_yet_implemented');
 

@@ -1,4 +1,4 @@
-import type { Constitution } from '@degencage/rules';
+import type { AssetTier, Constitution } from '@degencage/rules';
 import {
   bigint,
   boolean,
@@ -237,9 +237,14 @@ export type ConstitutionRow = typeof constitutions.$inferSelect;
  * over an already-swept range a no-op rather than a duplicate row
  * (`.ai/decisions/event-time-vs-observation-time.md`'s "resumable and idempotent").
  *
- * Tier/loss columns (`acquired_tier`, `is_acquisition`, `is_round_trip_close`,
- * `realized_loss_usd`) are Phase 5/6 additions, deliberately not here — this migration is
- * scoped to exactly what Phase 4 evaluates (`daily_notional_usd` only).
+ * `acquired_tier`/`is_acquisition` are Phase 5's additions: `acquired_tier` is the
+ * market-cap tier of `bought_mint` at classification time (`server/chain/classify-token.ts`),
+ * stamped once and never recomputed — a tier is a point-in-time judgement, and a token that
+ * later moons must not retroactively rewrite a past violation (decision 17, append-only).
+ * `is_acquisition` is `true` for every real (non-excluded) trade — a swap always acquires
+ * exactly one tier, the bought leg's — and `false`/`null` for an excluded candidate, where
+ * classification never runs. Loss columns (`is_round_trip_close`, `realized_loss_usd`) are
+ * Phase 6's addition, deliberately not here.
  *
  * `usd_value` is nullable and must never be coerced to `0`: an unpriceable trade is
  * unpriced, not free (CLAUDE.md → fail closed). `is_baseline` marks a trade from the
@@ -281,6 +286,14 @@ export const trades = pgTable(
     priceSource: text('price_source'),
     isBaseline: boolean('is_baseline').notNull().default(false),
     excludedReason: text('excluded_reason'),
+    /**
+     * The market-cap tier `AssetTier` (`@degencage/rules`) of `bought_mint`, at
+     * classification time. `null` for an excluded candidate. Plain `text`, not a `pgEnum` —
+     * same choice as `excluded_reason` above, which is also a closed TS union stored as text.
+     */
+    acquiredTier: text('acquired_tier').$type<AssetTier>(),
+    /** `true` for every real (non-excluded) trade; `false` for an excluded candidate. */
+    isAcquisition: boolean('is_acquisition').notNull().default(false),
   },
   (table) => [
     // The rolling-window sum's predicate: one wallet's live trades in a time range.

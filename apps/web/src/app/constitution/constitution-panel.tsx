@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import type { AssetTier } from '@degencage/rules';
 import type { SerializedConstitution } from '@/server/constitution/commitment';
 
 /**
- * The interactive half of `/constitution`: author a daily-notional limit, commit it, watch
- * a server-driven countdown, then activate.
+ * The interactive half of `/constitution`: author a daily-notional limit and, since Phase 5,
+ * an optional per-asset-tier acquisition limit, commit them, watch a server-driven countdown,
+ * then activate.
  *
  * The countdown is cosmetic between polls only — `remainingMs` always comes from the last
  * `GET /api/constitution` response, never from a client-side clock counting down on its
@@ -15,6 +17,14 @@ import type { SerializedConstitution } from '@/server/constitution/commitment';
  */
 
 const POLL_INTERVAL_MS = 5_000;
+
+/**
+ * Hardcoded here rather than imported: `packages/rules` keeps `ASSET_TIERS` internal (its
+ * public surface is unchanged in shape by Phase 5 — only the `AssetTier` type's members
+ * changed), and the daily-notional limit's `type` literal is already hardcoded the same way
+ * just below.
+ */
+const ASSET_TIER_OPTIONS: readonly AssetTier[] = ['STABLE', 'LARGE_CAP', 'MID_CAP', 'SMALL_CAP', 'MICRO_CAP'];
 
 interface ConstitutionResponse {
   constitution: SerializedConstitution | null;
@@ -40,6 +50,8 @@ export interface ConstitutionPanelProps {
 export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
   const [constitution, setConstitution] = useState<SerializedConstitution | null>(initial);
   const [maxUsd, setMaxUsd] = useState('');
+  const [tierMaxUsd, setTierMaxUsd] = useState('');
+  const [tier, setTier] = useState<AssetTier>('MICRO_CAP');
   const [error, setError] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   // Seeded from the stored limit's id when one already exists — Phase 8's pending-change
@@ -47,6 +59,9 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
   // mount would silently detach a draft edit from the limit it is meant to describe.
   const limitIdRef = useRef<string>(
     initial?.document.limits.find((limit) => limit.type === 'daily_notional_usd')?.id ?? crypto.randomUUID(),
+  );
+  const tierLimitIdRef = useRef<string>(
+    initial?.document.limits.find((limit) => limit.type === 'asset_tier_acquisition_usd')?.id ?? crypto.randomUUID(),
   );
 
   const refresh = useCallback(async () => {
@@ -75,20 +90,31 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
     setIsBusy(true);
 
     try {
+      const limits: unknown[] = [
+        {
+          id: limitIdRef.current,
+          type: 'daily_notional_usd',
+          maxUsd,
+          windowHours: 24,
+        },
+      ];
+
+      // The tier limit is optional — an empty field means the user only wants the daily
+      // total for now, not a rejected draft.
+      if (tierMaxUsd.trim() !== '') {
+        limits.push({
+          id: tierLimitIdRef.current,
+          type: 'asset_tier_acquisition_usd',
+          tier,
+          maxUsd: tierMaxUsd,
+          windowHours: 24,
+        });
+      }
+
       const draftResponse = await fetch('/api/constitution', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          schemaVersion: 1,
-          limits: [
-            {
-              id: limitIdRef.current,
-              type: 'daily_notional_usd',
-              maxUsd,
-              windowHours: 24,
-            },
-          ],
-        }),
+        body: JSON.stringify({ schemaVersion: 1, limits }),
       });
       const draftBody = await readJson(draftResponse);
 
@@ -138,10 +164,19 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
 
   if (constitution?.status === 'active') {
     const limit = constitution.document.limits.find((rule) => rule.type === 'daily_notional_usd');
+    const tierLimit = constitution.document.limits.find(
+      (rule): rule is Extract<typeof rule, { type: 'asset_tier_acquisition_usd' }> =>
+        rule.type === 'asset_tier_acquisition_usd',
+    );
 
     return (
       <section>
         <p>Active. Daily notional limit: ${limit?.maxUsd ?? '—'}/day.</p>
+        {tierLimit ? (
+          <p>
+            {tierLimit.tier} acquisition limit: ${tierLimit.maxUsd}/{tierLimit.windowHours}h.
+          </p>
+        ) : null}
       </section>
     );
   }
@@ -173,6 +208,29 @@ export function ConstitutionPanel({ initial }: ConstitutionPanelProps) {
           placeholder="500"
         />
       </label>
+      <fieldset>
+        <legend>Per-asset-tier acquisition limit (optional)</legend>
+        <label>
+          Tier
+          <select value={tier} onChange={(event) => setTier(event.target.value as AssetTier)}>
+            {ASSET_TIER_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Max USD acquired into this tier per 24h
+          <input
+            type="text"
+            inputMode="decimal"
+            value={tierMaxUsd}
+            onChange={(event) => setTierMaxUsd(event.target.value)}
+            placeholder="100"
+          />
+        </label>
+      </fieldset>
       <button disabled={isBusy || maxUsd.trim() === ''} onClick={handleCommit}>
         Commit
       </button>

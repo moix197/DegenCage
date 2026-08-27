@@ -1,4 +1,4 @@
-import { evaluateTrade, migrateConstitution, type Constitution } from '@degencage/rules';
+import { evaluateTrade, migrateConstitution, type AssetTier, type Constitution } from '@degencage/rules';
 import { eq, sql } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
@@ -7,6 +7,7 @@ import { logger } from '../../observability/logger';
 import { resolveSession } from '../auth/session';
 import { getDb } from '../db/client';
 import { constitutions, trades, wallets, type NewTradeRow } from '../db/schema';
+import { classifyTokens } from './classify-token';
 import { deriveSwapFromTransaction, type DerivedSwap } from './derive-swaps';
 import { getTransactionsForAddress, type HeliusTransaction } from './helius-client';
 import { priceTrade } from '../pricing/price-trade';
@@ -129,7 +130,12 @@ async function failReconciliation(walletId: string, userId: string, correlationI
   }
 }
 
-function toNewTradeRow(walletId: string, swap: DerivedSwap, priced: { usdValue: string | null; priceSource: string | null }, isBaseline: boolean): NewTradeRow {
+function toNewTradeRow(
+  walletId: string,
+  swap: DerivedSwap,
+  priced: { usdValue: string | null; priceSource: string | null; acquiredTier: AssetTier | null; isAcquisition: boolean },
+  isBaseline: boolean,
+): NewTradeRow {
   return {
     walletId,
     signature: swap.signature,
@@ -144,6 +150,8 @@ function toNewTradeRow(walletId: string, swap: DerivedSwap, priced: { usdValue: 
     priceSource: priced.priceSource,
     isBaseline,
     excludedReason: swap.excludedReason,
+    acquiredTier: priced.acquiredTier,
+    isAcquisition: priced.isAcquisition,
   };
 }
 
@@ -151,20 +159,40 @@ interface PricedSwap {
   swap: DerivedSwap;
   usdValue: string | null;
   priceSource: string | null;
+  /** The market-cap tier of `swap.boughtMint`, or `null` for an excluded candidate. */
+  acquiredTier: AssetTier | null;
+  /** `true` for every real (non-excluded) swap — see `trades.isAcquisition`'s schema comment. */
+  isAcquisition: boolean;
 }
 
 /**
- * Prices every real (non-excluded) swap in `batch` — the slow, external-HTTP part
- * (`priceTrade` calls Binance, with its own timeout) — deliberately *outside* any database
- * transaction, so a row lock is never held across a network round trip. `persistBatch`
- * consumes the result and does only DB work under the lock.
+ * Classifies every distinct `boughtMint` across `batch`'s real (non-excluded) swaps in one
+ * pass — one comma-batched Jupiter request per reconcile batch (`classify-token.ts`), not
+ * one per trade. Runs for baseline trades too: the status page shows a (clearly labeled,
+ * non-contemporaneous) tier badge on backfilled history as well as live trades.
+ */
+async function classifyBatch(batch: DerivedSwap[]): Promise<Map<string, { tier: AssetTier; classification: 'known' | 'unknown' }>> {
+  const boughtMints = batch
+    .filter((swap) => swap.excludedReason === null && swap.boughtMint !== null)
+    .map((swap) => swap.boughtMint!);
+
+  return classifyTokens(boughtMints);
+}
+
+/**
+ * Prices and classifies every real (non-excluded) swap in `batch` — the slow, external-HTTP
+ * part (`priceTrade` calls Binance/Birdeye, `classifyBatch` calls Jupiter, each with its own
+ * timeout) — deliberately *outside* any database transaction, so a row lock is never held
+ * across a network round trip. `persistBatch` consumes the result and does only DB work
+ * under the lock.
  */
 async function priceBatch(batch: DerivedSwap[]): Promise<PricedSwap[]> {
+  const classifications = await classifyBatch(batch);
   const priced: PricedSwap[] = [];
 
   for (const swap of batch) {
     if (swap.excludedReason !== null) {
-      priced.push({ swap, usdValue: null, priceSource: null });
+      priced.push({ swap, usdValue: null, priceSource: null, acquiredTier: null, isAcquisition: false });
       continue;
     }
 
@@ -178,7 +206,11 @@ async function priceBatch(batch: DerivedSwap[]): Promise<PricedSwap[]> {
       occurredAt: swap.occurredAt,
     });
 
-    priced.push({ swap, usdValue: result.usdValue, priceSource: result.priceSource });
+    // `classifyTokens` returns an entry for every mint it was asked to classify — the
+    // fallback here is defensive only, never expected to trigger.
+    const tier = classifications.get(swap.boughtMint!)?.tier ?? 'MICRO_CAP';
+
+    priced.push({ swap, usdValue: result.usdValue, priceSource: result.priceSource, acquiredTier: tier, isAcquisition: true });
   }
 
   return priced;
@@ -242,7 +274,12 @@ async function persistOneSwap(
   }
 
   if (constitution) {
-    const decision = evaluateTrade(constitution, windowedHistory, { occurredAt: swap.occurredAt, usdValue: priced.usdValue });
+    const decision = evaluateTrade(constitution, windowedHistory, {
+      occurredAt: swap.occurredAt,
+      usdValue: priced.usdValue,
+      isAcquisition: priced.isAcquisition,
+      acquiredTier: priced.acquiredTier,
+    });
 
     await recordEvent(
       {

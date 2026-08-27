@@ -116,20 +116,110 @@ describe('evaluateTrade — daily_notional_usd', () => {
   it('returns unevaluable, not a silent allow, for a limit type not yet implemented', () => {
     const constitution: Constitution = {
       schemaVersion: CONSTITUTION_SCHEMA_VERSION,
-      limits: [
-        { id: 'limit-tier', type: 'asset_tier_acquisition_usd', tier: 'MEMECOIN', maxUsd: '100', windowHours: 24 },
-        { id: 'limit-loss', type: 'rolling_loss_usd', maxUsd: '200', windowHours: 168 },
-      ],
+      limits: [{ id: 'limit-loss', type: 'rolling_loss_usd', maxUsd: '200', windowHours: 168 }],
     };
 
     const decision = evaluateTrade(constitution, [], trade());
 
     expect(decision.evaluations).toEqual([
-      expect.objectContaining({ limitId: 'limit-tier', verdict: 'unevaluable', reason: 'limit_type_not_yet_implemented' }),
       expect.objectContaining({ limitId: 'limit-loss', verdict: 'unevaluable', reason: 'limit_type_not_yet_implemented' }),
     ]);
   });
 
+});
+
+describe('evaluateTrade — asset_tier_acquisition_usd', () => {
+  function tierConstitution(tier: 'MICRO_CAP' | 'LARGE_CAP', maxUsd: string): Constitution {
+    return {
+      schemaVersion: CONSTITUTION_SCHEMA_VERSION,
+      limits: [{ id: 'limit-tier', type: 'asset_tier_acquisition_usd', tier, maxUsd, windowHours: 24 }],
+    };
+  }
+
+  it('flags a violation when a buy pushes the tier total past its limit', () => {
+    const decision = evaluateTrade(
+      tierConstitution('MICRO_CAP', '100'),
+      [trade({ usdValue: '80', isAcquisition: true, acquiredTier: 'MICRO_CAP' })],
+      trade({ usdValue: '50', isAcquisition: true, acquiredTier: 'MICRO_CAP' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({
+      verdict: 'violation',
+      priorUsd: '80',
+      totalUsd: '130',
+      reason: 'exceeds_asset_tier_acquisition_limit',
+    });
+  });
+
+  it('allows a buy that stays within the tier limit', () => {
+    const decision = evaluateTrade(
+      tierConstitution('MICRO_CAP', '100'),
+      [],
+      trade({ usdValue: '50', isAcquisition: true, acquiredTier: 'MICRO_CAP' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', totalUsd: '50', reason: 'within_asset_tier_acquisition_limit' });
+  });
+
+  it('never counts a sell out of the tier against the limit, no matter the amount', () => {
+    const decision = evaluateTrade(
+      tierConstitution('MICRO_CAP', '10'),
+      [trade({ usdValue: '9', isAcquisition: true, acquiredTier: 'MICRO_CAP' })],
+      trade({ usdValue: '999999', isAcquisition: false, acquiredTier: 'MICRO_CAP' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', reason: 'not_an_acquisition_into_this_tier' });
+  });
+
+  it('never counts a buy into a different tier against this tier\'s limit', () => {
+    const decision = evaluateTrade(
+      tierConstitution('MICRO_CAP', '10'),
+      [],
+      trade({ usdValue: '999999', isAcquisition: true, acquiredTier: 'LARGE_CAP' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'allow', reason: 'not_an_acquisition_into_this_tier' });
+  });
+
+  it('a trade can violate the tier limit and still be within the daily-notional limit — independent evaluations', () => {
+    const constitution: Constitution = {
+      schemaVersion: CONSTITUTION_SCHEMA_VERSION,
+      limits: [
+        { id: 'limit-tier', type: 'asset_tier_acquisition_usd', tier: 'MICRO_CAP', maxUsd: '10', windowHours: 24 },
+        { id: 'limit-daily', type: 'daily_notional_usd', maxUsd: '5000', windowHours: 24 },
+      ],
+    };
+
+    const decision = evaluateTrade(constitution, [], trade({ usdValue: '50', isAcquisition: true, acquiredTier: 'MICRO_CAP' }));
+
+    expect(decision.evaluations).toEqual([
+      expect.objectContaining({ limitId: 'limit-tier', verdict: 'violation' }),
+      expect.objectContaining({ limitId: 'limit-daily', verdict: 'allow' }),
+    ]);
+  });
+
+  it('fails closed on an unpriced qualifying acquisition', () => {
+    const decision = evaluateTrade(
+      tierConstitution('MICRO_CAP', '100'),
+      [],
+      trade({ usdValue: null, isAcquisition: true, acquiredTier: 'MICRO_CAP' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'trade_unpriced' });
+  });
+
+  it('fails closed when the qualifying window history contains an unpriced trade', () => {
+    const decision = evaluateTrade(
+      tierConstitution('MICRO_CAP', '100'),
+      [trade({ usdValue: null, isAcquisition: true, acquiredTier: 'MICRO_CAP' })],
+      trade({ usdValue: '10', isAcquisition: true, acquiredTier: 'MICRO_CAP' }),
+    );
+
+    expect(decision.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'history_contains_unpriced_trade' });
+  });
+});
+
+describe('evaluateTrade — cross-limit independence', () => {
   it('evaluates every limit on the constitution independently', () => {
     const constitution: Constitution = {
       schemaVersion: CONSTITUTION_SCHEMA_VERSION,

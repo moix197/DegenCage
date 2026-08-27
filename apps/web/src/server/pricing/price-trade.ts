@@ -1,21 +1,13 @@
 import { getSolUsdPrice, SOL_MINT } from './binance-klines';
+import { getBirdeyeUsdPrice } from './birdeye-price';
+import { isStablecoin } from '../chain/stablecoin-mints';
 
 /**
- * Leg-selection pricing (decision 19): price only the known SOL/stablecoin leg of a swap.
- * A trade with neither leg priceable is `usd_value: null` — fail closed, never `$0`, never
- * silently folded into the notional sum as zero (CLAUDE.md). Long-tail alt↔alt pricing via
- * Birdeye is Phase 5, not here.
+ * Leg-selection pricing (decision 19): price only the known SOL/stablecoin leg of a swap,
+ * falling back to Birdeye long-tail pricing (Phase 5) when neither leg is SOL/stablecoin. A
+ * trade priceable by none of these is `usd_value: null` — fail closed, never `$0`, never
+ * silently folded into the notional sum as zero (CLAUDE.md).
  */
-
-/** USDC and USDT mints — priced at exactly $1 with zero external calls. */
-const STABLECOIN_MINTS: ReadonlySet<string> = new Set([
-  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
-]);
-
-function isStablecoin(mint: string): boolean {
-  return STABLECOIN_MINTS.has(mint);
-}
 
 export interface PriceableTrade {
   soldMint: string;
@@ -95,6 +87,27 @@ export async function priceTrade(trade: PriceableTrade): Promise<PricedTrade> {
     };
   }
 
-  // Alt<->alt: unresolvable until Phase 5's Birdeye fallback.
+  // Alt<->alt: neither leg is SOL/stablecoin. Try Birdeye for each leg in turn — this is a
+  // best-effort fallback, not a true liquidity comparison (a cheap batched liquidity signal
+  // isn't available here), so the sold leg is tried first and the bought leg only if that
+  // fails; whichever resolves first is priced and used.
+  const soldPrice = await getBirdeyeUsdPrice(trade.soldMint, trade.occurredAt);
+
+  if (soldPrice !== null) {
+    return {
+      usdValue: multiplyUsd(baseUnitsToDecimalString(trade.soldAmountBaseUnits, trade.soldDecimals), soldPrice),
+      priceSource: 'birdeye',
+    };
+  }
+
+  const boughtPrice = await getBirdeyeUsdPrice(trade.boughtMint, trade.occurredAt);
+
+  if (boughtPrice !== null) {
+    return {
+      usdValue: multiplyUsd(baseUnitsToDecimalString(trade.boughtAmountBaseUnits, trade.boughtDecimals), boughtPrice),
+      priceSource: 'birdeye',
+    };
+  }
+
   return { usdValue: null, priceSource: null };
 }
