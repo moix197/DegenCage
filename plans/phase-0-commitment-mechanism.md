@@ -342,20 +342,20 @@ Stored as `constitutions.document jsonb` (matches `single-source-of-truth-databa
 
 - [x] Live Helius smoke test succeeds on the free tier (documented result, not just "it worked")
 - [x] `pnpm test` passes
-- [ ] Manual: connect a real wallet with known trade history, activate a daily-notional constitution, confirm the status page populates correctly, baseline trades are visibly marked private, re-opening the app doesn't duplicate rows
+- [x] Manual: connect a real wallet with known trade history, activate a daily-notional constitution, confirm the status page populates correctly, baseline trades are visibly marked private, re-opening the app doesn't duplicate rows
 
 **Phase review:**
 
-- [ ] All Steps and Verification checkboxes above ticked in the plan file
-- [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
-- [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
+- [x] All Steps and Verification checkboxes above ticked in the plan file
+- [x] Reviewer handoff prompt emitted — N/A: superseded by `/execute-prd` subagent dispatch
+- [x] Orchestrator cleared context — N/A: superseded by `/execute-prd` subagent dispatch
 - [x] Code-reviewer agent has verified this phase
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
 - [ ] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: reconcile chain history and enforce the daily notional limit end to end`
-- [ ] Phase marked complete
+- [x] Orchestrator (user) has verified and approved this phase
+- [x] Changes committed: `feat: reconcile chain history and enforce the daily notional limit end to end`
+- [x] Phase marked complete
 
 ---
 
