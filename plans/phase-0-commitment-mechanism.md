@@ -428,7 +428,9 @@ Thresholds live in one named exported constant so they are tunable without touch
 **Verification:**
 
 - [x] `pnpm test` passes
-- [ ] Manual: activate a constitution with a tight `MICRO_CAP` limit, execute a small real swap into a low-cap token on-chain, confirm it's flagged with correct reasoning; confirm selling out of an over-limit tier is never itself flagged; confirm flipping `classification.jupiter_mcap` off degrades every classification to `MICRO_CAP`/`unknown` rather than erroring
+- [~] Manual (**deferred to Phase 7**): activate a constitution with a tight `MICRO_CAP` limit, execute a small real swap into a low-cap token on-chain, confirm it is flagged with correct reasoning; confirm selling out of an over-limit tier is never itself flagged; confirm flipping `classification.jupiter_mcap` off degrades every classification to `MICRO_CAP`/`unknown` rather than erroring.
+
+  **Why deferred:** Phase 0 has no swap UI, so exercising this today means trading on Jupiter directly, waiting for reconcile, and reading the outcome out of the database — disproportionate setup to confirm behavior the unit tests already cover, and it would be repeated again for Phase 6. Phase 7 builds the dashboard that makes these outcomes directly observable; the real-swap pass runs once there, covering Phases 5 and 6 together. Accepted risk: the classification and pricing paths stay unexercised against live Jupiter/Birdeye responses until Phase 7, so a schema drift in either provider would not surface before then.
 
 **Phase review:**
 
@@ -438,7 +440,7 @@ Thresholds live in one named exported constant so they are tunable without touch
 - [x] Code-reviewer agent has verified this phase
 - [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
-- [ ] Documentation updated
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `feat: market-cap asset tiers and per-tier acquisition limits`
 - [ ] Phase marked complete
@@ -540,6 +542,7 @@ No additional automated tests for the page component's polling behavior itself �
 
 - [ ] `pnpm test` passes
 - [ ] Manual: confirm the remaining-allowance figures visibly change as old trades age out of the rolling window without any new activity, without a manual reload; confirm baseline trades never appear in the feed; confirm copy review
+- [ ] Manual (**consolidated on-chain pass, deferred from Phases 5 and 6**): with the dashboard in place, run the real-swap verifications those phases deferred — Phase 5: a small swap into a low-cap token is flagged against a tight `MICRO_CAP` limit with correct reasoning, selling out of an over-limit tier is never itself flagged, and flipping `classification.jupiter_mcap` off degrades to `MICRO_CAP`/`unknown` rather than erroring; Phase 6: a real round-trip realizes the expected FIFO loss and trips the rolling loss limit. This is also the first live exercise of the Jupiter Tokens v2 and Birdeye response shapes — treat an unexpected payload as a finding, not a test-setup problem.
 
 **Phase review:**
 

@@ -33,9 +33,11 @@ unpriced trade in a window makes the window's total `null`, which the rule engin
   data into a favorable reading of the user's behavior. Fail closed instead.
 - **Carrying forward the last known price / interpolating** — invents a number that then
   becomes an audit-trail fact indistinguishable from a real one.
-- **A paid long-tail price API (Birdeye) for everything, now** — deliberately deferred to
-  Phase 5 for the alt↔alt fallback only. Phase 4 exists to prove the ingestion pipeline is
-  correct; adding a second priced dependency to do it buys risk, not signal.
+- **A paid long-tail price API (Birdeye) for everything** — Phase 4 exists to prove the
+  ingestion pipeline is correct; adding a second priced dependency to do it buys risk, not
+  signal. Phase 5 added Birdeye (`pricing/birdeye-price.ts`, flag `pricing.birdeye`) as the
+  **alt↔alt fallback only**: it is consulted when neither leg is a stablecoin or SOL, never
+  in place of the face-value or Binance paths.
 - **An on-chain / DEX-quote price at the trade's slot** — most accurate in principle, but
   needs the long-tail infrastructure this phase is avoiding, for majors that Binance already
   prices exactly.
@@ -44,6 +46,14 @@ unpriced trade in a window makes the window's total `null`, which the rule engin
 
 - USD amounts are exact decimal strings computed with `BigInt`, never floats — in pricing,
   in the rolling sum, and in the rule engine. `usd_value` is `NUMERIC(38,12)`.
+- **A price crossing the JSON-number boundary must be converted to fixed notation, not via
+  `toString()`.** JavaScript renders numbers below `1e-6` in exponential form
+  (`1.2345e-7`), and `BigInt('12345e-7')` throws — which, because `reconcileWallet` rethrows,
+  fails the *entire wallet's* reconciliation rather than one trade. Long-tail mints priced
+  through Birdeye are routinely sub-$0.000001, so this is the common case there, not an edge
+  case. `birdeye-price.ts` converts to a plain decimal string with no precision loss and
+  rejects non-finite values to `null`. Any future price source arriving as a JSON number
+  inherits this requirement.
 - Stablecoins are pinned to exactly $1. A depeg is knowingly not modeled.
 - SOL/USDT is treated as SOL/USD.
 - Behind its own kill switch (`pricing.binance`); disabled, timed out, or an unresolvable

@@ -27,7 +27,12 @@ POST /api/wallet/reconcile ──> reconcileWallet(correlationId)
    │    sorted by (slot, transactionIndex)
    │
    ▼  chunk(100) — then, per batch:
-        priceBatch()    ← HTTP, OUTSIDE any transaction
+        priceBatch()      ← HTTP, OUTSIDE any transaction
+        classifyTokens()  ← HTTP, OUTSIDE any transaction
+                          classify-token.ts + jupiter-tokens.ts
+                          bought mints, comma-batched into ONE Jupiter call
+                          STABLE from the curated set, else mcap buckets
+                          anything unresolved → MICRO_CAP + 'unknown'
         persistBatch()  ┌─ ONE transaction ──────────────────────────────────┐
                         │ SELECT … FOR UPDATE the wallet row                 │
                         │ per swap: loadWindowedTrades → INSERT … ON CONFLICT│
@@ -48,6 +53,11 @@ POST /api/wallet/reconcile ──> reconcileWallet(correlationId)
 | `CHAIN_HELIUS_FLAG` | the kill switch the *client* checks |
 | `deriveSwapFromTransaction(tx, address)` | pure; the whole swap heuristic, independently testable |
 | `LST_MINTS` / `isSolOrLstMint` / `WSOL_MINT` | the shared SOL/LST set |
+| `STABLECOIN_MINTS` / `isStablecoin` | the shared stablecoin set — read by `server/pricing` too, so the two cannot disagree |
+| `classifyToken(mint)` / `classifyTokens(mints)` | market-cap tier + `'known' \| 'unknown'` quality; never throws |
+| `ASSET_TIER_MCAP_THRESHOLDS_USD` | the $1B / $100M / $10M bucket boundaries, in one place |
+| `lookupTokenMcaps(mints)` | batched Jupiter Tokens v2 `mcap` read, TTL-cached per mint |
+| `CLASSIFICATION_JUPITER_MCAP_FLAG` | the kill switch classification checks |
 
 ## Invariants a change must not break
 
@@ -86,6 +96,19 @@ POST /api/wallet/reconcile ──> reconcileWallet(correlationId)
   "we could not check", which silently marks a reconciliation `current` on no data.
 - **Wallet identity comes only from `resolveSession()`.** No function below
   `reconcileWallet` takes a wallet id from anything a caller supplies.
+- **Classification never throws.** Timeout, Jupiter error, unlisted mint, `mcap: null`, and
+  a disabled flag all resolve to the same `MICRO_CAP` + `'unknown'` default. This is
+  load-bearing, not defensive style: `reconcileWallet` rethrows, so a raising classifier
+  fails an entire wallet's reconciliation over one unrecognised token. Contrast the Helius
+  client, which throws *on purpose* — there, an empty list would be misread as "no trades";
+  here, a fail-closed tier is a complete and honest answer.
+- **A tier is stamped once, never recomputed.** `mcap` is live, so `acquired_tier` and
+  `classification` are properties of the moment the trade was classified. Recomputing them
+  later would let a token that moons rewrite past violations.
+- **`classification` is not decoration.** `MICRO_CAP` + `'unknown'` (we could not tell) and
+  `MICRO_CAP` + `'known'` (a real sub-$10M read) are different facts, and only the first
+  gets the "counted as micro cap" note. Dropping the column would leave the audit trail
+  unable to tell a genuine classification from a provider outage.
 - **`MAX_PAGES` is a real bound, not a formality.** No unbounded loop against an external
   API; hitting it logs a truncation warning rather than looping or failing.
 
@@ -130,6 +153,7 @@ All carry the run's `correlationId`, so one reconciliation is one thread through
 | `wallet.reconciliation_started` / `wallet.reconciliation_completed` | every later run |
 | `wallet.reconciliation_failed` | Helius or persistence threw; state set `failed` |
 | `trade.excluded` | live, non-baseline, newly-inserted excluded candidate |
+| `trade.classified` | live real trade's bought mint resolved to a tier — carries the quality, so a fail-closed `MICRO_CAP` is distinguishable in the audit trail |
 | `rule.decision_recorded` | live real trade evaluated against an active constitution |
 
 The last two are written **inside the batch transaction**, so a decision cannot exist
@@ -138,12 +162,13 @@ wrapped so it can never mask or throw past the original error.
 
 ## Kill switches
 
-Two, at different layers, both seeded by `src/server/db/seed.ts`:
+Three, at different layers, all seeded by `src/server/db/seed.ts`:
 
 | Flag | Off means |
 | ---- | --------- |
 | `chain.helius_reconcile` | the route answers `503` and the status page hides the control — no run starts |
 | `chain.helius` | the client throws — an already-started run fails closed rather than persisting a truncated history |
+| `classification.jupiter_mcap` | no Jupiter call is made and every non-stablecoin mint classifies `MICRO_CAP` + `'unknown'`. Reconciliation still runs and still records trades; tier limits simply see everything as the most conservative tier |
 
 Neither deletes anything already reconciled; both stop new reads. A flag lookup that itself
 fails is treated as off.

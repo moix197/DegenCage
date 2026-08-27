@@ -3,9 +3,9 @@
 **Decision:** `packages/rules/src/constitution.ts` defines the constitution as
 `{ schemaVersion, limits: LimitRule[] }`, where `LimitRule` is a discriminated union whose
 **all three** members (`daily_notional_usd`, `asset_tier_acquisition_usd`,
-`rolling_loss_usd`) exist now, even though only the first is offered by the authoring UI
-and only the first is evaluated — `evaluateTrade` returns `unevaluable` (never a silent
-allow) for the other two until their phases land. It is stored whole in
+`rolling_loss_usd`) exist now. `daily_notional_usd` and `asset_tier_acquisition_usd` are
+offered by the authoring UI and evaluated; `evaluateTrade` returns `unevaluable` (never a
+silent allow) for `rolling_loss_usd` until its phase lands. It is stored whole in
 `constitutions.document jsonb`,
 with `schema_version` mirrored as a relational column. Each `LimitRule` carries a stable
 `id`, and `windowHours` is a plain number rather than a `24` literal.
@@ -47,8 +47,16 @@ limit type never does.
   input (the draft/save path) and returns a reason; `migrateConstitution` validates our own
   *stored* row and **throws**, because a failure there means the row is corrupt. Never
   substitute one for the other.
-- The server validator accepts any well-formed `LimitRule`, including the two the UI does
-  not offer — Phases 5/6 add their UI with no server change.
+- The server validator accepts any well-formed `LimitRule`, including one the UI does not
+  yet offer — Phase 5 added `asset_tier_acquisition_usd`'s UI with no server-validator
+  change, and Phase 6 adds `rolling_loss_usd`'s the same way.
+- **The `AssetTier` *vocabulary* is not covered by the stability argument above.** Phase 5
+  replaced the identity tiers with market-cap tiers
+  ([asset-tier-by-market-cap](asset-tier-by-market-cap.md)) — a change to the set of legal
+  `tier` values, which is exactly the kind of reshape that would need `migrateConstitution`
+  had any constitution carrying a tier limit already been committed. None had, so the
+  vocabulary was swapped outright. Changing it again once users hold tier limits is a
+  version bump, not an edit.
 - `maxUsd` is a decimal **string**, and positivity is proven digit-by-digit, never through
   `parseFloat`: a long enough digit string parses to `Infinity`, which is `> 0`, so a float
   check would pass a value it never actually read. The evaluator keeps that discipline:

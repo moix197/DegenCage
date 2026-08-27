@@ -25,7 +25,10 @@ priceTrade(trade)                              price-trade.ts
    │                             price × amount, exact BigInt decimal math
    │                             priceSource: 'binance'  |  null on any failure
    │
-   └─ alt <-> alt ─────────────> { usdValue: null, priceSource: null }
+   └─ alt <-> alt ─────────────> getBirdeyeUsdPrice(mint, occurredAt)  birdeye-price.ts
+                                   the more liquid leg only
+                                   price × amount, exact BigInt decimal math
+                                   priceSource: 'birdeye'  |  null on any failure
 ```
 
 ## Public surface
@@ -34,8 +37,9 @@ priceTrade(trade)                              price-trade.ts
 | ------ | ---- |
 | `priceTrade(trade)` | leg selection and the exact multiplication; returns `{ usdValue, priceSource }` |
 | `getSolUsdPrice(occurredAt)` | the cached SOL/USD minute price; `null` on any failure |
+| `getBirdeyeUsdPrice(mint, occurredAt)` | the long-tail fallback price for one mint; `null` on any failure |
 | `minuteBucketUtc(date)` | the cache key's time half — floor to the UTC minute |
-| `SOL_MINT`, `PRICING_BINANCE_FLAG` | the wSOL mint address, and the kill switch |
+| `SOL_MINT`, `PRICING_BINANCE_FLAG`, `PRICING_BIRDEYE_FLAG` | the wSOL mint address, and the two kill switches |
 
 ## Invariants a change must not break
 
@@ -60,6 +64,13 @@ priceTrade(trade)                              price-trade.ts
   `multiplyUsd` manipulate digits directly and the result stays a string all the way into
   `numeric(38, 12)`. A single `Number` in this path is a rounding bug in a dollar figure a
   user is held to.
+- **A price arriving as a JSON number is converted to *fixed* notation, never via
+  `toString()`.** JavaScript renders anything below `1e-6` as `1.2345e-7`, and
+  `BigInt('12345e-7')` **throws** — which, because `reconcileWallet` rethrows, fails the
+  entire wallet's reconciliation rather than one trade. Birdeye's long-tail mints are
+  routinely sub-$0.000001, so this is the common case on that path, not an edge case.
+  `birdeye-price.ts` converts digit-wise with no precision loss and rejects non-finite
+  values to `null`. Any future price source that arrives as a number inherits this.
 - **`priceTrade` is called outside any database transaction.** It does external HTTP with
   its own timeout; `reconcile-wallet.ts`'s `priceBatch` deliberately runs before the
   row-locked `persistBatch` so no lock is ever held across a network round trip. Calling it
@@ -74,16 +85,28 @@ A swap has two sides; pricing the *known* one is exact and needs no price for th
 stablecoin leg is $1 with zero external calls; a SOL leg needs one cached minute price. That
 covers the overwhelming majority of real Solana swap volume with one external dependency.
 
-**Alt↔alt is deliberately out of scope in Phase 4** and returns `null` — a long-tail token
-price needs a different source (Birdeye), which arrives in Phase 5 as a fallback *after*
-these two branches, not as a replacement for them. Until then those trades are recorded with
-`usd_value: null` and correctly poison any window total they fall in, which is the honest
-answer rather than a silent undercount.
+**Alt↔alt is covered by Birdeye**, which sits *after* these two branches rather than
+replacing them: it is consulted only when neither leg is a stablecoin or SOL, and prices the
+more liquid leg. It is a fallback because it is a keyed, paid, long-tail source — the two
+branches above remain cheaper and more accurate for the volume they cover. When Birdeye is
+also unresolvable (flag off, no key, no price for that mint) the trade stays `usd_value:
+null` and correctly poisons any window total it falls in, which is the honest answer rather
+than a silent undercount.
+
+`STABLECOIN_MINTS` lives in `server/chain/stablecoin-mints.ts`, not here — pricing and
+Phase 5's tier classification both read the same set, so "is this a stablecoin" cannot get
+two different answers. Same reasoning as `lst-allowlist.ts`.
 
 The 8-second timeout and the `data-api.binance.vision` host (the public data mirror, no
 API key, no account) are both part of keeping this a bounded, unauthenticated read.
 
-## Kill switch
+## Kill switches
+
+`pricing.birdeye` (`PRICING_BIRDEYE_FLAG`) gates the alt↔alt branch only. Off, or with
+`BIRDEYE_API_KEY` unset, those swaps return to `usd_value: null` — the Phase 4 behaviour,
+fail-closed, never a guessed price. A missing key is caught inside the request path (it does
+not crash reconciliation), but it reports one error per attempted trade: set the key or turn
+the flag off, don't leave both.
 
 `pricing.binance` (`PRICING_BINANCE_FLAG`), seeded by `src/server/db/seed.ts`. Off — or with
 the flag lookup itself failing — `getSolUsdPrice` returns `null` before touching the cache or
