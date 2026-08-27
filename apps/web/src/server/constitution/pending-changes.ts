@@ -1,8 +1,9 @@
 import { compareUsd, migrateConstitution, parseConstitution, type Constitution, type LimitRule } from '@degencage/rules';
-import { and, eq, isNull, lte, sql, type SQL } from 'drizzle-orm';
+import { and, asc, count, eq, isNull, lte, sql, type SQL } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
 import { recordEvent } from '../../observability/events';
+import { logger } from '../../observability/logger';
 import { resolveSession, type SessionIdentity } from '../auth/session';
 import { getDb } from '../db/client';
 import {
@@ -413,7 +414,11 @@ async function applyOneDuePendingChange(pendingChangeId: string, correlationId: 
     const document = migrateConstitution(constitutionRow.document);
     const currentLimit = document.limits.find((limit) => limit.id === pending.limitId);
 
-    if (!currentLimit || currentLimit.maxUsd !== pending.oldValue) {
+    // Decimal-value comparison, not string equality: `"500"` and `"500.00"` are the same
+    // value and must not void a legitimate pending increase just because the stored digit
+    // string's formatting differs (`compareUsd` is the same exact-decimal helper
+    // `requestLimitChange` uses to decide direction in the first place).
+    if (!currentLimit || compareUsd(currentLimit.maxUsd, pending.oldValue) !== 0) {
       const voidedRows = await tx
         .update(constitutionPendingChanges)
         .set({ voidedAt: sql`now()` })
@@ -483,12 +488,24 @@ export interface ApplyDuePendingChangesResult {
   voidedCount: number;
 }
 
+/** `effective_at <= now()` and not yet resolved — the due-rows scan's own predicate, shared with the stranded-row count query below so the two can never drift apart. */
+function dueCondition(): SQL | undefined {
+  return stillPending(lte(constitutionPendingChanges.effectiveAt, sql`now()`));
+}
+
+/** How many rows are currently due — used only on the kill-switch-off path, to make a silent skip visible. */
+async function countDueRows(): Promise<number> {
+  const rows = await getDb().select({ total: count() }).from(constitutionPendingChanges).where(dueCondition());
+
+  return rows[0]?.total ?? 0;
+}
+
 /**
  * Resolves up to `PENDING_CHANGE_APPLY_BATCH_LIMIT` pending changes whose 48h has elapsed,
- * across every user's constitution. Piggybacks on the existing app-open trigger — the
- * dashboard load and the `/constitution/edit` load, and `POST /api/wallet/reconcile` — rather
- * than a scheduler; this is Phase 0's only "lazy cron" pattern
- * (`.ai/decisions/hosting-and-growth-path.md`), already used the same way for chain
+ * across every user's constitution, oldest-due first. Piggybacks on the existing app-open
+ * trigger — the dashboard load and the `/constitution/edit` load, and `POST
+ * /api/wallet/reconcile` — rather than a scheduler; this is Phase 0's only "lazy cron"
+ * pattern (`.ai/decisions/hosting-and-growth-path.md`), already used the same way for chain
  * reconciliation itself.
  *
  * Deliberately not scoped to the caller's own session: whoever happens to open the app first
@@ -497,33 +514,52 @@ export interface ApplyDuePendingChangesResult {
  * "even if the user reloads, closes the tab, or the change is checked well past its due time"
  * (this phase's success criteria), the moment *anyone's* app-open trigger runs. The batch cap
  * bounds one call's work; a backlog beyond it is picked up by the next trigger, not held open
- * in one unbounded scan.
+ * in one unbounded scan — ordered oldest-`effective_at`-first so a backlog drains in the order
+ * it became due, rather than in whatever order Postgres happens to return rows.
  *
- * Gated by `CONSTITUTION_PENDING_CHANGE_APPLY_FLAG` — off (or unreachable), this returns zero
- * counts without claiming, voiding, or applying anything; a due row simply waits for the next
- * pass once the switch is back on.
+ * Both a kill-switch skip and a batch-cap backlog are logged (CLAUDE.md → *No silent
+ * failures*: a stranded pending row must be visible in telemetry, not just quietly waiting for
+ * the next pass) — the first only when there is actually something stranded to report, the
+ * second only when the cap was actually hit.
  */
 export async function applyDuePendingChanges(correlationId: string): Promise<ApplyDuePendingChangesResult> {
   if (!(await isFeatureEnabled(CONSTITUTION_PENDING_CHANGE_APPLY_FLAG))) {
+    const strandedCount = await countDueRows();
+
+    if (strandedCount > 0) {
+      logger.warn('constitution pending-change apply skipped: kill switch is off', {
+        correlationId,
+        strandedCount,
+      });
+    }
+
     return { appliedCount: 0, voidedCount: 0 };
   }
 
+  // Fetched one over the cap so a full page (`length > PENDING_CHANGE_APPLY_BATCH_LIMIT`)
+  // proves there is a backlog beyond this batch, without a second round trip to count it.
   const dueRows = await getDb()
     .select({ id: constitutionPendingChanges.id })
     .from(constitutionPendingChanges)
-    .where(
-      and(
-        isNull(constitutionPendingChanges.appliedAt),
-        isNull(constitutionPendingChanges.voidedAt),
-        lte(constitutionPendingChanges.effectiveAt, sql`now()`),
-      ),
-    )
-    .limit(PENDING_CHANGE_APPLY_BATCH_LIMIT);
+    .where(dueCondition())
+    .orderBy(asc(constitutionPendingChanges.effectiveAt))
+    .limit(PENDING_CHANGE_APPLY_BATCH_LIMIT + 1);
+
+  const batchCapHit = dueRows.length > PENDING_CHANGE_APPLY_BATCH_LIMIT;
+  const rowsToProcess = batchCapHit ? dueRows.slice(0, PENDING_CHANGE_APPLY_BATCH_LIMIT) : dueRows;
+
+  if (batchCapHit) {
+    logger.warn('constitution pending-change apply batch cap hit; rows remain due', {
+      correlationId,
+      batchLimit: PENDING_CHANGE_APPLY_BATCH_LIMIT,
+      strandedAtLeast: dueRows.length - PENDING_CHANGE_APPLY_BATCH_LIMIT,
+    });
+  }
 
   let appliedCount = 0;
   let voidedCount = 0;
 
-  for (const dueRow of dueRows) {
+  for (const dueRow of rowsToProcess) {
     try {
       const outcome = await applyOneDuePendingChange(dueRow.id, correlationId);
 

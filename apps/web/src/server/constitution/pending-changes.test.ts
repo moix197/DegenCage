@@ -101,13 +101,16 @@ function pendingRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
-/** A thenable that is also chainable with `.limit()` / `.for('update').limit()` — covers every shape `select().from().where()` takes across this module. */
+/** A thenable that is also chainable with `.limit()` / `.for('update').limit()` / `.orderBy().limit()` — covers every shape `select().from().where()` takes across this module. */
 function queryResult(rows: unknown[]) {
   const promise = Promise.resolve(rows);
 
   return Object.assign(promise, {
     limit: () => Promise.resolve(rows),
     for: () => ({ limit: () => Promise.resolve(rows) }),
+    // Recurses so `.orderBy()` itself is awaitable AND further chainable with `.limit()` —
+    // the due-rows scan's `select().from().where().orderBy().limit(N)` shape.
+    orderBy: () => queryResult(rows),
   });
 }
 
@@ -122,9 +125,10 @@ function selectReturnsOn(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
   mock.mockReturnValueOnce({ from: () => ({ where: () => queryResult(rows) }) });
 }
 
-/** Same as `selectReturnsOn`, but captures the WHERE predicate and the `.limit(n)` argument — the due-rows scan's `select().from().where().limit(N)` shape. */
-function selectReturnsCapturingWhereAndLimit(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
+/** Same as `selectReturnsOn`, but captures the WHERE predicate, the `.orderBy(...)` argument, and the `.limit(n)` argument — the due-rows scan's `select().from().where().orderBy().limit(N)` shape. */
+function selectReturnsCapturingWhereOrderAndLimit(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
   const whereSpy = vi.fn();
+  const orderBySpy = vi.fn();
   const limitSpy = vi.fn();
 
   mock.mockReturnValueOnce({
@@ -133,17 +137,23 @@ function selectReturnsCapturingWhereAndLimit(mock: ReturnType<typeof vi.fn>, row
         whereSpy(whereArg);
 
         return {
-          limit: (n: unknown) => {
-            limitSpy(n);
+          orderBy: (orderArg: unknown) => {
+            orderBySpy(orderArg);
 
-            return Promise.resolve(rows);
+            return {
+              limit: (n: unknown) => {
+                limitSpy(n);
+
+                return Promise.resolve(rows);
+              },
+            };
           },
         };
       },
     }),
   });
 
-  return { whereSpy, limitSpy };
+  return { whereSpy, orderBySpy, limitSpy };
 }
 
 function updateReturnsOn(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
@@ -391,20 +401,64 @@ describe('applyDuePendingChanges', () => {
     });
   });
 
-  /** The kill switch: off, nothing is claimed, voided, or applied — the row simply waits. */
+  /**
+   * The decimal-vs-string-equality bug: `"500"` and `"500.00"` are the same value, so a
+   * pending row requested against `oldValue: '500'` must still apply — not void — when the
+   * limit's current `maxUsd` happens to be stored/observed as `'500.00'` by the time it
+   * becomes due. A raw `!==` string comparison would wrongly treat this as a stale value and
+   * void a legitimate increase; `compareUsd` must be used instead.
+   */
+  it('applies a due increase whose current value is the same amount in different decimal formatting (500 vs 500.00)', async () => {
+    const duePending = pendingRow({ oldValue: '500', newValue: '900', effectiveAt: new Date(Date.now() - 1_000) });
+    selectReturns([{ id: duePending.id }]); // due-rows scan
+
+    txSelectReturns([duePending]); // claim the pending row under FOR UPDATE
+    // The limit's current maxUsd is formatted with trailing zeros but is the same value.
+    txSelectReturns([activeRow({ document: constitutionDocument({ maxUsd: '500.00' }) })]);
+    const { setSpy: documentSetSpy } = txUpdateReturns([]); // fold the new value into `document`
+    txUpdateReturns([{ ...duePending, appliedAt: new Date() }]); // mark the row applied
+
+    const result = await applyDuePendingChanges('corr-decimal-format');
+
+    expect(result).toEqual({ appliedCount: 1, voidedCount: 0 });
+    const documentSetArg = documentSetSpy.mock.calls[0]?.[0] as { document: Constitution };
+    expect(documentSetArg.document.limits[0]?.maxUsd).toBe('900');
+
+    expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
+      eventType: 'constitution.limit_increase_applied',
+      correlationId: 'corr-decimal-format',
+    });
+  });
+
+  /**
+   * The kill switch: off, nothing is claimed, voided, or applied — the row simply waits.
+   * `applyDuePendingChanges` still counts how many rows are stranded (for telemetry), so
+   * `selectMock` *is* called once here (the count query) even though no transaction runs.
+   */
   it('is a no-op when CONSTITUTION_PENDING_CHANGE_APPLY_FLAG is off', async () => {
     isFeatureEnabledMock.mockResolvedValue(false);
+    selectReturns([{ total: 0 }]); // countDueRows: nothing stranded
 
     const result = await applyDuePendingChanges('corr-flag-off');
 
     expect(result).toEqual({ appliedCount: 0, voidedCount: 0 });
-    expect(selectMock).not.toHaveBeenCalled();
     expect(transactionMock).not.toHaveBeenCalled();
   });
 
-  /** The real `effective_at <= now() AND applied_at IS NULL AND voided_at IS NULL` predicate, and the batch cap. */
-  it('scans with the real due predicate and caps the batch size', async () => {
-    const { whereSpy, limitSpy } = selectReturnsCapturingWhereAndLimit(selectMock, []);
+  /** Same as above, but with a real backlog — exercises the stranded-row count path without asserting on log output (this codebase does not mock `logger` in tests). */
+  it('still counts stranded rows when the kill switch is off and a backlog exists', async () => {
+    isFeatureEnabledMock.mockResolvedValue(false);
+    selectReturns([{ total: 3 }]); // countDueRows: 3 rows are due but the switch is off
+
+    const result = await applyDuePendingChanges('corr-flag-off-backlog');
+
+    expect(result).toEqual({ appliedCount: 0, voidedCount: 0 });
+    expect(transactionMock).not.toHaveBeenCalled();
+  });
+
+  /** The real `effective_at <= now() AND applied_at IS NULL AND voided_at IS NULL` predicate, oldest-due-first ordering, and the batch cap. */
+  it('scans with the real due predicate, orders oldest-due-first, and caps the batch size', async () => {
+    const { whereSpy, orderBySpy, limitSpy } = selectReturnsCapturingWhereOrderAndLimit(selectMock, []);
 
     await applyDuePendingChanges('corr-predicate');
 
@@ -412,6 +466,7 @@ describe('applyDuePendingChanges', () => {
     expect(whereClause).toContain('"applied_at" is null');
     expect(whereClause).toContain('"voided_at" is null');
     expect(whereClause).toContain('"effective_at" <=');
+    expect(orderBySpy).toHaveBeenCalledTimes(1);
     expect(limitSpy.mock.calls[0]?.[0]).toBeGreaterThan(0);
   });
 });
