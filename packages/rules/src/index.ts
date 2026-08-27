@@ -31,6 +31,7 @@ export {
   addUsd,
   compareUsd,
   evaluateTrade,
+  subtractUsd,
   sumRealizedLosses,
   sumTradeUsd,
   type Decision,

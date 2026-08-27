@@ -1,16 +1,14 @@
 import { desc, eq } from 'drizzle-orm';
 
-import { compareUsd, migrateConstitution, sumRealizedLosses, sumTradeUsd, type AssetTier } from '@degencage/rules';
+import type { AssetTier } from '@degencage/rules';
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { getDb } from '@/server/db/client';
-import { constitutions, trades, wallets, type TokenClassificationQuality } from '@/server/db/schema';
-import { loadViolationsFeed } from '@/server/dashboard/violations-feed';
+import { trades, type TokenClassificationQuality } from '@/server/db/schema';
+import { buildDashboardState, loadReconciliationState } from '@/server/dashboard/dashboard-state';
 import { DASHBOARD_DISCIPLINE_VIEW_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
-import { computeRollingAllowance, loadWindowedTrades } from '@/server/rules/rolling-allowance';
 import { captureError } from '@/observability/error-tracking';
 import { recordEvent } from '@/observability/events';
-import type { DashboardApiResponse } from '@/app/api/dashboard/route';
 import { DashboardPanel } from './dashboard-panel';
 
 export const dynamic = 'force-dynamic';
@@ -18,11 +16,12 @@ export const runtime = 'nodejs';
 
 /**
  * The Phase 4–6 status page (`constitution-status/page.tsx`), promoted into the real
- * dashboard (Phase 7): same server-side reconciliation-on-open and allowance computation,
- * plus the live-polling `DashboardPanel` and the violations feed. This component only
- * builds the *initial* server-rendered snapshot — `GET /api/dashboard`
- * (`app/api/dashboard/route.ts`) is the sole place that recomputes it afterwards, so the two
- * intentionally mirror each other's combinators rather than sharing one.
+ * dashboard (Phase 7): same server-side reconciliation-on-open, plus the live-polling
+ * `DashboardPanel` and the violations feed. The allowance/violations computation itself
+ * lives in `server/dashboard/dashboard-state.ts`'s `buildDashboardState` — the identical
+ * function `GET /api/dashboard` calls for every subsequent poll — so this component only
+ * has to build the *initial* server-rendered snapshot from it, never a second copy of the
+ * computation.
  */
 
 const TRADE_LIST_LIMIT = 50;
@@ -62,33 +61,6 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
     .limit(TRADE_LIST_LIMIT);
 }
 
-interface TierAllowanceView {
-  tier: AssetTier;
-  maxUsd: string;
-  totalUsd: string | null;
-  withinLimit: boolean;
-}
-
-/**
- * Mirrors `computeRollingAllowance` (Phase 4) but scoped to one tier's qualifying
- * acquisitions — `loadWindowedTrades` is reused rather than duplicated; only the
- * tier-filter-then-sum step is new, composed here rather than inside
- * `rolling-allowance.ts` (which stays limit-type-agnostic). `app/api/dashboard/route.ts`
- * has its own identically-named combinator for the same reason.
- */
-async function computeTierAllowance(walletId: string, limit: { tier: AssetTier; maxUsd: string; windowHours: number }): Promise<TierAllowanceView> {
-  const windowed = await loadWindowedTrades({ walletId, windowHours: limit.windowHours, asOf: new Date() });
-  const qualifying = windowed.filter((trade) => trade.isAcquisition === true && trade.acquiredTier === limit.tier);
-  const totalUsd = sumTradeUsd(qualifying);
-
-  return {
-    tier: limit.tier,
-    maxUsd: limit.maxUsd,
-    totalUsd,
-    withinLimit: totalUsd !== null && compareUsd(totalUsd, limit.maxUsd) <= 0,
-  };
-}
-
 /**
  * `[MICRO_CAP]`, except the fail-closed default is called out by name — success criteria
  * requires an unlisted/unpriceable token to be "visibly tagged". Gated on `classification`,
@@ -100,30 +72,6 @@ function formatTierBadge(tier: AssetTier | null, classification: TokenClassifica
   return classification === 'unknown' ? `${tier} — counted as micro cap` : tier;
 }
 
-interface LossAllowanceView {
-  maxUsd: string;
-  totalUsd: string;
-  withinLimit: boolean;
-}
-
-/** Mirrors `computeTierAllowance` above; `app/api/dashboard/route.ts` has the same combinator for the poll path. */
-async function computeLossAllowance(walletId: string, limit: { maxUsd: string; windowHours: number }): Promise<LossAllowanceView> {
-  const windowed = await loadWindowedTrades({ walletId, windowHours: limit.windowHours, asOf: new Date() });
-  const totalUsd = sumRealizedLosses(windowed);
-
-  return { maxUsd: limit.maxUsd, totalUsd, withinLimit: compareUsd(totalUsd, limit.maxUsd) <= 0 };
-}
-
-async function loadReconciliationState(walletId: string): Promise<string | null> {
-  const rows = await getDb()
-    .select({ reconciliationState: wallets.reconciliationState })
-    .from(wallets)
-    .where(eq(wallets.id, walletId))
-    .limit(1);
-
-  return rows[0]?.reconciliationState ?? null;
-}
-
 function formatMint(mint: string | null): string {
   if (!mint) return '—';
   return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
@@ -131,51 +79,6 @@ function formatMint(mint: string | null): string {
 
 function formatUsd(usdValue: string | null): string {
   return usdValue === null ? 'unvalued' : `$${usdValue}`;
-}
-
-/**
- * Builds the same shape `GET /api/dashboard` returns, so `DashboardPanel` can treat its
- * `initial` prop and every subsequent poll response identically.
- */
-async function buildInitialDashboardState(
-  walletId: string,
-  userId: string,
-  lossLimitEnabled: boolean,
-): Promise<DashboardApiResponse> {
-  const constitutionRow = await getDb().select().from(constitutions).where(eq(constitutions.userId, userId)).limit(1);
-  const constitution = constitutionRow[0] && constitutionRow[0].status === 'active' ? migrateConstitution(constitutionRow[0].document) : null;
-
-  const dailyNotionalLimit = constitution?.limits.find(
-    (limit): limit is Extract<typeof limit, { type: 'daily_notional_usd' }> => limit.type === 'daily_notional_usd',
-  );
-  const tierLimit = constitution?.limits.find(
-    (limit): limit is Extract<typeof limit, { type: 'asset_tier_acquisition_usd' }> => limit.type === 'asset_tier_acquisition_usd',
-  );
-  const lossLimit = constitution?.limits.find(
-    (limit): limit is Extract<typeof limit, { type: 'rolling_loss_usd' }> => limit.type === 'rolling_loss_usd',
-  );
-
-  const [allowance, tierAllowance, lossAllowance, violations] = await Promise.all([
-    dailyNotionalLimit
-      ? computeRollingAllowance({ walletId, windowHours: dailyNotionalLimit.windowHours, asOf: new Date(), maxUsd: dailyNotionalLimit.maxUsd })
-      : null,
-    tierLimit ? computeTierAllowance(walletId, tierLimit) : null,
-    lossLimit && lossLimitEnabled ? computeLossAllowance(walletId, lossLimit) : null,
-    loadViolationsFeed({ walletId, userId }),
-  ]);
-
-  return {
-    now: new Date().toISOString(),
-    allowance: allowance ? { totalUsd: allowance.totalUsd, maxUsd: allowance.maxUsd, withinLimit: allowance.withinLimit } : null,
-    tierAllowance,
-    lossAllowance: lossLimit
-      ? lossLimitEnabled && lossAllowance
-        ? { ...lossAllowance, enabled: true }
-        : { enabled: false, maxUsd: lossLimit.maxUsd }
-      : null,
-    violations: violations.map((violation) => ({ ...violation, occurredAt: violation.occurredAt.toISOString() })),
-    correlationId: crypto.randomUUID(),
-  };
 }
 
 /**
@@ -243,7 +146,7 @@ export default async function DashboardPage() {
   }
 
   const [initial, tradesList] = await Promise.all([
-    buildInitialDashboardState(session.walletId, session.userId, lossLimitEnabled),
+    buildDashboardState({ walletId: session.walletId, userId: session.userId, lossLimitEnabled, correlationId }),
     loadRecentTrades(session.walletId),
   ]);
 

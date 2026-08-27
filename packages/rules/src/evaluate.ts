@@ -95,6 +95,28 @@ export function addUsd(a: string, b: string): string {
   return scale > 0 ? `${intResult}.${fracResult}` : intResult;
 }
 
+/**
+ * Exact decimal-string subtraction via `BigInt` on a shared scale — never a float. Unlike
+ * `addUsd`, the result can be negative (leading `-`, same convention `lot-matching.ts` uses
+ * for `realized_loss_usd`) since callers may subtract a larger amount from a smaller one
+ * (e.g. `apps/web/src/server/dashboard/violations-feed.ts`'s "exceeded by" copy).
+ */
+export function subtractUsd(a: string, b: string): string {
+  const da = splitDecimal(a);
+  const db = splitDecimal(b);
+  const scale = Math.max(da.fracPart.length, db.fracPart.length);
+  const bigA = BigInt(da.intPart + da.fracPart.padEnd(scale, '0'));
+  const bigB = BigInt(db.intPart + db.fracPart.padEnd(scale, '0'));
+  const diff = bigA - bigB;
+  const isNegative = diff < 0n;
+  const digits = (isNegative ? -diff : diff).toString().padStart(scale + 1, '0');
+  const intResult = digits.slice(0, digits.length - scale) || '0';
+  const fracResult = scale > 0 ? digits.slice(digits.length - scale) : '';
+  const magnitude = scale > 0 ? `${intResult}.${fracResult}` : intResult;
+
+  return isNegative && magnitude !== '0' ? `-${magnitude}` : magnitude;
+}
+
 /** Exact decimal-string comparison via `BigInt` on a shared scale — never a float. */
 export function compareUsd(a: string, b: string): -1 | 0 | 1 {
   const da = splitDecimal(a);

@@ -18,8 +18,9 @@ Tailwind is the smallest, most widely adopted answer to "utility classes instead
 per-element style objects," and shadcn/ui rides on top of it rather than being a second,
 competing choice: **shadcn components are copied into `src/components/ui/` as source we
 own, not a package we depend on and can't touch.** No new runtime dependency owns our
-markup — Radix (the primitives shadcn wraps for accessible behavior: focus management,
-keyboard nav, ARIA) and `class-variance-authority`/`clsx`/`tailwind-merge` (variant and
+markup — `@base-ui/react` (the primitives shadcn wraps for accessible behavior: focus
+management, keyboard nav, ARIA — shadcn's own move away from Radix, not our choice to
+diverge from it) and `class-variance-authority`/`clsx`/`tailwind-merge` (variant and
 class-merging plumbing) are the only new dependencies with actual code in the tree, and all
 four are mature, narrowly-scoped, and exactly the kind of "don't hand-roll this" case
 CLAUDE.md's Architecture section already calls out for anything that isn't the product's
@@ -32,10 +33,11 @@ differentiator. The rule engine, commitment logic, and violation detection stay 
   per page) but does not scale to a dashboard with cards, a feed, and live-updating state —
   every new element needs a bespoke style object, and nothing enforces visual consistency
   across screens.
-- **A different headless/component kit (Radix alone, Headless UI, Ark UI).** shadcn/ui is
-  Radix underneath anyway; picking shadcn gets the same accessible primitives plus a CLI
-  that generates readable, editable source instead of a black-box component package.
-  Nothing else in that space offers "copied-in source we own" as the default.
+- **A different headless/component kit (Radix directly, Headless UI, Ark UI).** shadcn/ui
+  already wraps a headless primitives library (`@base-ui/react`) underneath; picking shadcn
+  gets the same accessible primitives plus a CLI that generates readable, editable source
+  instead of a black-box component package. Nothing else in that space offers "copied-in
+  source we own" as the default.
 - **CSS Modules or vanilla CSS with a small utility layer.** Viable, but reinvents a
   chunk of what Tailwind already gives for free (a constrained scale, dark-mode variants,
   responsive prefixes) with no ecosystem of pre-built accessible components on top.
@@ -59,7 +61,8 @@ differentiator. The rule engine, commitment logic, and violation detection stay 
   generated file set, and dependency versions consistent with what the CLI expects to
   manage on a future `diff`/update.
 - **`tailwindcss`, `@tailwindcss/postcss`, `postcss`, `tw-animate-css`, `lucide-react`,
-  `class-variance-authority`, `clsx`, `tailwind-merge`, and the Radix packages a given
-  shadcn component pulls in are real dependencies of `apps/web`, declared explicitly** —
-  same discipline as [wallet-standard-ui-dependency](wallet-standard-ui-dependency.md): no
-  phantom hoisted imports.
+  `class-variance-authority`, `clsx`, `tailwind-merge`, and the `@base-ui/react` packages a
+  given shadcn component pulls in are real dependencies of `apps/web`, declared explicitly**
+  — same discipline as [wallet-standard-ui-dependency](wallet-standard-ui-dependency.md): no
+  phantom hoisted imports. `shadcn` (the CLI) and `postcss` (a build-time-only tool, never
+  imported at runtime) are `devDependencies`; everything else here ships in the bundle.

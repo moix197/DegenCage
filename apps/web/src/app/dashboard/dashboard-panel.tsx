@@ -6,9 +6,8 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
-import { Skeleton } from '@/components/ui/skeleton';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import type { DashboardApiResponse } from '@/app/api/dashboard/route';
+import type { DashboardApiResponse } from '@/server/dashboard/dashboard-state';
 
 /**
  * The dashboard's live half (Phase 7): the allowance cards and the "we saw that" feed,
@@ -16,9 +15,26 @@ import type { DashboardApiResponse } from '@/app/api/dashboard/route';
  * — never a client-side clock counting anything down. Same discipline as
  * `constitution/constitution-panel.tsx`'s countdown poll: `refresh()` always replaces state
  * with the last `GET /api/dashboard` response, in full, never a locally-derived guess.
+ *
+ * A background poll never hides the current figures — `data` only ever moves forward to a
+ * newer successful response; a failed or in-flight poll leaves whatever is already on
+ * screen exactly as it was (the `refreshFailed` banner is the only visible sign of it).
  */
 
 const POLL_INTERVAL_MS = 15_000;
+
+/**
+ * Reports a failed poll without pulling `@sentry/nextjs`'s browser SDK into this page's
+ * initial bundle: `error-tracking.ts` is imported statically all over the server, but a
+ * client component has to load it lazily, same gate `instrumentation-client.ts` uses, or
+ * every dashboard visit pays for Sentry's client runtime whether or not a poll ever fails
+ * (`.ai/decisions/observability-stack.md`).
+ */
+function reportRefreshFailure(error: unknown): void {
+  void import('@/observability/error-tracking').then(({ captureError }) => {
+    captureError(error, { component: 'dashboard-panel', route: '/api/dashboard' });
+  });
+}
 
 interface SimpleAllowance {
   maxUsd: string;
@@ -34,7 +50,7 @@ function LimitStatusBadge({ allowance }: { allowance: SimpleAllowance }) {
   return <Badge variant={allowance.withinLimit ? 'outline' : 'destructive'}>{allowance.withinLimit ? 'within limit' : 'over limit'}</Badge>;
 }
 
-function AllowanceCard({ title, allowance, isRefreshing }: { title: string; allowance: SimpleAllowance | null; isRefreshing: boolean }) {
+function AllowanceCard({ title, allowance }: { title: string; allowance: SimpleAllowance | null }) {
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between">
@@ -42,15 +58,15 @@ function AllowanceCard({ title, allowance, isRefreshing }: { title: string; allo
         {allowance ? <LimitStatusBadge allowance={allowance} /> : null}
       </CardHeader>
       <CardContent>
-        {isRefreshing ? <Skeleton className="h-8 w-32" /> : null}
-        {!isRefreshing && allowance ? (
+        {allowance ? (
           <p className="text-2xl font-semibold">
             {allowance.totalUsd === null ? 'unknown' : `$${allowance.totalUsd}`}{' '}
             <span className="text-sm font-normal text-muted-foreground">of ${allowance.maxUsd}</span>
           </p>
-        ) : null}
-        {!isRefreshing && !allowance ? <p className="text-sm text-muted-foreground">No limit set.</p> : null}
-        {!isRefreshing && allowance?.totalUsd === null ? (
+        ) : (
+          <p className="text-sm text-muted-foreground">No limit set.</p>
+        )}
+        {allowance?.totalUsd === null ? (
           <p className="mt-1 text-xs text-muted-foreground">Some trades in the window could not be priced — never assumed clean.</p>
         ) : null}
       </CardContent>
@@ -58,7 +74,7 @@ function AllowanceCard({ title, allowance, isRefreshing }: { title: string; allo
   );
 }
 
-function LossAllowanceCard({ lossAllowance, isRefreshing }: { lossAllowance: DashboardApiResponse['lossAllowance']; isRefreshing: boolean }) {
+function LossAllowanceCard({ lossAllowance }: { lossAllowance: DashboardApiResponse['lossAllowance'] }) {
   if (!lossAllowance) {
     return null;
   }
@@ -83,13 +99,9 @@ function LossAllowanceCard({ lossAllowance, isRefreshing }: { lossAllowance: Das
         <LimitStatusBadge allowance={lossAllowance} />
       </CardHeader>
       <CardContent>
-        {isRefreshing ? (
-          <Skeleton className="h-8 w-32" />
-        ) : (
-          <p className="text-2xl font-semibold">
-            ${lossAllowance.totalUsd} <span className="text-sm font-normal text-muted-foreground">of ${lossAllowance.maxUsd}</span>
-          </p>
-        )}
+        <p className="text-2xl font-semibold">
+          ${lossAllowance.totalUsd} <span className="text-sm font-normal text-muted-foreground">of ${lossAllowance.maxUsd}</span>
+        </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Covers only round-trips — bought and later sold — where both sides happened after this constitution
           activated. Not your full P&L.
@@ -130,26 +142,23 @@ export interface DashboardPanelProps {
 
 export function DashboardPanel({ initial }: DashboardPanelProps) {
   const [data, setData] = useState<DashboardApiResponse>(initial);
-  const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshFailed, setRefreshFailed] = useState(false);
 
   const refresh = useCallback(async () => {
-    setIsRefreshing(true);
-
     try {
       const response = await fetch('/api/dashboard', { cache: 'no-store' });
 
       if (!response.ok) {
         setRefreshFailed(true);
+        reportRefreshFailure(new Error(`dashboard refresh failed with status ${response.status}`));
         return;
       }
 
       setData((await response.json()) as DashboardApiResponse);
       setRefreshFailed(false);
-    } catch {
+    } catch (error) {
       setRefreshFailed(true);
-    } finally {
-      setIsRefreshing(false);
+      reportRefreshFailure(error);
     }
   }, []);
 
@@ -177,11 +186,9 @@ export function DashboardPanel({ initial }: DashboardPanelProps) {
       ) : null}
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <AllowanceCard title="Daily notional" allowance={data.allowance} isRefreshing={isRefreshing} />
-        {data.tierAllowance ? (
-          <AllowanceCard title={`${data.tierAllowance.tier} acquisitions`} allowance={data.tierAllowance} isRefreshing={isRefreshing} />
-        ) : null}
-        <LossAllowanceCard lossAllowance={data.lossAllowance} isRefreshing={isRefreshing} />
+        <AllowanceCard title="Daily notional" allowance={data.allowance} />
+        {data.tierAllowance ? <AllowanceCard title={`${data.tierAllowance.tier} acquisitions`} allowance={data.tierAllowance} /> : null}
+        <LossAllowanceCard lossAllowance={data.lossAllowance} />
       </div>
 
       <Separator />

@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray } from 'drizzle-orm';
 
-import type { AssetTier, LimitEvaluation, LimitRule } from '@degencage/rules';
+import { subtractUsd, type AssetTier, type LimitEvaluation, type LimitRule } from '@degencage/rules';
 import { getDb } from '../db/client';
 import { events, trades } from '../db/schema';
 
@@ -34,17 +34,25 @@ function readDecisionRecordedPayload(payload: Record<string, unknown>): Decision
 }
 
 interface DecisionRecordedEventRow {
+  id: string;
   occurredAt: Date;
   correlationId: string;
   payload: Record<string, unknown>;
 }
 
+/**
+ * `occurredAt` is chain block time — only second-granularity (several trades can land in
+ * the same block), so ties are expected, not rare. `desc(events.id)` breaks them
+ * deterministically: without a full ORDER BY, Postgres does not guarantee a stable order
+ * for equal `occurredAt` values, so two identical queries could otherwise return the same
+ * rows in a different order.
+ */
 async function loadDecisionRecordedEvents(userId: string, limit: number): Promise<DecisionRecordedEventRow[]> {
   return getDb()
-    .select({ occurredAt: events.occurredAt, correlationId: events.correlationId, payload: events.payload })
+    .select({ id: events.id, occurredAt: events.occurredAt, correlationId: events.correlationId, payload: events.payload })
     .from(events)
     .where(and(eq(events.userId, userId), eq(events.eventType, 'rule.decision_recorded')))
-    .orderBy(desc(events.occurredAt))
+    .orderBy(desc(events.occurredAt), desc(events.id))
     .limit(limit);
 }
 
@@ -71,31 +79,6 @@ async function loadTradeLookup(walletId: string, signatures: string[]): Promise<
   return new Map(rows.map((row) => [row.signature, { isBaseline: row.isBaseline, acquiredTier: row.acquiredTier }]));
 }
 
-/** Splits a decimal digit string into sign-free integer/fraction parts, same shape `@degencage/rules`' own decimal helpers use. */
-function splitDecimal(value: string): { intPart: string; fracPart: string } {
-  const [intPart, fracPart = ''] = value.split('.');
-  return { intPart: intPart || '0', fracPart };
-}
-
-/**
- * Display-only exact-decimal subtraction for the feed's "exceeded by $X" copy — `totalUsd`
- * and `maxUsd` are already-decided figures from the recorded event, not a re-evaluation of
- * whether this was a violation. Local rather than imported: `@degencage/rules` exports
- * `addUsd`/`compareUsd` but no subtraction, since the rule engine itself never needs one.
- */
-function subtractUsd(a: string, b: string): string {
-  const da = splitDecimal(a);
-  const db = splitDecimal(b);
-  const scale = Math.max(da.fracPart.length, db.fracPart.length);
-  const bigA = BigInt(da.intPart + da.fracPart.padEnd(scale, '0'));
-  const bigB = BigInt(db.intPart + db.fracPart.padEnd(scale, '0'));
-  const diff = (bigA - bigB).toString().padStart(scale + 1, '0');
-  const intResult = diff.slice(0, diff.length - scale) || '0';
-  const fracResult = scale > 0 ? diff.slice(diff.length - scale) : '';
-
-  return scale > 0 ? `${intResult}.${fracResult}` : intResult;
-}
-
 const LIMIT_TYPE_LABELS: Record<LimitRule['type'], string> = {
   daily_notional_usd: 'daily notional',
   asset_tier_acquisition_usd: 'asset-tier acquisition',
@@ -107,12 +90,9 @@ const LIMIT_TYPE_LABELS: Record<LimitRule['type'], string> = {
  * rule". A tier-specific label (e.g. "MICRO_CAP acquisition") is used when the trade's own
  * `acquiredTier` is known, matching the plan's own example phrasing.
  */
-function buildAccountabilityMessage(evaluation: LimitEvaluation, tradeTier: AssetTier | null): string {
-  const exceededByUsd = subtractUsd(evaluation.totalUsd ?? evaluation.maxUsd, evaluation.maxUsd);
-  const label =
-    evaluation.type === 'asset_tier_acquisition_usd' && tradeTier
-      ? `${tradeTier} acquisition`
-      : LIMIT_TYPE_LABELS[evaluation.type];
+function buildAccountabilityMessage(limitType: LimitRule['type'], totalUsd: string, maxUsd: string, tradeTier: AssetTier | null): string {
+  const exceededByUsd = subtractUsd(totalUsd, maxUsd);
+  const label = limitType === 'asset_tier_acquisition_usd' && tradeTier ? `${tradeTier} acquisition` : LIMIT_TYPE_LABELS[limitType];
 
   return `We saw that you exceeded your ${label} limit by $${exceededByUsd}.`;
 }
@@ -126,23 +106,41 @@ export interface ViolationFeedItem {
   message: string;
 }
 
-function extractViolations(row: DecisionRecordedEventRow, tradeTier: AssetTier | null): ViolationFeedItem[] {
+/** Narrows `verdict === 'violation'` evaluations to ones whose `totalUsd` is known — the filter and the type live together so `extractViolations` never has to fall back to a placeholder value. */
+function isKnownViolation(evaluation: LimitEvaluation): evaluation is LimitEvaluation & { totalUsd: string } {
+  return evaluation.verdict === 'violation' && evaluation.totalUsd !== null;
+}
+
+/** Carries the source event's id purely for the tie-break in `loadViolationsFeed` below — stripped before the public `ViolationFeedItem` shape is returned. */
+type InternalViolation = ViolationFeedItem & { eventId: string };
+
+function extractViolations(row: DecisionRecordedEventRow, tradeTier: AssetTier | null): InternalViolation[] {
   const decoded = readDecisionRecordedPayload(row.payload);
 
   if (!decoded) {
     return [];
   }
 
-  return decoded.evaluations
-    .filter((evaluation) => evaluation.verdict === 'violation' && evaluation.totalUsd !== null)
-    .map((evaluation) => ({
-      correlationId: row.correlationId,
-      occurredAt: row.occurredAt,
-      limitType: evaluation.type,
-      maxUsd: evaluation.maxUsd,
-      totalUsd: evaluation.totalUsd as string,
-      message: buildAccountabilityMessage(evaluation, tradeTier),
-    }));
+  return decoded.evaluations.filter(isKnownViolation).map((evaluation) => ({
+    eventId: row.id,
+    correlationId: row.correlationId,
+    occurredAt: row.occurredAt,
+    limitType: evaluation.type,
+    maxUsd: evaluation.maxUsd,
+    totalUsd: evaluation.totalUsd,
+    message: buildAccountabilityMessage(evaluation.type, evaluation.totalUsd, evaluation.maxUsd, tradeTier),
+  }));
+}
+
+/** Deterministic tie-break for equal `occurredAt` values — mirrors the query's own `desc(events.id)` tiebreak. */
+function compareChronological(a: InternalViolation, b: InternalViolation): number {
+  const occurredAtDiff = a.occurredAt.getTime() - b.occurredAt.getTime();
+
+  if (occurredAtDiff !== 0) {
+    return occurredAtDiff;
+  }
+
+  return a.eventId < b.eventId ? -1 : a.eventId > b.eventId ? 1 : 0;
 }
 
 /**
@@ -175,5 +173,5 @@ export async function loadViolationsFeed(
     return extractViolations(row, trade.acquiredTier);
   });
 
-  return violations.sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime());
+  return violations.sort(compareChronological).map(({ eventId: _eventId, ...item }) => item);
 }

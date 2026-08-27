@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { CONSTITUTION_SCHEMA_VERSION, type Constitution } from './constitution';
-import { addUsd, compareUsd, evaluateTrade, sumRealizedLosses, sumTradeUsd, type EvaluableTrade } from './evaluate';
+import { addUsd, compareUsd, evaluateTrade, subtractUsd, sumRealizedLosses, sumTradeUsd, type EvaluableTrade } from './evaluate';
 
 const NOW = new Date('2026-08-26T12:00:00Z');
 
@@ -26,6 +26,22 @@ describe('addUsd', () => {
     expect(addUsd('100', '50.5')).toBe('150.5');
     expect(addUsd('0.1', '0.2')).toBe('0.3'); // the canonical float trap: 0.1 + 0.2 !== 0.3 in IEEE 754
     expect(addUsd('999999999999999999999.999999999999', '0.000000000001')).toBe('1000000000000000000000.000000000000');
+  });
+});
+
+describe('subtractUsd', () => {
+  it('subtracts exact decimal strings without touching floating point', () => {
+    expect(subtractUsd('0', '0')).toBe('0');
+    expect(subtractUsd('150.5', '100')).toBe('50.5');
+    expect(subtractUsd('0.3', '0.1')).toBe('0.2'); // same float trap as addUsd, in reverse
+  });
+
+  it('returns a leading-minus negative when the second amount is larger', () => {
+    expect(subtractUsd('100', '150.5')).toBe('-50.5');
+  });
+
+  it('never produces a signed zero', () => {
+    expect(subtractUsd('100', '100')).toBe('0');
   });
 });
 
