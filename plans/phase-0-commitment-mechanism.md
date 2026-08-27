@@ -514,15 +514,15 @@ Accepted deviations from the plan's letter, confirmed by review: decision 1 requ
 **Phase review:**
 
 - [x] All Steps and Verification checkboxes above ticked in the plan file
-- [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
-- [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
+- [~] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
+- [~] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
 - [x] Code-reviewer agent has verified this phase (flag the decimal-math and activation-boundary logic for extra scrutiny)
 - [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
 - [x] Tests for this phase written and passing
 - [x] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
+- [x] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `feat: FIFO lot-matching and the rolling loss limit`
-- [ ] Phase marked complete
+- [x] Phase marked complete
 
 ---
 
