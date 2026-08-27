@@ -5,6 +5,7 @@ import { CHAIN_HELIUS_FLAG } from '../chain/helius-client';
 import { CLASSIFICATION_JUPITER_MCAP_FLAG } from '../chain/jupiter-tokens';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
 import { CONSTITUTION_AUTHOR_FLAG } from '../constitution/commitment';
+import { CONSTITUTION_PENDING_CHANGE_APPLY_FLAG } from '../constitution/pending-changes';
 import { DASHBOARD_DISCIPLINE_VIEW_FLAG, HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
 import { PRICING_BINANCE_FLAG } from '../pricing/binance-klines';
 import { PRICING_BIRDEYE_FLAG } from '../pricing/birdeye-price';
@@ -40,6 +41,10 @@ const SEED_FLAGS: { key: string; enabled: boolean }[] = [
   // Phase 7's dashboard is the real replacement for `/constitution-status` — same
   // ship-enabled-by-default posture as the other user-facing pages above.
   { key: DASHBOARD_DISCIPLINE_VIEW_FLAG, enabled: true },
+  // Unseeded would mean permanently off (fail closed) — a due limit increase would never
+  // apply out of the box, the exact bug this flag's own kill-switch review finding exists to
+  // let ops recover from at runtime, not the default state.
+  { key: CONSTITUTION_PENDING_CHANGE_APPLY_FLAG, enabled: true },
 ];
 
 async function seedFeatureFlags(): Promise<void> {

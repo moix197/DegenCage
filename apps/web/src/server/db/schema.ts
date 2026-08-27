@@ -431,6 +431,14 @@ export type NewPositionLotRow = typeof positionLots.$inferInsert;
  * `constitution.limit_increase_cancelled` event is the durable record that it happened, and
  * `applyDuePendingChanges`'s `applied_at IS NULL` scan needs a *gone* row to never reconsider,
  * not a soft-deleted one it has to keep filtering out forever.
+ *
+ * `voided_at` (non-null) is the third terminal state, alongside `applied_at`: it means the
+ * limit's *current* `maxUsd` no longer matched this row's `old_value` by the time 48h
+ * elapsed — the user (or a decrease that landed in between) already moved the value out from
+ * under this stale increase, and applying `new_value` on top would silently grant an
+ * increase from a baseline the user never actually saw. Voided, not deleted or overwritten:
+ * `asymmetric-constitution-edits.md` (`.ai/decisions/`) is why this must stay append-only
+ * evidence rather than a row that quietly disappears or reapplies against new state.
  */
 export const constitutionPendingChanges = pgTable(
   'constitution_pending_changes',
@@ -445,13 +453,14 @@ export const constitutionPendingChanges = pgTable(
     newValue: text('new_value').notNull(),
     effectiveAt: timestamp('effective_at', { withTimezone: true }).notNull(),
     appliedAt: timestamp('applied_at', { withTimezone: true }),
+    voidedAt: timestamp('voided_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    // `applyDuePendingChanges`'s predicate: every not-yet-applied row whose time has come.
-    index('constitution_pending_changes_effective_at_idx').on(table.effectiveAt, table.appliedAt),
-    // The edit page's predicate: one constitution's in-flight pending changes.
-    index('constitution_pending_changes_constitution_id_idx').on(table.constitutionId, table.appliedAt),
+    // `applyDuePendingChanges`'s predicate: every not-yet-resolved row whose time has come.
+    index('constitution_pending_changes_effective_at_idx').on(table.effectiveAt, table.appliedAt, table.voidedAt),
+    // The edit page's predicate: one constitution's in-flight (not applied, not voided) pending changes.
+    index('constitution_pending_changes_constitution_id_idx').on(table.constitutionId, table.appliedAt, table.voidedAt),
   ],
 );
 

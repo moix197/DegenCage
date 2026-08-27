@@ -24,9 +24,14 @@ async function applyDuePendingChangesBestEffort(correlationId: string): Promise<
 }
 
 /**
- * Triggered on app open (not scheduled — `.ai/decisions/hosting-and-growth-path.md`'s
- * Phase 0 no-cron approach). Wallet identity comes entirely from `resolveSession()` inside
- * `reconcileWallet()`; this route never reads a wallet id from the request.
+ * Meant to be triggered on app open (not scheduled — `.ai/decisions/hosting-and-growth-path.md`'s
+ * Phase 0 no-cron approach), same as `reconcileWallet()`'s other call site. **The real
+ * app-open triggers are the page loads themselves** — `apps/web/src/app/dashboard/page.tsx`
+ * and `apps/web/src/app/constitution/edit/page.tsx` both call `reconcileWallet()` /
+ * `applyDuePendingChanges()` directly server-side; nothing in this app currently calls this
+ * route. It is kept wired (not deleted) as the API surface for a future non-page caller —
+ * a client-driven refresh button, a mobile client — so that caller does not have to
+ * reintroduce this wiring from scratch, but it is not load-bearing for either page today.
  *
  * Also piggybacks Phase 8's `applyDuePendingChanges()` on this same app-open trigger — the
  * plan's lazy-cron pattern used once already for chain reconciliation, reused here rather

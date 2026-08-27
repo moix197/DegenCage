@@ -1,5 +1,5 @@
 import { compareUsd, migrateConstitution, parseConstitution, type Constitution, type LimitRule } from '@degencage/rules';
-import { and, eq, isNull, lte, sql } from 'drizzle-orm';
+import { and, eq, isNull, lte, sql, type SQL } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
 import { recordEvent } from '../../observability/events';
@@ -11,6 +11,7 @@ import {
   type ConstitutionPendingChangeRow,
   type ConstitutionRow,
 } from '../db/schema';
+import { isFeatureEnabled } from '../flags/feature-flags';
 
 /**
  * Asymmetric constitution edits (decision 12): loosening a limit is *always* the slow path,
@@ -27,6 +28,22 @@ import {
 /** The 48h delay a limit *increase* sits through before it is folded into `document`. */
 export const DELAYED_INCREASE_MS = 48 * 60 * 60 * 1_000;
 
+/**
+ * Dedicated kill switch for the *apply* half of this module — separate from
+ * `CONSTITUTION_AUTHOR_FLAG` (which gates requesting/cancelling a change) and from
+ * `CHAIN_HELIUS_RECONCILE_FLAG` (an unrelated integration switch that `POST
+ * /api/wallet/reconcile` happens to also be gated by). Off, `applyDuePendingChanges` is a
+ * no-op: a due increase stays pending rather than applying while this surface is being
+ * rolled back, and no row is claimed, voided, or otherwise mutated. Seeded enabled by
+ * `src/server/db/seed.ts`, same as every other flag in this codebase — unseeded would mean
+ * "always off" (fail closed), which would silently reintroduce "a due increase never
+ * applies" by default.
+ */
+export const CONSTITUTION_PENDING_CHANGE_APPLY_FLAG = 'constitution.pending_change_apply';
+
+/** Caps how many due rows one `applyDuePendingChanges` call processes — see finding #8. */
+const PENDING_CHANGE_APPLY_BATCH_LIMIT = 50;
+
 export type PendingChangeRejectionReason =
   | 'unauthenticated'
   | 'no_active_constitution'
@@ -40,24 +57,6 @@ export class PendingChangeRejected extends Error {
   constructor(readonly reason: PendingChangeRejectionReason) {
     super(`pending change rejected: ${reason}`);
     this.name = 'PendingChangeRejected';
-  }
-}
-
-/** The HTTP status a route/action should answer for a given rejection. */
-export function httpStatusForPendingChangeRejection(reason: PendingChangeRejectionReason): number {
-  switch (reason) {
-    case 'unauthenticated':
-      return 401;
-    case 'invalid_value':
-      return 400;
-    case 'no_active_constitution':
-    case 'limit_not_found':
-    case 'no_change':
-    case 'pending_change_exists':
-    case 'pending_change_not_found':
-      return 409;
-    default:
-      return 400;
   }
 }
 
@@ -118,16 +117,20 @@ function withMaxUsd(document: Constitution, limitId: string, newMaxUsd: string):
   return parsed.constitution;
 }
 
+/** Still actionable: neither applied nor voided yet. */
+function stillPending(...conditions: (SQL | undefined)[]): SQL | undefined {
+  return and(...conditions, isNull(constitutionPendingChanges.appliedAt), isNull(constitutionPendingChanges.voidedAt));
+}
+
 async function assertNoExistingPendingChange(constitutionId: string, limitId: string, field: string): Promise<void> {
   const rows = await getDb()
     .select({ id: constitutionPendingChanges.id })
     .from(constitutionPendingChanges)
     .where(
-      and(
+      stillPending(
         eq(constitutionPendingChanges.constitutionId, constitutionId),
         eq(constitutionPendingChanges.limitId, limitId),
         eq(constitutionPendingChanges.field, field),
-        isNull(constitutionPendingChanges.appliedAt),
       ),
     )
     .limit(1);
@@ -295,11 +298,11 @@ export async function loadPendingChangesForCurrentUser(): Promise<ConstitutionPe
   return getDb()
     .select()
     .from(constitutionPendingChanges)
-    .where(and(eq(constitutionPendingChanges.constitutionId, constitutionId), isNull(constitutionPendingChanges.appliedAt)));
+    .where(stillPending(eq(constitutionPendingChanges.constitutionId, constitutionId)));
 }
 
 /**
- * Cancels one of the caller's own not-yet-applied pending changes. Ownership is proven by
+ * Cancels one of the caller's own not-yet-resolved pending changes. Ownership is proven by
  * joining through the caller's *own* active constitution row, never by trusting the id alone
  * — the same "identity from the session, not the request" invariant as everything else in
  * `server/constitution/*`.
@@ -311,10 +314,9 @@ export async function cancelPendingChange(pendingChangeId: string, correlationId
   const deleted = await getDb()
     .delete(constitutionPendingChanges)
     .where(
-      and(
+      stillPending(
         eq(constitutionPendingChanges.id, pendingChangeId),
         eq(constitutionPendingChanges.constitutionId, constitutionRow.id),
-        isNull(constitutionPendingChanges.appliedAt),
       ),
     )
     .returning();
@@ -341,19 +343,31 @@ export async function cancelPendingChange(pendingChangeId: string, correlationId
   });
 }
 
+/** What became of one due row after `applyOneDuePendingChange` got the lock on it. */
+type ApplyOutcome = 'applied' | 'voided' | 'none';
+
 /**
- * Atomically claims and applies exactly one due pending change, inside a single transaction
- * so "marked applied" and "folded into `document`" can never split apart on a crash. Re-reads
- * `applied_at IS NULL AND effective_at <= now()` under `FOR UPDATE` right before applying, so
- * two concurrent calls to `applyDuePendingChanges` (two app-open reconciliations racing) can
- * both attempt this row without double-applying it — the second transaction's row lock waits,
- * then sees `applied_at` already set and does nothing.
+ * Atomically claims and resolves exactly one due pending change, inside a single transaction
+ * so "marked resolved" and "folded into `document`" (when it applies) can never split apart
+ * on a crash. Re-reads `applied_at IS NULL AND voided_at IS NULL AND effective_at <= now()`
+ * under `FOR UPDATE` right before resolving, so two concurrent calls to
+ * `applyDuePendingChanges` (two app-open loads racing) can both attempt this row without
+ * double-resolving it — the second transaction's row lock waits, then sees the row already
+ * resolved and does nothing.
  *
- * Returns `false` when the row was already applied/cancelled/not yet due by the time this
+ * Before applying, re-checks the limit's *current* `maxUsd` against `pending.oldValue`
+ * (`asymmetric-constitution-edits.md`, `.ai/decisions/`): if a decrease — or a different
+ * increase — already moved the value since this row was requested, `pending.newValue` is no
+ * longer an increase *from the value the user actually saw*. Applying it anyway would grant
+ * an increase nobody asked for from the constitution's current state. That row is voided
+ * instead — `voided_at` set, `document` untouched, `constitution.limit_increase_voided`
+ * recorded with both the expected and observed values — never silently dropped or applied.
+ *
+ * Returns `'none'` when the row was already resolved or not yet due by the time this
  * transaction got the lock — never an error, since that is the expected shape of the race
  * above, not a failure.
  */
-async function applyOneDuePendingChange(pendingChangeId: string, correlationId: string): Promise<boolean> {
+async function applyOneDuePendingChange(pendingChangeId: string, correlationId: string): Promise<ApplyOutcome> {
   return getDb().transaction(async (tx) => {
     const pendingRows = await tx
       .select()
@@ -362,6 +376,7 @@ async function applyOneDuePendingChange(pendingChangeId: string, correlationId: 
         and(
           eq(constitutionPendingChanges.id, pendingChangeId),
           isNull(constitutionPendingChanges.appliedAt),
+          isNull(constitutionPendingChanges.voidedAt),
           lte(constitutionPendingChanges.effectiveAt, sql`now()`),
         ),
       )
@@ -371,7 +386,7 @@ async function applyOneDuePendingChange(pendingChangeId: string, correlationId: 
     const pending = pendingRows[0];
 
     if (!pending) {
-      return false;
+      return 'none';
     }
 
     const constitutionRows = await tx
@@ -392,10 +407,43 @@ async function applyOneDuePendingChange(pendingChangeId: string, correlationId: 
         pendingChangeId: pending.id,
       });
 
-      return false;
+      return 'none';
     }
 
     const document = migrateConstitution(constitutionRow.document);
+    const currentLimit = document.limits.find((limit) => limit.id === pending.limitId);
+
+    if (!currentLimit || currentLimit.maxUsd !== pending.oldValue) {
+      const voidedRows = await tx
+        .update(constitutionPendingChanges)
+        .set({ voidedAt: sql`now()` })
+        .where(eq(constitutionPendingChanges.id, pending.id))
+        .returning();
+
+      const voidedAt = voidedRows[0]?.voidedAt ?? new Date();
+
+      await recordEvent(
+        {
+          eventType: 'constitution.limit_increase_voided',
+          occurredAt: voidedAt,
+          correlationId,
+          userId: constitutionRow.userId,
+          payload: {
+            constitutionId: constitutionRow.id,
+            limitId: pending.limitId,
+            field: pending.field,
+            expectedOldValue: pending.oldValue,
+            observedCurrentValue: currentLimit?.maxUsd ?? null,
+            newValue: pending.newValue,
+            pendingChangeId: pending.id,
+          },
+        },
+        tx,
+      );
+
+      return 'voided';
+    }
+
     const newDocument = withMaxUsd(document, pending.limitId, pending.newValue);
 
     await tx.update(constitutions).set({ document: newDocument }).where(eq(constitutions.id, constitutionRow.id));
@@ -426,44 +474,70 @@ async function applyOneDuePendingChange(pendingChangeId: string, correlationId: 
       tx,
     );
 
-    return true;
+    return 'applied';
   });
 }
 
+export interface ApplyDuePendingChangesResult {
+  appliedCount: number;
+  voidedCount: number;
+}
+
 /**
- * Applies every pending change whose 48h has elapsed, across every user's constitution.
- * Piggybacks on the existing app-open reconciliation entry point
- * (`POST /api/wallet/reconcile`) rather than a scheduler — this is Phase 0's only "lazy cron"
- * pattern (`.ai/decisions/hosting-and-growth-path.md`), already used the same way for chain
+ * Resolves up to `PENDING_CHANGE_APPLY_BATCH_LIMIT` pending changes whose 48h has elapsed,
+ * across every user's constitution. Piggybacks on the existing app-open trigger — the
+ * dashboard load and the `/constitution/edit` load, and `POST /api/wallet/reconcile` — rather
+ * than a scheduler; this is Phase 0's only "lazy cron" pattern
+ * (`.ai/decisions/hosting-and-growth-path.md`), already used the same way for chain
  * reconciliation itself.
  *
  * Deliberately not scoped to the caller's own session: whoever happens to open the app first
- * after a change's `effective_at` passes is what applies it, for every user with a due row —
- * not only their own — so a change that becomes due while its owner is away still applies
+ * after a change's `effective_at` passes is what resolves it, for every user with a due row —
+ * not only their own — so a change that becomes due while its owner is away still resolves
  * "even if the user reloads, closes the tab, or the change is checked well past its due time"
- * (this phase's success criteria), the moment *anyone's* reconcile call runs.
+ * (this phase's success criteria), the moment *anyone's* app-open trigger runs. The batch cap
+ * bounds one call's work; a backlog beyond it is picked up by the next trigger, not held open
+ * in one unbounded scan.
+ *
+ * Gated by `CONSTITUTION_PENDING_CHANGE_APPLY_FLAG` — off (or unreachable), this returns zero
+ * counts without claiming, voiding, or applying anything; a due row simply waits for the next
+ * pass once the switch is back on.
  */
-export async function applyDuePendingChanges(correlationId: string): Promise<number> {
+export async function applyDuePendingChanges(correlationId: string): Promise<ApplyDuePendingChangesResult> {
+  if (!(await isFeatureEnabled(CONSTITUTION_PENDING_CHANGE_APPLY_FLAG))) {
+    return { appliedCount: 0, voidedCount: 0 };
+  }
+
   const dueRows = await getDb()
     .select({ id: constitutionPendingChanges.id })
     .from(constitutionPendingChanges)
-    .where(and(isNull(constitutionPendingChanges.appliedAt), lte(constitutionPendingChanges.effectiveAt, sql`now()`)));
+    .where(
+      and(
+        isNull(constitutionPendingChanges.appliedAt),
+        isNull(constitutionPendingChanges.voidedAt),
+        lte(constitutionPendingChanges.effectiveAt, sql`now()`),
+      ),
+    )
+    .limit(PENDING_CHANGE_APPLY_BATCH_LIMIT);
 
   let appliedCount = 0;
+  let voidedCount = 0;
 
   for (const dueRow of dueRows) {
     try {
-      const applied = await applyOneDuePendingChange(dueRow.id, correlationId);
+      const outcome = await applyOneDuePendingChange(dueRow.id, correlationId);
 
-      if (applied) {
+      if (outcome === 'applied') {
         appliedCount += 1;
+      } else if (outcome === 'voided') {
+        voidedCount += 1;
       }
     } catch (error) {
       captureError(error, { correlationId, operation: 'applyDuePendingChanges', pendingChangeId: dueRow.id });
     }
   }
 
-  return appliedCount;
+  return { appliedCount, voidedCount };
 }
 
 /** The wire shape the edit page renders — one place computing the countdown-to-effective. */

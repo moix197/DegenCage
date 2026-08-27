@@ -21,6 +21,7 @@ const {
   txUpdateMock,
   resolveSessionMock,
   recordEventMock,
+  isFeatureEnabledMock,
 } = vi.hoisted(() => ({
   selectMock: vi.fn(),
   updateMock: vi.fn(),
@@ -31,6 +32,7 @@ const {
   txUpdateMock: vi.fn(),
   resolveSessionMock: vi.fn(),
   recordEventMock: vi.fn(),
+  isFeatureEnabledMock: vi.fn(),
 }));
 
 vi.mock('../db/client', () => ({
@@ -44,6 +46,7 @@ vi.mock('../db/client', () => ({
 }));
 vi.mock('../auth/session', () => ({ resolveSession: resolveSessionMock }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
+vi.mock('../flags/feature-flags', () => ({ isFeatureEnabled: isFeatureEnabledMock }));
 
 const SESSION_USER_ID = 'user-1';
 const SESSION_WALLET_ID = 'wallet-1';
@@ -92,6 +95,7 @@ function pendingRow(overrides: Record<string, unknown> = {}) {
     newValue: '900',
     effectiveAt: new Date(Date.now() + DELAYED_INCREASE_MS),
     appliedAt: null,
+    voidedAt: null,
     createdAt: new Date(),
     ...overrides,
   };
@@ -116,6 +120,30 @@ function updateResult(rows: unknown[]) {
 
 function selectReturnsOn(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
   mock.mockReturnValueOnce({ from: () => ({ where: () => queryResult(rows) }) });
+}
+
+/** Same as `selectReturnsOn`, but captures the WHERE predicate and the `.limit(n)` argument — the due-rows scan's `select().from().where().limit(N)` shape. */
+function selectReturnsCapturingWhereAndLimit(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
+  const whereSpy = vi.fn();
+  const limitSpy = vi.fn();
+
+  mock.mockReturnValueOnce({
+    from: () => ({
+      where: (whereArg: unknown) => {
+        whereSpy(whereArg);
+
+        return {
+          limit: (n: unknown) => {
+            limitSpy(n);
+
+            return Promise.resolve(rows);
+          },
+        };
+      },
+    }),
+  });
+
+  return { whereSpy, limitSpy };
 }
 
 function updateReturnsOn(mock: ReturnType<typeof vi.fn>, rows: unknown[]) {
@@ -182,6 +210,9 @@ function whereSql(whereArg: unknown): { sql: string; params: unknown[] } {
 beforeEach(() => {
   vi.clearAllMocks();
   resolveSessionMock.mockResolvedValue(sessionIdentity());
+  // On by default so every existing test exercises the real apply/void logic; the kill-switch
+  // tests below override this per-call.
+  isFeatureEnabledMock.mockResolvedValue(true);
   transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<unknown>) =>
     callback({ select: txSelectMock, update: txUpdateMock }),
   );
@@ -273,8 +304,8 @@ describe('requestLimitChange', () => {
     selectReturns([]);
     const secondPass = await applyDuePendingChanges('corr-7');
 
-    expect(firstPass).toBe(0);
-    expect(secondPass).toBe(0);
+    expect(firstPass).toEqual({ appliedCount: 0, voidedCount: 0 });
+    expect(secondPass).toEqual({ appliedCount: 0, voidedCount: 0 });
     expect(transactionMock).not.toHaveBeenCalled();
   });
 
@@ -294,13 +325,13 @@ describe('applyDuePendingChanges', () => {
     selectReturns([{ id: duePending.id }]); // due-rows scan
 
     txSelectReturns([duePending]); // claim the pending row under FOR UPDATE
-    txSelectReturns([activeRow()]); // load the constitution row under FOR UPDATE
+    txSelectReturns([activeRow()]); // load the constitution row under FOR UPDATE (current maxUsd '500' === oldValue '500')
     const { setSpy: documentSetSpy } = txUpdateReturns([]); // fold the new value into `document`
     txUpdateReturns([{ ...duePending, appliedAt: new Date() }]); // mark the row applied
 
-    const appliedCount = await applyDuePendingChanges('corr-9');
+    const result = await applyDuePendingChanges('corr-9');
 
-    expect(appliedCount).toBe(1);
+    expect(result).toEqual({ appliedCount: 1, voidedCount: 0 });
     const documentSetArg = documentSetSpy.mock.calls[0]?.[0] as { document: Constitution };
     expect(documentSetArg.document.limits[0]?.maxUsd).toBe(duePending.newValue);
 
@@ -314,10 +345,74 @@ describe('applyDuePendingChanges', () => {
   it('is a no-op when the due-rows scan finds nothing', async () => {
     selectReturns([]);
 
-    const appliedCount = await applyDuePendingChanges('corr-10');
+    const result = await applyDuePendingChanges('corr-10');
 
-    expect(appliedCount).toBe(0);
+    expect(result).toEqual({ appliedCount: 0, voidedCount: 0 });
     expect(transactionMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The stale-value repro: request an increase 500→900, then a decrease lands (500→10)
+   * before the 48h elapses — simulated here by the constitution row `applyOneDuePendingChange`
+   * loads having a *current* `maxUsd` ('10') that no longer matches the pending row's
+   * `old_value` ('500'). Applying `new_value` ('900') on top would silently jump the limit
+   * from the user's actual current value (10) to 900 — an increase never requested from that
+   * baseline. The row must be voided, not applied, and `document` must stay untouched.
+   */
+  it('voids a due increase whose old_value no longer matches the limit\'s current value, without touching document', async () => {
+    const duePending = pendingRow({ oldValue: '500', newValue: '900', effectiveAt: new Date(Date.now() - 1_000) });
+    selectReturns([{ id: duePending.id }]); // due-rows scan
+
+    txSelectReturns([duePending]); // claim the pending row under FOR UPDATE
+    // The limit's current maxUsd has moved to '10' since the increase was requested — a
+    // decrease that landed in between.
+    txSelectReturns([activeRow({ document: constitutionDocument({ maxUsd: '10' }) })]);
+    const { setSpy: voidSetSpy, whereSpy: voidWhereSpy } = txUpdateReturns([{ ...duePending, voidedAt: new Date() }]);
+
+    const result = await applyDuePendingChanges('corr-stale');
+
+    expect(result).toEqual({ appliedCount: 0, voidedCount: 1 });
+    // Exactly one tx.update call (the voided-row bookkeeping) — never the `constitutions`
+    // document update the applied path would also make.
+    expect(txUpdateMock).toHaveBeenCalledTimes(1);
+    expect((voidSetSpy.mock.calls[0]?.[0] as { voidedAt: unknown }).voidedAt).toBeDefined();
+    const { params: voidWhereParams } = whereSql(voidWhereSpy.mock.calls[0]?.[0]);
+    expect(voidWhereParams).toContain(duePending.id);
+
+    expect(recordEventMock.mock.calls[0]?.[0]).toMatchObject({
+      eventType: 'constitution.limit_increase_voided',
+      correlationId: 'corr-stale',
+      payload: expect.objectContaining({
+        pendingChangeId: duePending.id,
+        expectedOldValue: '500',
+        observedCurrentValue: '10',
+        newValue: '900',
+      }),
+    });
+  });
+
+  /** The kill switch: off, nothing is claimed, voided, or applied — the row simply waits. */
+  it('is a no-op when CONSTITUTION_PENDING_CHANGE_APPLY_FLAG is off', async () => {
+    isFeatureEnabledMock.mockResolvedValue(false);
+
+    const result = await applyDuePendingChanges('corr-flag-off');
+
+    expect(result).toEqual({ appliedCount: 0, voidedCount: 0 });
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(transactionMock).not.toHaveBeenCalled();
+  });
+
+  /** The real `effective_at <= now() AND applied_at IS NULL AND voided_at IS NULL` predicate, and the batch cap. */
+  it('scans with the real due predicate and caps the batch size', async () => {
+    const { whereSpy, limitSpy } = selectReturnsCapturingWhereAndLimit(selectMock, []);
+
+    await applyDuePendingChanges('corr-predicate');
+
+    const { sql: whereClause } = whereSql(whereSpy.mock.calls[0]?.[0]);
+    expect(whereClause).toContain('"applied_at" is null');
+    expect(whereClause).toContain('"voided_at" is null');
+    expect(whereClause).toContain('"effective_at" <=');
+    expect(limitSpy.mock.calls[0]?.[0]).toBeGreaterThan(0);
   });
 });
 
@@ -345,6 +440,7 @@ describe('cancelPendingChange', () => {
     const { sql: whereClause, params } = whereSql(whereSpy.mock.calls[0]?.[0]);
     expect(whereClause).toContain('"constitution_id" =');
     expect(whereClause).toContain('"applied_at" is null');
+    expect(whereClause).toContain('"voided_at" is null');
     expect(params).toContain(cancelled.id);
     expect(params).toContain(CONSTITUTION_ID);
   });
@@ -367,9 +463,9 @@ describe('cancelPendingChange', () => {
     // The row no longer exists, so the due-rows scan (the same query real Postgres would run
     // after the DELETE committed) finds nothing left to apply.
     selectReturns([]);
-    const appliedCount = await applyDuePendingChanges('corr-15');
+    const result = await applyDuePendingChanges('corr-15');
 
-    expect(appliedCount).toBe(0);
+    expect(result).toEqual({ appliedCount: 0, voidedCount: 0 });
     expect(transactionMock).not.toHaveBeenCalled();
   });
 });

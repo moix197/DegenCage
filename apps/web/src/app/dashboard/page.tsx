@@ -3,6 +3,7 @@ import { desc, eq } from 'drizzle-orm';
 import type { AssetTier } from '@degencage/rules';
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
+import { applyDuePendingChanges } from '@/server/constitution/pending-changes';
 import { getDb } from '@/server/db/client';
 import { trades, type TokenClassificationQuality } from '@/server/db/schema';
 import { buildDashboardState, loadReconciliationState } from '@/server/dashboard/dashboard-state';
@@ -129,6 +130,16 @@ export default async function DashboardPage() {
       captureError(error, { correlationId, page: 'dashboard' });
     }
     reconcileFailed = true;
+  }
+
+  // The real app-open trigger: `POST /api/wallet/reconcile` has no caller of its own, so this
+  // page load (and `/constitution/edit`'s) is what actually resolves a due limit increase.
+  // Best-effort and independent of chain reconciliation above — a due constitution edit does
+  // not depend on wallet history, so it must still resolve even when `reconcileFailed`.
+  try {
+    await applyDuePendingChanges(correlationId);
+  } catch (error) {
+    captureError(error, { correlationId, page: 'dashboard', operation: 'applyDuePendingChanges' });
   }
 
   const reconciliationState = await loadReconciliationState(session.walletId);
