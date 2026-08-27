@@ -359,62 +359,88 @@ Stored as `constitutions.document jsonb` (matches `single-source-of-truth-databa
 
 ---
 
-### Phase 5: Thicken with asset-tier classification and per-tier acquisition limits
+### Phase 5: Thicken with market-cap asset tiers and per-tier acquisition limits
 
 **Risk:** high
 **Mode:** afk
 **Type:** backend
-**Success criteria:** A user can add a per-asset-tier acquisition limit (e.g. "$100/24h into MEMECOIN") alongside their daily total. Each trade on the status page now shows a tier badge, and buying into a tier past its limit is flagged as a violation while selling out of that tier never is. An unclassifiable token is visibly tagged "counted as memecoin."
+**Success criteria:** A user can add a per-asset-tier acquisition limit (e.g. "$100/24h into MICRO_CAP") alongside their daily total. Each trade on the status page now shows a market-cap tier badge, and buying into a tier past its limit is flagged as a violation while selling out of that tier never is. An unlisted or unpriceable token is visibly tagged "counted as micro cap."
+
+**Taxonomy change (supersedes decision 7's identity-based tiers):** tiers are graded by market capitalization, not by asset identity. The product question a tier limit answers is "how much am I gambling?", and market cap answers it directly where an identity label does not — Jupiter's `verified` tag classifies BONK (~$268M mcap) identically to a 3-day-old pump.fun mint, which is exactly the trade the limit exists to cage. Buying a low cap is the same bet whether or not it has a dog on it.
 
 **Acid test applied explicitly:** this is not a re-run of Phase 4's layer — it adds a second, independently authorable limit type with its own visible enforcement (tier badges + per-tier violations), which a user can exercise without touching anything from Phase 6.
 
-**Commit message:** `feat: asset-tier classification and per-tier acquisition limits`
+**Commit message:** `feat: market-cap asset tiers and per-tier acquisition limits`
+
+**Tier definition (the new `AssetTier`):**
+
+| Tier | Rule | Source |
+|---|---|---|
+| `STABLE` | curated stablecoin mint set | reuses the stablecoin mints from `pricing/price-trade.ts` — extracted to a shared module, not duplicated |
+| `LARGE_CAP` | `mcap >= $1B` | Jupiter Tokens v2 |
+| `MID_CAP` | `$100M <= mcap < $1B` | Jupiter Tokens v2 |
+| `SMALL_CAP` | `$10M <= mcap < $100M` | Jupiter Tokens v2 |
+| `MICRO_CAP` | `mcap < $10M`, unlisted, no `mcap` field, or flag off | **fail-closed default** |
+
+Thresholds live in one named exported constant so they are tunable without touching classification logic. SOL and LSTs are unaffected by tiering: SOL↔LST swaps are already excluded upstream by decision 8 (`derive-swaps.ts`), and SOL itself classifies as `LARGE_CAP` by mcap like anything else.
+
+**Known imprecision (document, do not solve):** `mcap` is a *live* value, so a tier is a point-in-time judgement. It is therefore stamped onto `trades.acquired_tier` at classification time and never recomputed — a token that later moons does not retroactively rewrite past violations (consistent with decision 17, append-only). One consequence: the 90-day backfill (decision 9) classifies historical trades at *today's* mcap. Backfilled trades are baseline-only and never surfaced as violations, so this is acceptable, but the status page must not present a backfilled tier badge as if it were a contemporaneous judgement.
 
 **File changes:**
 | Action | File | What changes |
 |---|---|---|
+| modify | `packages/rules/src/constitution.ts` | replace `AssetTier` with the market-cap tiers above; `ASSET_TIERS` array and `isAssetTier()` follow. Phase 3's parse/validation structure is otherwise untouched |
+| modify | `packages/rules/src/constitution.test.ts` | update the tier fixtures to the new enum; keep the invalid-tier rejection case |
+| modify | `packages/rules/src/index.ts` | re-export surface unchanged in shape, new tier values |
 | modify | `apps/web/src/server/db/schema.ts` | add `trades.acquired_tier`, `trades.is_acquisition` columns |
-| create | `apps/web/src/server/chain/classify-token.ts` | curated allowlists (stables, SOL/wSOL, BTC/ETH wrappers) + `lst-allowlist.ts` (reused from Phase 4, not duplicated) + Jupiter Tokens v2 `tag=verified` lookup, behind `isFeatureEnabled('classification.jupiter_tags')`; unclassifiable or flag-off → `MEMECOIN` + `classification: 'unknown'` (decision 7's fail-closed default doubles as the kill-switch fallback) |
+| create | `apps/web/src/server/chain/stablecoin-mints.ts` | the curated stablecoin mint set, extracted from `pricing/price-trade.ts` so pricing and classification share one list and cannot diverge (same pattern as `lst-allowlist.ts`) |
+| modify | `apps/web/src/server/pricing/price-trade.ts` | import the stablecoin set from its new home instead of declaring it locally; add alt↔alt fallback: price the more liquid leg via Birdeye when neither leg is SOL/stablecoin |
+| create | `apps/web/src/server/chain/jupiter-tokens.ts` | thin client for Jupiter Tokens v2 `search` (comma-batched mints, one call per reconcile batch), behind `isFeatureEnabled('classification.jupiter_mcap')`, with timeout + per-mint TTL cache |
+| create | `apps/web/src/server/chain/classify-token.ts` | `STABLE` via the curated set, then mcap bucketing via `jupiter-tokens.ts`; unlisted / no `mcap` / flag off → `MICRO_CAP` + `classification: 'unknown'` (fail-closed default doubles as the kill-switch fallback) |
 | create | `apps/web/src/server/pricing/birdeye-price.ts` | long-tail mint pricing via `historical_price_unix`/`history_price`, behind `isFeatureEnabled('pricing.birdeye')` |
-| modify | `apps/web/src/server/pricing/price-trade.ts` | add alt↔alt fallback: price the more liquid leg via Birdeye when neither leg is SOL/stablecoin |
-| modify | `packages/rules/src/evaluate.ts` | add the `asset_tier_acquisition_usd` case, reusing the existing `Decision`/`LimitEvaluation` types and `rolling-allowance.ts` windowing helper from Phase 4 |
 | modify | `apps/web/src/server/chain/reconcile-wallet.ts` | resolve tier via `classify-token.ts` before calling `evaluateTrade`; pass `acquiredTier`/`isAcquisition` through |
+| modify | `packages/rules/src/evaluate.ts` | add the `asset_tier_acquisition_usd` case, reusing the existing `Decision`/`LimitEvaluation` types and `rolling-allowance.ts` windowing helper from Phase 4 |
 | modify | `apps/web/src/app/constitution/page.tsx` | add the per-asset-tier limit as a second authoring option |
 | modify | `apps/web/src/app/constitution-status/page.tsx` | add tier badges to each trade row and a per-tier remaining-allowance line |
 
 **Steps:**
 
-- [ ] Migration: `trades` tier columns
-- [ ] Implement `classify-token.ts` reusing `lst-allowlist.ts`; unknown mint → `MEMECOIN` + `classification: 'unknown'`; flag-off → same fail-closed fallback
-- [ ] Implement Birdeye long-tail pricing behind its own kill switch; extend `price-trade.ts`'s leg-selection to fall back to it only when neither leg is SOL/stablecoin
-- [ ] Add `asset_tier_acquisition_usd` to `evaluateTrade()`: sums `usd_value` only where `isAcquisition && acquiredTier === rule.tier`; disposals never consume this allowance (decision 6)
-- [ ] Wire classification into `reconcile-wallet.ts`, in the same transaction/order as Phase 4's pipeline
-- [ ] Extend constitution authoring UI and status page
+- [x] Replace `AssetTier` in `packages/rules/src/constitution.ts` with the market-cap tiers; update `constitution.test.ts` fixtures
+- [x] Migration: `trades` tier columns
+- [x] Extract `stablecoin-mints.ts` from `price-trade.ts` and repoint the pricing import (no behavior change)
+- [x] Implement `jupiter-tokens.ts`: batched mint lookup, timeout, TTL cache, kill switch
+- [x] Implement `classify-token.ts`: `STABLE` first, then mcap thresholds; unlisted / missing mcap / flag-off → `MICRO_CAP` + `classification: 'unknown'`
+- [x] Implement Birdeye long-tail pricing behind its own kill switch; extend `price-trade.ts`'s leg-selection to fall back to it only when neither leg is SOL/stablecoin
+- [x] Add `asset_tier_acquisition_usd` to `evaluateTrade()`: sums `usd_value` only where `isAcquisition && acquiredTier === rule.tier`; disposals never consume this allowance (decision 6)
+- [x] Wire classification into `reconcile-wallet.ts`, in the same transaction/order as Phase 4's pipeline
+- [x] Extend constitution authoring UI and status page
 
 **Tests:**
 
 | Action | File | What it covers |
 |---|---|---|
-| create | `apps/web/src/server/chain/classify-token.test.ts` | curated lists resolve correctly; unknown mint → MEMECOIN + `unknown`; flag-off → same fallback; LST list reused correctly from `lst-allowlist.ts` (no divergence between exclusion and classification lists) |
-| modify | `apps/web/src/server/pricing/price-trade.test.ts` | alt↔alt fallback prices the more liquid leg via Birdeye; still `null` if Birdeye is also unresolvable/flag-off |
+| modify | `packages/rules/src/constitution.test.ts` | the new tier values parse; an unknown tier string is still rejected as `invalid_asset_tier` |
+| create | `apps/web/src/server/chain/classify-token.test.ts` | each mcap threshold buckets on both sides of its boundary; stablecoin mints resolve to `STABLE` without any external call; unlisted mint → `MICRO_CAP` + `unknown`; missing/null `mcap` field → same fallback; flag-off → same fallback with zero network calls; Jupiter client timeout/error → same fallback (fail closed, never throws into the reconcile pipeline) |
+| create | `apps/web/src/server/chain/jupiter-tokens.test.ts` | mints are comma-batched into one request; TTL cache prevents a repeat call inside the window; timeout is enforced |
+| modify | `apps/web/src/server/pricing/price-trade.test.ts` | alt↔alt fallback prices the more liquid leg via Birdeye; still `null` if Birdeye is also unresolvable/flag-off; stablecoin pricing unchanged after the mint-set extraction |
 | modify | `packages/rules/src/evaluate.test.ts` | `asset_tier_acquisition_usd`: buying into a tier past its limit violates; selling out of that tier never consumes the allowance regardless of amount; a trade can violate the tier limit and still be within the daily-notional limit (independent evaluations) |
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] Manual: activate a constitution with a tight per-asset-tier limit, execute a small real swap into that tier on-chain, confirm it's flagged with correct reasoning; confirm selling out of an over-limit tier is never itself flagged
+- [x] `pnpm test` passes
+- [ ] Manual: activate a constitution with a tight `MICRO_CAP` limit, execute a small real swap into a low-cap token on-chain, confirm it's flagged with correct reasoning; confirm selling out of an over-limit tier is never itself flagged; confirm flipping `classification.jupiter_mcap` off degrades every classification to `MICRO_CAP`/`unknown` rather than erroring
 
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes above ticked in the plan file
 - [ ] Reviewer handoff prompt emitted in a fenced code block as the final message of this turn
 - [ ] Orchestrator cleared context (`/clear`) and pasted the handoff prompt into a fresh session
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
-- [ ] Tests for this phase written and passing
+- [x] Code-reviewer agent has verified this phase
+- [x] Any changes made in response to code-reviewer suggestions have been reflected back into this plan file
+- [x] Tests for this phase written and passing
 - [ ] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat: asset-tier classification and per-tier acquisition limits`
+- [x] Changes committed: `feat: market-cap asset tiers and per-tier acquisition limits`
 - [ ] Phase marked complete
 
 ---
