@@ -1,5 +1,6 @@
 import type { AssetTier, Constitution } from '@degencage/rules';
 import type { TokenClassificationQuality } from '../chain/classify-token';
+import { sql } from 'drizzle-orm';
 import {
   bigint,
   boolean,
@@ -534,6 +535,22 @@ export const TRADE_INTENT_STATUSES = [
 export type TradeIntentStatus = (typeof TRADE_INTENT_STATUSES)[number];
 
 /**
+ * Statuses in which a `trade_intents` row is "live" — it reserves allowance against the
+ * wallet's rolling limits and is the one row the partial unique index below allows per wallet.
+ * `quoted` is included deliberately: nothing writes `approved` yet (it exists in the schema for
+ * a later explicit-approval step — `.ai/decisions/swap-signing-and-submit.md`), so a `quoted`
+ * intent *is* the wallet's live reservation between `quote-service.ts` writing it and either an
+ * approval, a signature, or expiry. Excluding it here would make Phase 4's whole concurrency
+ * guarantee protect nothing, since every intent sits in `quoted` for its entire unsigned life.
+ *
+ * Kept in sync **by hand** with the partial unique index's `.where()` predicate immediately
+ * below — Postgres requires a partial-index predicate to be immutable, so this array cannot be
+ * interpolated into it at migration-generation time. `server/swap/intent-lifecycle.ts`'s
+ * `intent-lifecycle.test.ts` asserts the two stay identical.
+ */
+export const LIVE_TRADE_INTENT_STATUSES = ['quoted', 'approved', 'signed', 'submitted'] as const satisfies readonly TradeIntentStatus[];
+
+/**
  * One pre-trade intent: a Jupiter quote, the rule-engine verdict computed against it before
  * any signature exists, and (for an allowed quote) the hash of the compiled v0 message the
  * wallet will be asked to sign.
@@ -589,6 +606,16 @@ export const tradeIntents = pgTable(
   (table) => [
     // The live-intent lookup Phase 4's reservation and expiry reaping both run.
     index('trade_intents_wallet_id_status_idx').on(table.walletId, table.status),
+    // Belt-and-braces DB-level backstop (`.ai/patterns/guarded-state-transition.md`): at most
+    // one live row per wallet, full stop — a `SELECT` then `INSERT` in application code cannot
+    // close the race between two concurrent quote requests on its own (see the plan's
+    // "Single-live-intent concurrency guarantee"). The predicate can reference only `status`
+    // (Postgres partial-index predicates must be immutable, so `expires_at > now()` cannot
+    // appear here) — keep this literal list in sync by hand with `LIVE_TRADE_INTENT_STATUSES`
+    // above.
+    uniqueIndex('trade_intents_wallet_live_idx')
+      .on(table.walletId)
+      .where(sql`status in ('quoted','approved','signed','submitted')`),
   ],
 );
 

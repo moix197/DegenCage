@@ -30,7 +30,7 @@ import { submitSignedSwap, SubmitRejectedError } from './submit-service';
  * own contents are asserted separately, by reading back the parameters it was built with.
  */
 
-const { getDbMock, updateMock, selectMock, recordEventMock, broadcastMock, loadWindowedTradesMock, isFeatureEnabledMock } = vi.hoisted(() => {
+const { getDbMock, updateMock, selectMock, recordEventMock, broadcastMock, loadEvaluableWindowedTradesMock, isFeatureEnabledMock } = vi.hoisted(() => {
   const updateMock = vi.fn();
   const selectMock = vi.fn();
 
@@ -39,7 +39,7 @@ const { getDbMock, updateMock, selectMock, recordEventMock, broadcastMock, loadW
     selectMock,
     recordEventMock: vi.fn(),
     broadcastMock: vi.fn(),
-    loadWindowedTradesMock: vi.fn(),
+    loadEvaluableWindowedTradesMock: vi.fn(),
     isFeatureEnabledMock: vi.fn(),
     getDbMock: () => ({
       update: () => ({
@@ -78,7 +78,7 @@ function collectParams(node: unknown, out: unknown[] = []): unknown[] {
 vi.mock('../db/client', () => ({ getDb: getDbMock }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
 vi.mock('../chain/broadcast-transaction', () => ({ broadcastSignedTransaction: broadcastMock, CHAIN_BROADCAST_FLAG: 'chain.broadcast' }));
-vi.mock('../rules/rolling-allowance', () => ({ loadWindowedTrades: loadWindowedTradesMock }));
+vi.mock('./intent-lifecycle', () => ({ loadEvaluableWindowedTrades: loadEvaluableWindowedTradesMock }));
 vi.mock('../flags/feature-flags', () => ({ isFeatureEnabled: isFeatureEnabledMock }));
 
 const WALLET_ADDRESS = 'BPFLoaderUpgradeab1e11111111111111111111111';
@@ -211,7 +211,7 @@ beforeEach(() => {
   selectReturns([intentRow()]);
   recordEventMock.mockResolvedValue(undefined);
   broadcastMock.mockResolvedValue({ dryRun: true, networkSignature: null, logs: [] });
-  loadWindowedTradesMock.mockResolvedValue([]);
+  loadEvaluableWindowedTradesMock.mockResolvedValue([]);
   isFeatureEnabledMock.mockResolvedValue(true);
 });
 
@@ -394,13 +394,32 @@ describe('submitSignedSwap idempotency', () => {
 
 describe('submitSignedSwap re-evaluation', () => {
   it('blocks a trade whose allowance was spent between the quote and the signature', async () => {
-    loadWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: '450', isAcquisition: true, acquiredTier: 'MICRO_CAP' }]);
+    loadEvaluableWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: '450', isAcquisition: true, acquiredTier: 'MICRO_CAP' }]);
 
     await expect(submitSignedSwap(submitParams())).rejects.toMatchObject({ reason: 'rules_now_block' });
 
     expect(broadcastMock).not.toHaveBeenCalled();
     expect(updateMock).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'failed' }), expect.anything());
     expect(eventTypes()).toEqual(['trade.intent_signed', 'trade.intent_failed']);
+  });
+
+  /**
+   * The self-block regression this phase's plan calls out explicitly: `trade_intents`'
+   * partial unique index (Phase 4) allows at most one live row per wallet, and by the time an
+   * intent reaches `signed` it *is* that one live row. Once the allowance sum folds live
+   * intents in (`loadEvaluableWindowedTrades`), re-evaluating without excluding the intent
+   * under submission would always find itself already reserving its own notional and reject a
+   * signed, legitimate trade. `reevaluate` must pass `intent.id` as the exclusion — asserting
+   * on the actual call args, not just on the outcome, is what makes this test able to fail if
+   * that argument is ever dropped.
+   */
+  it('does not self-block: the intent being submitted must not count against its own reservation', async () => {
+    loadEvaluableWindowedTradesMock.mockResolvedValue([]);
+
+    const result = await submitSignedSwap(submitParams());
+
+    expect(result.status).toBe('submitted');
+    expect(loadEvaluableWindowedTradesMock).toHaveBeenCalledWith('wallet-1', expect.any(Number), expect.any(Date), expect.anything(), INTENT_ID);
   });
 
   it('blocks when the constitution is no longer active', async () => {
@@ -426,7 +445,7 @@ describe('submitSignedSwap re-evaluation', () => {
 
   it('re-evaluates before broadcasting, never after', async () => {
     const order: string[] = [];
-    loadWindowedTradesMock.mockImplementation(async () => {
+    loadEvaluableWindowedTradesMock.mockImplementation(async () => {
       order.push('reevaluate');
       return [];
     });

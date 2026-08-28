@@ -1,6 +1,7 @@
 import type { Constitution } from '@degencage/rules';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { tradeIntents, trades } from '../db/schema';
 import { createQuote, foldVerdict, QuotePreconditionError } from './quote-service';
 import type { JupiterBuildResponse } from './jupiter-client';
 
@@ -22,6 +23,7 @@ const {
   assembleSwapTransactionMock,
   recordEventMock,
   selectMock,
+  updateMock,
   transactionMock,
   insertedValuesSpy,
   getSolUsdPriceMock,
@@ -36,6 +38,7 @@ const {
   assembleSwapTransactionMock: vi.fn(),
   recordEventMock: vi.fn(),
   selectMock: vi.fn(),
+  updateMock: vi.fn(),
   transactionMock: vi.fn(),
   insertedValuesSpy: vi.fn(),
   getSolUsdPriceMock: vi.fn(),
@@ -51,7 +54,7 @@ vi.mock('../flags/feature-flags', () => ({ isFeatureEnabled: isFeatureEnabledMoc
 vi.mock('./jupiter-client', () => ({ buildSwap: buildSwapMock, BLOCKHASH_SLOTS_TO_EXPIRY: 150, JupiterBuildError: Error }));
 vi.mock('./assemble-transaction', () => ({ assembleSwapTransaction: assembleSwapTransactionMock }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
-vi.mock('../db/client', () => ({ getDb: () => ({ select: selectMock, transaction: transactionMock }) }));
+vi.mock('../db/client', () => ({ getDb: () => ({ select: selectMock, update: updateMock, transaction: transactionMock }) }));
 // The leaf price *sources* are mocked so no case here makes a network call; `priceTrade`
 // itself stays real, since which leg it prices is the thing under test.
 vi.mock('../pricing/binance-klines', () => ({
@@ -87,8 +90,25 @@ function constitutionRow(status: string, document: Constitution = DAILY_NOTIONAL
   return { id: 'constitution-1', userId: 'user-1', status, document, activatedAt: new Date() };
 }
 
-function selectReturns(rows: unknown[]): void {
-  selectMock.mockReturnValue({ from: () => ({ where: () => ({ limit: async () => rows }) }) });
+/**
+ * The `constitutions` lookup keeps its original one-shape mock; `tradeIntents`/`trades` — the
+ * two tables `intent-lifecycle.ts`'s live-intent reservation reads — always answer empty here,
+ * since no test in this file is exercising that reservation itself (`intent-lifecycle.test.ts`
+ * owns that). Discriminating on the real table object `.from()` is called with, the same
+ * convention `reconcile-wallet.test.ts`'s fake `tx()` uses, is what lets one shared
+ * `selectMock` serve three different query shapes without every existing test having to know
+ * about the two it does not care about.
+ */
+function selectReturns(constitutionRows: unknown[]): void {
+  selectMock.mockImplementation(() => ({
+    from: (table: unknown) => {
+      if (table === tradeIntents || table === trades) {
+        return { where: () => Promise.resolve([]) };
+      }
+
+      return { where: () => ({ limit: async () => constitutionRows }) };
+    },
+  }));
 }
 
 function buildResponse(overrides: Partial<JupiterBuildResponse> = {}): JupiterBuildResponse {
@@ -155,8 +175,17 @@ beforeEach(() => {
     lastValidBlockHeight: 300_000_000,
   });
   recordEventMock.mockResolvedValue(undefined);
+  // `reapExpiredIntents` (top of `createQuote`, and inside `loadLiveIntentUsd`) — no live
+  // intent to reap by default in any of these tests.
+  updateMock.mockReturnValue({ set: () => ({ where: () => ({ returning: async () => [] }) }) });
   transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
     callback({
+      // `expireAndReserveLiveIntent`'s wallet-row lock — the row itself is never read.
+      select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
+      // `expireAndReserveLiveIntent`'s guarded expire of the wallet's prior live intent — no
+      // prior live intent by default, so `persistIntent` never records `trade.intent_expired`
+      // unless a test overrides this.
+      update: () => ({ set: () => ({ where: () => ({ returning: async () => [] }) }) }),
       insert: () => ({
         values: (values: unknown) => {
           insertedValuesSpy(values);

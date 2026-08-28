@@ -10,8 +10,8 @@ import { getDb } from '../db/client';
 import { constitutions, tradeIntents, type TradeIntentStatus } from '../db/schema';
 import { isFeatureEnabled } from '../flags/feature-flags';
 import { priceTrade } from '../pricing/price-trade';
-import { loadWindowedTrades } from '../rules/rolling-allowance';
 import { assembleSwapTransaction, type AssembledTransaction } from './assemble-transaction';
+import { expireAndReserveLiveIntent, loadEvaluableWindowedTrades, reapExpiredIntents } from './intent-lifecycle';
 import { buildSwap, BLOCKHASH_SLOTS_TO_EXPIRY, JupiterBuildError, type JupiterBuildResponse } from './jupiter-client';
 
 /**
@@ -284,11 +284,10 @@ async function evaluateQuote(params: QuoteRequestParams, constitution: Constitut
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
   ]);
 
-  const windowedHistory = await loadWindowedTrades({
-    walletId: params.walletId,
-    windowHours: maxWindowHours(constitution),
-    asOf: occurredAt,
-  });
+  // Decision 3's allowance union: persisted `trades` plus any other live intent for this
+  // wallet (the prior quote a second concurrent request must see reserved). No exclusion id —
+  // this intent has not been inserted yet, so it cannot appear in its own history.
+  const windowedHistory = await loadEvaluableWindowedTrades(params.walletId, maxWindowHours(constitution), occurredAt);
 
   const decision = evaluateTrade(constitution, windowedHistory, {
     occurredAt,
@@ -329,6 +328,12 @@ function toQuoteView(evaluated: EvaluatedQuote): QuoteView {
  * The intent row and both its events are written in one transaction: a decision that reached
  * the user must be reconstructable from the audit trail, and a half-written one would leave a
  * live intent nothing explains (or an explanation for an intent that does not exist).
+ *
+ * Wrapped in `expireAndReserveLiveIntent` (`intent-lifecycle.ts`) rather than a plain
+ * `getDb().transaction()`: requesting this quote is what expires the wallet's prior live
+ * intent (decision 3), and the expire, the `trade.intent_expired` event and this insert all
+ * have to land atomically, under the same wallet-row lock, or two concurrent quote requests
+ * for the same wallet could both expire the same prior intent or both insert a live row.
  */
 async function persistIntent(
   params: QuoteRequestParams,
@@ -339,7 +344,20 @@ async function persistIntent(
 ): Promise<string> {
   const status: TradeIntentStatus = evaluated.verdict === 'allow' ? 'quoted' : 'blocked';
 
-  return getDb().transaction(async (tx) => {
+  return expireAndReserveLiveIntent(params.walletId, async (tx, expiredIntentId) => {
+    if (expiredIntentId) {
+      await recordEvent(
+        {
+          eventType: 'trade.intent_expired',
+          occurredAt: evaluated.occurredAt,
+          correlationId: params.correlationId,
+          userId: params.userId,
+          payload: { intentId: expiredIntentId, walletId: params.walletId, reason: 'new_quote_requested' },
+        },
+        tx,
+      );
+    }
+
     const inserted = await tx
       .insert(tradeIntents)
       .values({
@@ -410,6 +428,12 @@ async function persistIntent(
  */
 export async function createQuote(params: QuoteRequestParams): Promise<QuoteResult> {
   const constitution = await assertPreconditions(params);
+  // Reaped here, before the unconditional expire-prior-intent step further down in
+  // `persistIntent` (`.ai` mechanisms doc's "Active expiry reaping" — called from two places),
+  // so a wallet whose only live intent silently timed out is never mistaken for one this quote
+  // needs to expire, and so `evaluateQuote`'s live-intent sum below never counts a
+  // wall-clock-expired row.
+  await reapExpiredIntents(params.walletId);
   // Read before `/build`, not after: this is the fallback for a response that carries no
   // `fetchedAt`, and a clock read once the call has already returned dates the blockhash
   // later than it was fetched — which would push `expires_at` past the real lifetime.

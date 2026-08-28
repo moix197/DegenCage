@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -246,7 +246,31 @@ export function TradePanel() {
   const [submitting, setSubmitting] = useState(false);
   const [submitOutcome, setSubmitOutcome] = useState<SubmitResponse | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const { capability, isSigning, error: signingError, sign } = useSwapSigning();
+  const [accountSwitchNotice, setAccountSwitchNotice] = useState(false);
+  const { capability, isSigning, error: signingError, sign, connectedAddress } = useSwapSigning();
+
+  /**
+   * `connectedAddress` is `useSwapSigning`'s own `wallet-account-watch.ts` subscription
+   * (`.ai` Phase 4 mechanisms doc — "reuses the existing wallet-account-watch.ts
+   * subscription"), not a second one: the account-switch server-side path
+   * (`server/auth/session.ts`) is already expiring this wallet's live intent by the time this
+   * fires, so any quote sitting on screen belongs to a wallet this session no longer trusts —
+   * clearing it here rather than leaving a stale verdict up is the point, not a courtesy.
+   */
+  const previousConnectedAddress = useRef<string | null>(null);
+
+  useEffect(() => {
+    const previous = previousConnectedAddress.current;
+    previousConnectedAddress.current = connectedAddress;
+
+    if (previous !== null && connectedAddress !== previous) {
+      setResult(null);
+      setError(null);
+      setSubmitOutcome(null);
+      setSubmitError(null);
+      setAccountSwitchNotice(true);
+    }
+  }, [connectedAddress]);
 
   const decimals = SELLABLE_TOKENS.find((token) => token.mint === inputMint)?.decimals ?? 0;
   const baseUnits = toBaseUnits(amount, decimals);
@@ -257,6 +281,7 @@ export function TradePanel() {
     // describe the quote currently in hand, never a previous one.
     setSubmitOutcome(null);
     setSubmitError(null);
+    setAccountSwitchNotice(false);
 
     if (!ready) {
       setResult(null);
@@ -373,6 +398,13 @@ export function TradePanel() {
         <Label htmlFor="trade-output-mint">Buy (mint address)</Label>
         <Input id="trade-output-mint" value={outputMint} onChange={(event) => setOutputMint(event.target.value.trim())} placeholder="Mint address" />
       </div>
+
+      {accountSwitchNotice ? (
+        <Alert>
+          <AlertTitle>Wallet switched accounts</AlertTitle>
+          <AlertDescription>Your connected wallet changed, so this quote was reset. Request a new one for the account you are using now.</AlertDescription>
+        </Alert>
+      ) : null}
 
       {loading ? <Skeleton className="h-24 w-full" /> : null}
 

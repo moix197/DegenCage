@@ -11,6 +11,7 @@ import {
   resolveSession,
   revokeSession,
   type SessionCookie,
+  type SessionIdentity,
 } from '@/server/auth/session';
 import {
   parseSignInProof,
@@ -95,13 +96,18 @@ export async function POST(request: Request): Promise<Response> {
  * Runs before the revoke, or there is no session left to name. A failed write is captured,
  * never thrown: telemetry must not turn a revoke that succeeded into a sign-out reported
  * as failed.
+ *
+ * @returns The identity that was live on this request, so the caller can hand its
+ *   `walletId`/`userId` to `revokeSession` — Phase 4's account-switch intent expiry needs
+ *   them, and re-resolving the (about-to-be-cleared) cookie a second time there would be both
+ *   redundant and, once the revoke has run, unable to find the session at all.
  */
-async function recordSwitchDetectedByWatcher(correlationId: string): Promise<void> {
+async function recordSwitchDetectedByWatcher(correlationId: string): Promise<SessionIdentity | null> {
   try {
     const previous = await resolveSession(undefined, { slideExpiry: false });
 
     if (!previous) {
-      return;
+      return null;
     }
 
     logger.warn('wallet account switch detected by client watcher', {
@@ -116,8 +122,12 @@ async function recordSwitchDetectedByWatcher(correlationId: string): Promise<voi
       userId: previous.userId,
       payload: { previousAddress: previous.walletAddress, detectedBy: 'client_watcher' },
     });
+
+    return previous;
   } catch (error) {
     captureError(error, { correlationId, route: 'auth.verify.delete', step: 'record_switch' });
+
+    return null;
   }
 }
 
@@ -143,11 +153,9 @@ export async function DELETE(request: Request): Promise<Response> {
   const reason = parseRevocationReason(new URL(request.url).searchParams.get('reason'));
 
   try {
-    if (reason === 'account_switch') {
-      await recordSwitchDetectedByWatcher(correlationId);
-    }
+    const previous = reason === 'account_switch' ? await recordSwitchDetectedByWatcher(correlationId) : null;
 
-    await revokeSession(correlationId, reason);
+    await revokeSession(correlationId, reason, undefined, previous?.walletId ?? null, previous?.userId ?? null);
 
     return Response.json({ correlationId });
   } catch (error) {

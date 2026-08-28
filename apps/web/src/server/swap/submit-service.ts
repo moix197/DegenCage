@@ -10,7 +10,7 @@ import { LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
 import { getDb } from '../db/client';
 import { constitutions, events, tradeIntents, type TradeIntentRow, type TradeIntentStatus } from '../db/schema';
 import { isFeatureEnabled } from '../flags/feature-flags';
-import { loadWindowedTrades } from '../rules/rolling-allowance';
+import { loadEvaluableWindowedTrades } from './intent-lifecycle';
 import { foldVerdict } from './quote-service';
 
 /**
@@ -291,6 +291,14 @@ function maxWindowHours(constitution: Constitution): number {
  * traded elsewhere, and an allowance that was there a minute ago may not be. The constitution
  * must also still be the same active document: a different one means the intent was evaluated
  * against rules that are no longer in force, which fails closed rather than being re-judged.
+ *
+ * The windowed history is decision 3's same persisted-trades-UNION-live-intents allowance
+ * `quote-service.ts` evaluates against, via the shared `loadEvaluableWindowedTrades` —
+ * with `intent.id` excluded. By the time this intent reaches `signed` it is, by construction,
+ * the wallet's only live row (the partial unique index on `trade_intents` guarantees at most
+ * one), so without the exclusion it would always find itself already reserving its own
+ * notional and self-block a signed, legitimate trade (the hazard the Phase 3 code review
+ * flagged).
  */
 async function reevaluate(intent: TradeIntentRow, userId: string): Promise<void> {
   const rows = await getDb().select().from(constitutions).where(eq(constitutions.userId, userId)).limit(1);
@@ -306,7 +314,7 @@ async function reevaluate(intent: TradeIntentRow, userId: string): Promise<void>
 
   const constitution = migrateConstitution(row.document);
   const occurredAt = new Date();
-  const windowedHistory = await loadWindowedTrades({ walletId: intent.walletId, windowHours: maxWindowHours(constitution), asOf: occurredAt });
+  const windowedHistory = await loadEvaluableWindowedTrades(intent.walletId, maxWindowHours(constitution), occurredAt, getDb(), intent.id);
   const decision = evaluateTrade(constitution, windowedHistory, {
     occurredAt,
     usdValue: intent.usdValue,

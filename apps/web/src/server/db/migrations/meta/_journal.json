@@ -120,6 +120,13 @@
       "when": 1787883783213,
       "tag": "0016_robust_rawhide_kid",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1787892483044,
+      "tag": "0017_panoramic_thunderbolt",
+      "breakpoints": true
     }
   ]
 }
