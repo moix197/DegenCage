@@ -3,6 +3,7 @@ import { featureFlags } from './schema';
 import { WALLET_CONNECT_FLAG } from '../auth/solana-siws';
 import { CHAIN_HELIUS_FLAG } from '../chain/helius-client';
 import { CLASSIFICATION_JUPITER_MCAP_FLAG } from '../chain/jupiter-tokens';
+import { CHAIN_BROADCAST_FLAG } from '../chain/broadcast-transaction';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
 import { CONSTITUTION_AUTHOR_FLAG } from '../constitution/commitment';
 import { CONSTITUTION_PENDING_CHANGE_APPLY_FLAG } from '../constitution/pending-changes';
@@ -51,6 +52,11 @@ const SEED_FLAGS: { key: string; enabled: boolean }[] = [
   // are flipped on deliberately, per environment, never by default.
   { key: TRADE_TERMINAL_FLAG, enabled: false },
   { key: JUPITER_SWAP_BUILD_FLAG, enabled: false },
+  // The one flag in this repo that can move real money. Off is the designed state, not a
+  // degraded one (decision 14): every phase before Phase 6 exercises the whole pipeline —
+  // quote, evaluate, compile, sign, verify, simulate — with this off and nothing sent. It is
+  // flipped by a human, for one throwaway wallet, once the dry-run pass has been recorded.
+  { key: CHAIN_BROADCAST_FLAG, enabled: false },
 ];
 
 async function seedFeatureFlags(): Promise<void> {
