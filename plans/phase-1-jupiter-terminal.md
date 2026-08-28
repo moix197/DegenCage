@@ -128,8 +128,8 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 - [x] `pnpm typecheck` passes
 - [x] `pnpm test` passes (no regressions)
-- [ ] Manual: load `/dashboard` and `/feedback` (or wherever currently reachable) in a browser, confirm dark theme now renders shadcn's dark palette instead of light-on-dark
-- [ ] Manual: confirm each new primitive file imports without type errors (a throwaway local import is enough — no permanent smoke-test route needed)
+- [ ] Manual: load `/dashboard` and `/feedback` (or wherever currently reachable) in a browser, confirm dark theme now renders shadcn's dark palette instead of light-on-dark — _deferred: rolled into Phase 2's manual verification pass, when the app is run locally_
+- [x] Manual: confirm each new primitive file imports without type errors (a throwaway local import is enough — no permanent smoke-test route needed)
 
 **Phase review:**
 
@@ -138,9 +138,9 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 - [x] Code-reviewer agent has verified this phase
 - [x] Review follow-ups reflected back into this plan file
 - [x] Documentation updated (see Documentation section)
-- [ ] Orchestrator (user) has verified and approved this phase
+- [x] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
-- [ ] Phase marked complete
+- [x] Phase marked complete
 
 ---
 
