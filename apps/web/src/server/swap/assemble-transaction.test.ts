@@ -195,8 +195,16 @@ describe('resolveLookupTables', () => {
 
     const resolved = await resolveLookupTables({ [LOOKUP_TABLE]: [RENT_SYSVAR] });
 
-    expect(getMultipleAccountsMock).toHaveBeenCalledWith([LOOKUP_TABLE]);
+    expect(getMultipleAccountsMock).toHaveBeenCalledWith([LOOKUP_TABLE], undefined);
     expect(resolved[LOOKUP_TABLE as keyof typeof resolved]).toEqual([SOL, USDC]);
+  });
+
+  it('carries the correlation id into the Helius call', async () => {
+    getMultipleAccountsMock.mockResolvedValue([lookupTableAccountData([SOL, USDC])]);
+
+    await resolveLookupTables({ [LOOKUP_TABLE]: [RENT_SYSVAR] }, 'correlation-1');
+
+    expect(getMultipleAccountsMock).toHaveBeenCalledWith([LOOKUP_TABLE], 'correlation-1');
   });
 
   it('throws when the RPC is unavailable (flag off, timeout) instead of compiling without the table', async () => {
@@ -218,6 +226,16 @@ describe('assembleSwapTransaction', () => {
 
     expect(simulateTransactionMock).toHaveBeenCalledTimes(1);
     expect(simulateTransactionMock.mock.calls[0]![1]).toEqual({ replaceRecentBlockhash: true });
+  });
+
+  it('carries the correlation id into both Helius calls it makes', async () => {
+    const tableAddresses = [RENT_SYSVAR];
+    getMultipleAccountsMock.mockResolvedValue([lookupTableAccountData(tableAddresses)]);
+
+    await assembleSwapTransaction(buildResponse({ addressesByLookupTableAddress: { [LOOKUP_TABLE]: tableAddresses } }), TAKER, 'correlation-1');
+
+    expect(getMultipleAccountsMock).toHaveBeenCalledWith([LOOKUP_TABLE], 'correlation-1');
+    expect(simulateTransactionMock.mock.calls[0]![2]).toBe('correlation-1');
   });
 
   it('applies the measured limit, not a guess, to the message the user will sign', async () => {

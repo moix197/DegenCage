@@ -272,7 +272,7 @@ describe('submitSignedSwap guarded transitions', () => {
     const result = await submitSignedSwap(submitParams());
 
     expect(result).toEqual({ intentId: INTENT_ID, status: 'submitted', signature: FIXTURE.signature, dryRun: true, replayed: false });
-    expect(broadcastMock).toHaveBeenCalledWith(FIXTURE.signedTransactionBase64);
+    expect(broadcastMock).toHaveBeenCalledWith(FIXTURE.signedTransactionBase64, 'correlation-1');
     expect(eventTypes()).toEqual(['trade.intent_signed', 'trade.intent_submitted']);
   });
 

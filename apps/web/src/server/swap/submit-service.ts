@@ -344,7 +344,7 @@ async function verifyAndBroadcast(params: SubmitRequestParams, intent: TradeInte
   }
 
   try {
-    return await broadcastSignedTransaction(params.signedTransactionBase64);
+    return await broadcastSignedTransaction(params.signedTransactionBase64, params.correlationId);
   } catch (error) {
     return failSignedIntent(params, 'broadcast_failed', 'broadcast', error);
   }

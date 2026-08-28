@@ -138,6 +138,7 @@ export function parseLookupTableAddresses(accountDataBase64: string): Address[] 
  */
 export async function resolveLookupTables(
   addressesByLookupTableAddress: Record<string, string[]> | null,
+  correlationId?: string,
 ): Promise<AddressesByLookupTableAddress> {
   const tableAddresses = Object.keys(addressesByLookupTableAddress ?? {});
 
@@ -145,7 +146,7 @@ export async function resolveLookupTables(
     return {};
   }
 
-  const accounts = await getMultipleAccounts(tableAddresses);
+  const accounts = await getMultipleAccounts(tableAddresses, correlationId);
   const resolved: AddressesByLookupTableAddress = {};
 
   tableAddresses.forEach((tableAddress, index) => {
@@ -209,6 +210,7 @@ async function measureComputeUnits(
   blockhash: Blockhash,
   lastValidBlockHeight: bigint,
   lookupTables: AddressesByLookupTableAddress,
+  correlationId?: string,
 ): Promise<number> {
   const probe = compileV0Message(
     [setComputeUnitLimitInstruction(MAX_COMPUTE_UNIT_LIMIT), ...instructions],
@@ -218,7 +220,7 @@ async function measureComputeUnits(
     lookupTables,
   );
 
-  const simulation = await simulateTransaction(getBase64EncodedWireTransaction(probe), { replaceRecentBlockhash: true });
+  const simulation = await simulateTransaction(getBase64EncodedWireTransaction(probe), { replaceRecentBlockhash: true }, correlationId);
 
   if (simulation.err !== null && simulation.err !== undefined) {
     throw new AssembleTransactionError(`swap simulation failed: ${JSON.stringify(simulation.err)}`);
@@ -262,15 +264,20 @@ export interface AssembledTransaction {
  * Every failure throws. Nothing here degrades to a partially-assembled or best-effort
  * transaction: `quote-service.ts` only ever calls this for a trade the rules already allowed,
  * and a throw there blocks the quote outright.
+ *
+ * @param correlationId - The caller's trade-intent correlation id, carried into both Helius
+ *   calls this makes (`resolveLookupTables`, `measureComputeUnits`) so it keeps flowing UI →
+ *   rule engine → Jupiter → chain (CLAUDE.md → Observability). Optional only because a handful
+ *   of call sites this plan does not own yet have none to pass.
  */
-export async function assembleSwapTransaction(build: JupiterBuildResponse, taker: string): Promise<AssembledTransaction> {
+export async function assembleSwapTransaction(build: JupiterBuildResponse, taker: string, correlationId?: string): Promise<AssembledTransaction> {
   const feePayer = address(taker);
   const blockhash = decodeBlockhash(build.blockhashWithMetadata.blockhash);
   const lastValidBlockHeight = BigInt(build.blockhashWithMetadata.lastValidBlockHeight);
-  const lookupTables = await resolveLookupTables(build.addressesByLookupTableAddress);
+  const lookupTables = await resolveLookupTables(build.addressesByLookupTableAddress, correlationId);
   const instructions = swapInstructions(build);
 
-  const unitsConsumed = await measureComputeUnits(instructions, feePayer, blockhash, lastValidBlockHeight, lookupTables);
+  const unitsConsumed = await measureComputeUnits(instructions, feePayer, blockhash, lastValidBlockHeight, lookupTables, correlationId);
   const computeUnitLimit = computeUnitLimitFrom(unitsConsumed);
 
   const compiled = compileV0Message(
