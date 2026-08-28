@@ -234,12 +234,20 @@ const TERMINAL_INTENT_STATUSES = new Set(['confirmed', 'failed', 'expired']);
  * submit-time outcome above, which only ever says what *we* did with the signed bytes. Until
  * one of these lands the trade is genuinely unresolved, and saying so is more honest than
  * leaving the submit message as the last word.
+ *
+ * `failed`'s wording deliberately doesn't claim either "never landed" or "landed": that status
+ * covers both a transaction that never made it on chain at all (`sweepStrandedSubmittedIntents`,
+ * `reconcile-wallet.ts`) and one that did land but wasn't a swap we can account for
+ * (`no_net_change`/`pure_send`/`pure_receive`, per `resolveIntentOutcome` in that same file) —
+ * the status this component polls carries no field distinguishing the two, so asserting either
+ * one specifically would sometimes be a lie.
  */
 const STATUS_COPY: Record<string, string> = {
   submitted: 'Waiting for the network to confirm this trade.',
   signed: 'Waiting for the network to confirm this trade.',
   confirmed: 'Confirmed on chain.',
-  failed: 'This trade did not land on chain. Your allowance has been released.',
+  failed:
+    'This trade did not complete as a swap we can account for — either it never landed on chain, or it landed without completing the swap. Your allowance has been released.',
   expired: 'This quote expired before the trade landed. Your allowance has been released.',
 };
 
@@ -307,14 +315,32 @@ export function TradePanel() {
    */
   const polledIntentId = submitOutcome?.intentId ?? null;
 
+  // Read inside the interval/poll closures below instead of listed as an effect dependency:
+  // that keeps the effect itself keyed on `polledIntentId` alone, so a status transition never
+  // tears down and rebuilds the interval — only a new intent to poll does.
+  const intentStatusRef = useRef<string | null>(null);
+
   useEffect(() => {
-    if (polledIntentId === null || (intentStatus !== null && TERMINAL_INTENT_STATUSES.has(intentStatus))) {
+    intentStatusRef.current = intentStatus;
+  }, [intentStatus]);
+
+  useEffect(() => {
+    if (polledIntentId === null) {
       return;
     }
 
     let cancelled = false;
+    let inFlight = false;
 
     async function poll(): Promise<void> {
+      const status = intentStatusRef.current;
+
+      if (inFlight || (status !== null && TERMINAL_INTENT_STATUSES.has(status))) {
+        return;
+      }
+
+      inFlight = true;
+
       try {
         const response = await fetch(`/api/swap/intent/${polledIntentId}`);
 
@@ -327,11 +353,15 @@ export function TradePanel() {
         }
       } catch {
         // Next tick will try again.
+      } finally {
+        inFlight = false;
       }
     }
 
-    // Fires once immediately — a just-submitted intent should never sit on a stale status for a
-    // full interval before its first real check — then continues on the same cadence.
+    // Fires once immediately, per intent — a just-submitted intent should never sit on a stale
+    // status for a full interval before its first real check — then continues on the same
+    // cadence for as long as this same intent is being polled, regardless of how many status
+    // transitions it goes through before reaching a terminal one.
     void poll();
     const id = setInterval(() => void poll(), STATUS_POLL_INTERVAL_MS);
 
@@ -339,7 +369,7 @@ export function TradePanel() {
       cancelled = true;
       clearInterval(id);
     };
-  }, [polledIntentId, intentStatus]);
+  }, [polledIntentId]);
 
   const decimals = SELLABLE_TOKENS.find((token) => token.mint === inputMint)?.decimals ?? 0;
   const baseUnits = toBaseUnits(amount, decimals);
