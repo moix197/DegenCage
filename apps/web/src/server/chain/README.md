@@ -172,3 +172,25 @@ Three, at different layers, all seeded by `src/server/db/seed.ts`:
 
 Neither deletes anything already reconciled; both stop new reads. A flag lookup that itself
 fails is treated as off.
+
+## Serving the pre-trade path too
+
+Two files here are read by `server/swap` (the `/trade` terminal), not only by
+reconciliation. Nothing about the observation flow above changes; these are additional
+callers of the same clients.
+
+| File | Also used for |
+| ---- | ------------- |
+| `jupiter-tokens.ts` | mint `decimals` (`lookupTokenDecimals`), which `quote-service.ts` needs before a quote can be priced. Same batched request and TTL cache as the mcap lookup — one Jupiter round trip serves both |
+| `helius-simulate.ts` | `simulateTransaction` (compute-unit measurement, and Phase 3's dry-run verification) and `getMultipleAccounts` (resolving the address lookup tables a swap routes through), both behind the existing `chain.helius` flag — the same integration, not a new one |
+
+`jupiter-tokens.ts` now points at **`api.jup.ag`**, not the retired `lite-api.jup.ag`, and
+sends `x-api-key: $JUPITER_API_KEY` — the same key `server/swap/jupiter-client.ts` uses.
+The Free tier's 1 RPS / 60 RPM budget is shared org-wide *across* both endpoints, which is
+why the terminal debounces and caches rather than quoting per keystroke.
+
+`lookupTokenDecimals` is deliberately **not** behind `classification.jupiter_mcap`: that
+switch exists to turn tier classification off (whose fail-closed answer is `MICRO_CAP`), and
+flipping it must not silently disable pricing too. Its callers are gated by
+`jupiter.swap_build` instead. Its fail-closed contract is the same — an unresolved mint is
+simply absent from the result, and the caller blocks rather than guessing a decimal scale.

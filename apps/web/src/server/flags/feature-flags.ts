@@ -24,6 +24,15 @@ export const HOME_STATUS_PANEL_FLAG = 'web.home_status_panel';
 /** The discipline dashboard's kill switch (Phase 7) — seeded enabled by `src/server/db/seed.ts`. */
 export const DASHBOARD_DISCIPLINE_VIEW_FLAG = 'dashboard.discipline_view';
 
+/**
+ * The `/trade` terminal's kill switch — the route gate for the page and for
+ * `POST /api/swap/quote`. Seeded **disabled**: the first surface that can block a real trade
+ * ships dark and is rolled out deliberately (CLAUDE.md → feature flags for anything
+ * user-facing). Turning it off never disables rule enforcement — it removes the surface
+ * entirely, which is the only safe direction.
+ */
+export const TRADE_TERMINAL_FLAG = 'trade.terminal';
+
 /** Pure decision: given the stored row (or none), is this feature on for this caller? */
 export function resolveFeatureFlag(
   row: FeatureFlagRow | undefined,

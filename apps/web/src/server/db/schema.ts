@@ -510,3 +510,87 @@ export const tokenPrices = pgTable(
 );
 
 export type TokenPriceRow = typeof tokenPrices.$inferSelect;
+
+/**
+ * `quoted` → `approved`/`blocked` → `signed` → `submitted` → `confirmed`/`failed`/`expired`,
+ * per `apps/web/src/server/swap/quote-service.ts` (Phase 2 writes `quoted`/`blocked`) and,
+ * from Phase 3, `submit-service.ts`. Every transition is a guarded
+ * `UPDATE ... WHERE status = '<prior>' RETURNING *` — never read-then-write
+ * (`.ai/patterns/guarded-state-transition.md`).
+ *
+ * Plain `text`, not a `pgEnum` — same choice as `trades.excluded_reason`/`acquired_tier`,
+ * which are also closed TS unions stored as text.
+ */
+export const TRADE_INTENT_STATUSES = [
+  'quoted',
+  'approved',
+  'blocked',
+  'signed',
+  'submitted',
+  'confirmed',
+  'failed',
+  'expired',
+] as const;
+export type TradeIntentStatus = (typeof TRADE_INTENT_STATUSES)[number];
+
+/**
+ * One pre-trade intent: a Jupiter quote, the rule-engine verdict computed against it before
+ * any signature exists, and (for an allowed quote) the hash of the compiled v0 message the
+ * wallet will be asked to sign.
+ *
+ * Append-only in spirit, like every other rule-state table here: a row is never deleted and
+ * its history is the audit trail Phase 5's dashboard reads. Expiry is a guarded `UPDATE` to
+ * `expired` (Phase 4's `intent-lifecycle.ts`), never a `DELETE` — unlike
+ * `challenge-reaper.ts`/`login-attempt-reaper.ts`, whose rows carry no product meaning.
+ *
+ * `usd_value` is the *pre-trade estimate* computed by `quote-service.ts`'s slippage-safe leg
+ * rule (`.ai/decisions/pre-trade-slippage-pricing.md`) — deliberately the same
+ * `numeric(38,12)` shape as `trades.usd_value`, because Phase 4 sums this column alongside
+ * persisted trades to reserve allowance against a live intent. Nullable and never coerced to
+ * `0`: an unpriceable quote is unpriced, not free, and folds to a block (CLAUDE.md).
+ *
+ * `tx_message_hash` is a hash of the serialized compiled **message**, taken before any
+ * signature exists — never of a signed transaction, whose signature bytes vary. Null for a
+ * blocked quote: nothing is assembled for a trade the rules already refused.
+ *
+ * `quote_response` stores Jupiter's `/build` response verbatim so a decision can be
+ * reconstructed later from exactly the inputs that produced it.
+ */
+export const tradeIntents = pgTable(
+  'trade_intents',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    walletId: uuid('wallet_id')
+      .notNull()
+      .references(() => wallets.id),
+    constitutionId: uuid('constitution_id')
+      .notNull()
+      .references(() => constitutions.id),
+    status: text('status').$type<TradeIntentStatus>().notNull(),
+    inputMint: text('input_mint').notNull(),
+    outputMint: text('output_mint').notNull(),
+    /** Raw base units (pre-decimals), as a decimal-digit string — never a float, same convention as `trades`. */
+    inAmount: text('in_amount').notNull(),
+    outAmount: text('out_amount').notNull(),
+    usdValue: numeric('usd_value', { precision: 38, scale: 12 }),
+    acquiredTier: text('acquired_tier').$type<AssetTier>(),
+    evaluations: jsonb('evaluations').$type<unknown[]>().notNull().default([]),
+    quoteResponse: jsonb('quote_response').$type<Record<string, unknown>>().notNull().default({}),
+    txMessageHash: text('tx_message_hash'),
+    signature: text('signature'),
+    /**
+     * Our own estimate, not a value Jupiter hands us: `/build` has no quote-TTL field, so
+     * this is derived from `blockhashWithMetadata` and the ~400ms/slot blockhash lifetime
+     * (`server/swap/quote-service.ts`).
+     */
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // The live-intent lookup Phase 4's reservation and expiry reaping both run.
+    index('trade_intents_wallet_id_status_idx').on(table.walletId, table.status),
+  ],
+);
+
+export type TradeIntentRow = typeof tradeIntents.$inferSelect;
+export type NewTradeIntentRow = typeof tradeIntents.$inferInsert;

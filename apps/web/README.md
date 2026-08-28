@@ -37,6 +37,7 @@ All commands run from the **repo root**; they inject the root `.env` via `dotenv
 | `NEXT_PUBLIC_SENTRY_DSN` | no | browser Sentry init; inlined at build time, so setting it needs a rebuild. Unset means the ~80 kB browser SDK is never fetched |
 | `LOG_LEVEL` | no | pino level, defaults to `info` |
 | `SIWS_DOMAIN` | yes | the domain a Sign In With Solana message is bound to (`localhost:3000` in dev, the production host otherwise); `requiredSignInDomain()` throws without it. Configuration only — never derived from `Host`/`Origin` |
+| `JUPITER_API_KEY` | for `/trade` | `server/swap/jupiter-client.ts` (`/swap/v2/build`) and `server/chain/jupiter-tokens.ts` (`/tokens/v2/search` — mcaps and mint decimals), both on `api.jup.ag`. One key, one shared Free-tier bucket (1 RPS org-wide across both). Unset = every quote is blocked rather than quoted without a verdict |
 
 Later phases add their vars to `.env.example` as they introduce them.
 

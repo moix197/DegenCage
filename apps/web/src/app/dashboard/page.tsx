@@ -168,6 +168,11 @@ export default async function DashboardPage() {
     <main className="mx-auto flex max-w-3xl flex-col gap-6">
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
 
+      {/* The dashboard stays read-only (decision 5); enforcement lives on `/trade`. */}
+      <p>
+        <a href="/trade">Trade through DegenCage →</a>
+      </p>
+
       <DashboardPanel initial={initial} />
 
       {/* Ships dark by default (`FEEDBACK_CAPTURE_FLAG` not seeded enabled) — surfaced at
