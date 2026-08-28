@@ -12,7 +12,7 @@ import { isFeatureEnabled } from '../flags/feature-flags';
 import { priceTrade } from '../pricing/price-trade';
 import { loadWindowedTrades } from '../rules/rolling-allowance';
 import { assembleSwapTransaction, type AssembledTransaction } from './assemble-transaction';
-import { buildSwap, BLOCKHASH_SLOTS_TO_EXPIRY, type JupiterBuildResponse } from './jupiter-client';
+import { buildSwap, BLOCKHASH_SLOTS_TO_EXPIRY, JupiterBuildError, type JupiterBuildResponse } from './jupiter-client';
 
 /**
  * The pre-trade gate: Jupiter quote in, rule-engine verdict out, before a signature exists.
@@ -239,6 +239,24 @@ async function assertPreconditions(params: QuoteRequestParams): Promise<ActiveCo
   return constitution;
 }
 
+/**
+ * The premise the whole sold-leg pricing rule stands on
+ * (`.ai/decisions/pre-trade-slippage-pricing.md`): `inAmount` is a number the request already
+ * declared and execution cannot move *only* while the swap is exact-in for the amount we asked
+ * for. An exact-out route, or a `/build` that resized the trade, would denominate every ceiling
+ * limit in something the user never committed to — so a mismatch fails closed like any other
+ * Jupiter failure (throws, `503`, no intent recorded) rather than pricing off it.
+ */
+function assertExactInPremise(params: QuoteRequestParams, build: JupiterBuildResponse): void {
+  if (build.swapMode !== 'ExactIn') {
+    throw new JupiterBuildError(`Jupiter /swap/v2/build returned swapMode '${build.swapMode}'; sold-leg pricing requires 'ExactIn'`);
+  }
+
+  if (build.inAmount !== params.amount) {
+    throw new JupiterBuildError(`Jupiter /swap/v2/build returned inAmount ${build.inAmount} for a requested amount of ${params.amount}`);
+  }
+}
+
 interface EvaluatedQuote {
   build: JupiterBuildResponse;
   usdValue: string | null;
@@ -397,6 +415,7 @@ export async function createQuote(params: QuoteRequestParams): Promise<QuoteResu
   // later than it was fetched — which would push `expires_at` past the real lifetime.
   const requestedAt = new Date();
   const build = await buildOrReuseQuote(params);
+  assertExactInPremise(params, build);
   const evaluated = await evaluateQuote(params, constitution.document, build);
 
   // Only an allowed quote is turned into signable bytes: assembling a blocked one would spend

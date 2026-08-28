@@ -48,7 +48,7 @@ vi.mock('../chain/jupiter-tokens', () => ({ lookupTokenDecimals: lookupTokenDeci
 vi.mock('../chain/reconcile-wallet', () => ({ LOSS_LIMIT_ENABLED_FLAG: 'rules.loss_limit_enabled' }));
 vi.mock('../rules/rolling-allowance', () => ({ loadWindowedTrades: loadWindowedTradesMock }));
 vi.mock('../flags/feature-flags', () => ({ isFeatureEnabled: isFeatureEnabledMock }));
-vi.mock('./jupiter-client', () => ({ buildSwap: buildSwapMock, BLOCKHASH_SLOTS_TO_EXPIRY: 150 }));
+vi.mock('./jupiter-client', () => ({ buildSwap: buildSwapMock, BLOCKHASH_SLOTS_TO_EXPIRY: 150, JupiterBuildError: Error }));
 vi.mock('./assemble-transaction', () => ({ assembleSwapTransaction: assembleSwapTransactionMock }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
 vi.mock('../db/client', () => ({ getDb: () => ({ select: selectMock, transaction: transactionMock }) }));
@@ -71,12 +71,16 @@ function dailyNotional(maxUsd: string): Constitution {
 
 const DAILY_NOTIONAL: Constitution = dailyNotional('500');
 
-/** Each test uses a distinct amount so the module-level short-TTL quote cache never leaks between them. */
+/**
+ * Each test uses a distinct amount so the module-level short-TTL quote cache never leaks
+ * between them — and they stay within a base unit of each other, since the amount is now also
+ * the priced sold leg ($100 of 6-decimal USDC, comfortably under `DAILY_NOTIONAL`'s $500).
+ */
 let amountCounter = 0;
 
 function nextAmount(): string {
   amountCounter += 1;
-  return `${amountCounter}00000000`;
+  return `${100_000_000 + amountCounter}`;
 }
 
 function constitutionRow(status: string, document: Constitution = DAILY_NOTIONAL) {
@@ -110,6 +114,14 @@ function buildResponse(overrides: Partial<JupiterBuildResponse> = {}): JupiterBu
   };
 }
 
+/**
+ * `/build` echoes the amount it was asked for — the exact-in premise `createQuote` asserts —
+ * so the fixture derives `inAmount` from the request rather than pinning it independently.
+ */
+function buildSwapReturns(overrides: Partial<JupiterBuildResponse> = {}): void {
+  buildSwapMock.mockImplementation(async ({ amount }: { amount: string }) => buildResponse({ inAmount: amount, ...overrides }));
+}
+
 function quoteParams(overrides: Record<string, unknown> = {}) {
   return {
     walletId: 'wallet-1',
@@ -134,7 +146,7 @@ beforeEach(() => {
   getSolUsdPriceMock.mockResolvedValue(null);
   getBirdeyeUsdPriceMock.mockResolvedValue(null);
   isFeatureEnabledMock.mockResolvedValue(true);
-  buildSwapMock.mockResolvedValue(buildResponse());
+  buildSwapReturns();
   assembleSwapTransactionMock.mockResolvedValue({
     messageBase64: 'bWVzc2FnZQ==',
     txMessageHash: 'a'.repeat(64),
@@ -278,6 +290,24 @@ describe('createQuote fold rule', () => {
   });
 });
 
+describe('createQuote exact-in premise', () => {
+  it('blocks the quote when /build comes back exact-out, rather than pricing a leg that is not fixed', async () => {
+    buildSwapReturns({ swapMode: 'ExactOut' });
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/ExactIn/);
+    expect(lookupTokenDecimalsMock).not.toHaveBeenCalled();
+    expect(insertedValuesSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks the quote when /build returns an inAmount the request never asked for', async () => {
+    buildSwapMock.mockResolvedValue(buildResponse({ inAmount: '777' }));
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/inAmount 777/);
+    expect(lookupTokenDecimalsMock).not.toHaveBeenCalled();
+    expect(insertedValuesSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('createQuote instrumentation', () => {
   it('writes both events inside the same transaction as the intent row', async () => {
     await createQuote(quoteParams());
@@ -305,22 +335,20 @@ describe('createQuote instrumentation', () => {
 
 describe('createQuote slippage-safe pricing', () => {
   it('prices an acquisition off the exact sold leg, regardless of what outAmount claims', async () => {
-    buildSwapMock.mockResolvedValue(buildResponse({ inAmount: '250000000', outAmount: '999999999999', otherAmountThreshold: '1' }));
+    buildSwapReturns({ outAmount: '999999999999', otherAmountThreshold: '1' });
 
-    const result = await createQuote(quoteParams());
+    const result = await createQuote(quoteParams({ amount: '250000000' }));
 
     // 250000000 base units of 6-decimal USDC = $250 — untouched by the optimistic outAmount.
     expect(result.quote.usdValue).toBe('250.000000');
   });
 
   it('prices a sale off the exact sold leg too, never the stable leg’s slippage-shrinkable threshold', async () => {
-    buildSwapMock.mockResolvedValue(
-      buildResponse({ inputMint: BONK, outputMint: USDC, inAmount: '5000000', outAmount: '400000000', otherAmountThreshold: '300000000' }),
-    );
+    buildSwapReturns({ inputMint: BONK, outputMint: USDC, outAmount: '400000000', otherAmountThreshold: '300000000' });
     lookupTokenDecimalsMock.mockResolvedValue(new Map([[BONK, 5], [USDC, 6]]));
     getBirdeyeUsdPriceMock.mockResolvedValue('0.000002');
 
-    const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC }));
+    const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC, amount: '5000000' }));
 
     // 5000000 base units of 5-decimal BONK = 50 BONK at $0.000002. The $300 guaranteed-minimum
     // proceeds are the *floor*-limit figure; a ceiling limit must never be denominated in a
@@ -330,9 +358,7 @@ describe('createQuote slippage-safe pricing', () => {
   });
 
   it('blocks rather than falling back to the stable bought leg when the sold leg has no price', async () => {
-    buildSwapMock.mockResolvedValue(
-      buildResponse({ inputMint: BONK, outputMint: USDC, inAmount: '5000000', outAmount: '400000000', otherAmountThreshold: '300000000' }),
-    );
+    buildSwapReturns({ inputMint: BONK, outputMint: USDC, outAmount: '400000000', otherAmountThreshold: '300000000' });
     lookupTokenDecimalsMock.mockResolvedValue(new Map([[BONK, 5], [USDC, 6]]));
 
     const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC }));
@@ -348,20 +374,11 @@ describe('createQuote slippage-safe pricing', () => {
    */
   it('records a SOL→USDC quote at wide slippage off the exact sold SOL, and still blocks', async () => {
     selectReturns([constitutionRow('active', dailyNotional('145'))]);
-    buildSwapMock.mockResolvedValue(
-      buildResponse({
-        inputMint: SOL,
-        outputMint: USDC,
-        inAmount: '1000000000',
-        outAmount: '150000000',
-        otherAmountThreshold: '142500000',
-        slippageBps: 500,
-      }),
-    );
+    buildSwapReturns({ inputMint: SOL, outputMint: USDC, outAmount: '150000000', otherAmountThreshold: '142500000', slippageBps: 500 });
     lookupTokenDecimalsMock.mockResolvedValue(new Map([[SOL, 9], [USDC, 6]]));
     getSolUsdPriceMock.mockResolvedValue('150');
 
-    const result = await createQuote(quoteParams({ inputMint: SOL, outputMint: USDC, slippageBps: 500 }));
+    const result = await createQuote(quoteParams({ inputMint: SOL, outputMint: USDC, slippageBps: 500, amount: '1000000000' }));
 
     // 1 SOL at $150. Priced off the threshold this reads as $142.50, slips under the $145
     // limit, and the trade the user forbade themselves goes through.
@@ -371,8 +388,6 @@ describe('createQuote slippage-safe pricing', () => {
   });
 
   it('writes the same figure to the intent row that the limits were evaluated against', async () => {
-    buildSwapMock.mockResolvedValue(buildResponse({ inAmount: '250000000' }));
-
     const result = await createQuote(quoteParams());
 
     expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ usdValue: result.quote.usdValue }));

@@ -176,11 +176,11 @@ export function swapInstructions(build: JupiterBuildResponse): Instruction[] {
 }
 
 /**
- * The fee payer is set *before* lookup-table compression, not after: compression decides which
- * accounts may be replaced by a table index, and an account that is not yet known to the
- * message as the fee payer is not automatically protected from that. It happens to be safe
- * today only because the taker is also a signer of every swap — a fact this ordering no
- * longer has to depend on.
+ * Setting the fee payer before lookup-table compression buys no protection, despite reading
+ * like it should: kit's compressor exempts an account by signer role alone (`isSignerRole`)
+ * and never looks at the message's `feePayer`. The taker survives compression only because it
+ * signs every swap instruction. The order is kept because it follows the message's dependency
+ * order, not because it guarantees anything.
  */
 function compileV0Message(
   instructions: Instruction[],

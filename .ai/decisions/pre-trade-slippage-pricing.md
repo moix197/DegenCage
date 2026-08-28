@@ -72,5 +72,8 @@ estimate is a gate input, never the historical record.
   guaranteed minimum. Classify the limit before wiring its pricing.
 - Raising `MAX_SLIPPAGE_BPS` widens the gap between the quoted and executed trade for every
   limit computed from a quote — it is a rule-engine change, not a UX knob.
-- Exact-in is assumed: `inAmount` is only fixed because `swapMode` is `ExactIn`. An exact-*out*
-  route would invert which leg is the fixed one and this rule would have to be re-derived.
+- Exact-in is the premise: `inAmount` is only fixed because `swapMode` is `ExactIn` and the
+  amount returned is the amount requested. `quote-service.ts` asserts both against the `/build`
+  response before pricing and blocks on a mismatch, so the premise is checked rather than
+  trusted. An exact-*out* route would invert which leg is the fixed one and this rule would
+  have to be re-derived.

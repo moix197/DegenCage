@@ -24,8 +24,9 @@ POST /api/swap/quote ──> createQuote()                       quote-service.t
    ▼  buildSwap()                                            jupiter-client.ts
    │    GET api.jup.ag/swap/v2/build  (quote + raw instructions, one call)
    │    short-TTL cache keyed (walletId, inputMint, outputMint, amount, slippageBps)
+   │    assert exact-in: swapMode === 'ExactIn' && inAmount === the requested amount
    │
-   ▼  priceQuote()      lookupTokenDecimals + priceTrade      (chain/, pricing/)
+   ▼  priceCeilingLimits()  lookupTokenDecimals + priceTrade  (chain/, pricing/)
    │  classifyToken()   bought mint → AssetTier
    │  loadWindowedTrades()                                    rules/rolling-allowance.ts
    │
@@ -84,14 +85,31 @@ POST /api/swap/quote ──> createQuote()                       quote-service.t
   reconstructable, and a live intent must never exist with nothing explaining it.
 - **`resolveSession()` is the only source of wallet identity.** A body-supplied wallet would
   make every rule in the product opt-out.
+- **The exact-in premise is asserted, not assumed.** Ceiling limits are priced off `inAmount`
+  only because the swap is exact-in for the amount requested, so a `/build` response whose
+  `swapMode` is not `ExactIn`, or whose `inAmount` differs from the requested amount, throws
+  and blocks the quote instead of being priced.
 
 ## Pricing (the slippage-safe leg rule)
 
-The sold leg is priced off `inAmount` — for an exact-in swap that amount is fixed no matter
-how the swap fills. The bought leg, reached only when neither mint is a stablecoin or SOL, is
-priced off `otherAmountThreshold`, the guaranteed minimum. The optimistic `outAmount` is
-never used: the acquired token count has no documented upper bound, so pricing off it would
-understate risk on exactly the trades that execute better than quoted.
+Which leg a pre-trade limit prices off follows from the limit's *shape*, and the caller names
+it rather than letting `priceTrade` infer one — see
+[pre-trade-slippage-pricing](../../../../../.ai/decisions/pre-trade-slippage-pricing.md).
+
+- **Ceiling limits** — `daily_notional_usd`, `asset_tier_acquisition_usd`, where a *larger*
+  number must be more likely to block — price the **sold leg**, `leg: 'sold'` off `inAmount`.
+  That is the amount the request declared it was spending, and nothing in the request can
+  shrink it. Pricing a ceiling off `otherAmountThreshold` instead let a caller discount its own
+  recorded notional simply by asking for more slippage — a bypass through the enforcement path,
+  which is why that is no longer done.
+- **Floor limits** — `rolling_loss_usd`, where *smaller* proceeds are what block — price the
+  proceeds off `otherAmountThreshold`, the guaranteed minimum. Worst case maximises the
+  estimated loss, the conservative direction for a floor.
+- **`outAmount` is never used, in either direction.** It is the aggregator's optimistic estimate
+  with no documented upper bound.
+
+`inAmount` is only fixed because the swap is exact-in, so `createQuote` asserts that premise
+against the `/build` response before pricing anything (see the invariant below).
 
 An unresolved decimal scale is `usd_value: null` — unpriced, never `$0` — which folds every
 ceiling limit to a block.
