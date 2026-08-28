@@ -270,3 +270,25 @@ export async function loadEvaluableWindowedTrades(
 
   return [...persisted, ...live.entries];
 }
+
+/**
+ * The terminal's status poll (Phase 5): the one read behind `GET /api/swap/intent/[id]`.
+ *
+ * Scoped by `wallet_id` in the query itself rather than fetched-then-checked, so an intent
+ * belonging to another wallet is indistinguishable from one that does not exist — the caller
+ * cannot use a 404-vs-403 difference to probe for other users' intent ids. Decision 13's
+ * wallet-binding, applied to the read path.
+ */
+export async function loadIntentStatusForWallet(
+  intentId: string,
+  walletId: string,
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ status: string; signature: string | null } | null> {
+  const [row] = await executor
+    .select({ status: tradeIntents.status, signature: tradeIntents.signature })
+    .from(tradeIntents)
+    .where(and(eq(tradeIntents.id, intentId), eq(tradeIntents.walletId, walletId)))
+    .limit(1);
+
+  return row ?? null;
+}

@@ -1,5 +1,5 @@
 import { evaluateTrade, migrateConstitution, type AssetTier, type Constitution } from '@degencage/rules';
-import { and, asc, eq, gt, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 
 import { captureError } from '../../observability/error-tracking';
 import { recordEvent, type DatabaseExecutor } from '../../observability/events';
@@ -9,12 +9,15 @@ import { getDb } from '../db/client';
 import {
   constitutions,
   positionLots,
+  tradeIntents,
   trades,
   wallets,
   type NewPositionLotRow,
   type NewTradeRow,
   type PositionLotRow,
   type TokenClassificationQuality,
+  type TradeIntentRow,
+  type TradeIntentStatus,
   type TradeRow,
 } from '../db/schema';
 import { isFeatureEnabled } from '../flags/feature-flags';
@@ -195,6 +198,7 @@ function toNewTradeRow(
   },
   isBaseline: boolean,
   lotMatch: LotMatchResult | null,
+  tradeIntentId: string | null,
 ): NewTradeRow {
   return {
     walletId,
@@ -215,6 +219,7 @@ function toNewTradeRow(
     classification: priced.classification,
     isRoundTripClose: lotMatch?.disposal.isRoundTripClose ?? false,
     realizedLossUsd: lotMatch?.disposal.realizedLossUsd ?? null,
+    tradeIntentId,
   };
 }
 
@@ -434,6 +439,96 @@ async function priceBatch(batch: DerivedSwap[]): Promise<PricedSwap[]> {
 }
 
 /**
+ * The two `trade_intents` statuses reconciliation can still resolve — the same statuses
+ * `RESERVING_TRADE_INTENT_STATUSES` (`schema.ts`) keeps reserving allowance for past the quote
+ * slot, minus `quoted`/`approved`: an intent never reaches this file with a `signature` at all
+ * until `submit-service.ts`'s `transitionToSigned` writes one, so `quoted`/`approved` can never
+ * match here in the first place. Kept as its own local list (rather than reusing
+ * `RESERVING_TRADE_INTENT_STATUSES` and relying on the signature-null exclusion alone) so the
+ * guarded resolve below stays legible on its own.
+ */
+const RECONCILABLE_INTENT_STATUSES = ['signed', 'submitted'] as const satisfies readonly TradeIntentStatus[];
+
+/**
+ * The wallet's live (`signed`/`submitted`) `trade_intents` row sharing this exact
+ * `(wallet_id, signature)`, if any — the row this trade, if it is genuinely new, is the
+ * on-chain resolution of. Read-only and never itself an authorization: the guarded transition
+ * that actually resolves the intent (`resolveMatchedIntent`) carries its own precondition in
+ * its own `WHERE`, so a stale read here can never grant anything on its own
+ * (`.ai/patterns/guarded-state-transition.md`). Safe against another writer touching this
+ * intent between this read and that write regardless, because both run inside `persistBatch`'s
+ * per-wallet row lock, which serializes concurrent reconciliation runs for this same wallet.
+ */
+async function findMatchingLiveIntentId(tx: DatabaseExecutor, walletId: string, signature: string): Promise<string | null> {
+  const rows = await tx
+    .select({ id: tradeIntents.id })
+    .from(tradeIntents)
+    .where(
+      and(
+        eq(tradeIntents.walletId, walletId),
+        eq(tradeIntents.signature, signature),
+        inArray(tradeIntents.status, [...RECONCILABLE_INTENT_STATUSES]),
+      ),
+    )
+    .limit(1);
+
+  return rows[0]?.id ?? null;
+}
+
+/**
+ * The guarded `signed|submitted → confirmed|failed` resolution: `confirmed` when the matching
+ * trade this run just persisted is a real (non-excluded) trade — the signature landed and
+ * actually swapped — `failed` when it derived to an excluded candidate instead (the signature
+ * landed but had no net swap effect, e.g. the instruction failed on chain and only the fee was
+ * deducted). The WHERE carries the whole precondition (id and status), so a row coming back is
+ * proof the transition happened just now from a live status, not something inferred from
+ * `findMatchingLiveIntentId`'s earlier, separate read.
+ */
+async function resolveMatchedIntent(tx: DatabaseExecutor, intentId: string, next: 'confirmed' | 'failed'): Promise<TradeIntentRow | undefined> {
+  const rows = await tx
+    .update(tradeIntents)
+    .set({ status: next })
+    .where(and(eq(tradeIntents.id, intentId), inArray(tradeIntents.status, [...RECONCILABLE_INTENT_STATUSES])))
+    .returning();
+
+  return rows[0];
+}
+
+/**
+ * Records `trade.intent_confirmed`/`trade.intent_failed` from the reconciliation path —
+ * `payload.stage: 'reconciliation'` distinguishes these from `submit-service.ts`'s own
+ * submit-time `trade.intent_failed` (`payload.stage: 'reevaluation' | 'broadcast' | ...`), same
+ * event type, different stage, per the plan.
+ */
+async function recordIntentResolution(
+  tx: DatabaseExecutor,
+  correlationId: string,
+  userId: string,
+  resolved: TradeIntentRow,
+  signature: string,
+  next: 'confirmed' | 'failed',
+  occurredAt: Date,
+  excludedReason: string | null,
+): Promise<void> {
+  await recordEvent(
+    {
+      eventType: next === 'confirmed' ? 'trade.intent_confirmed' : 'trade.intent_failed',
+      occurredAt,
+      correlationId,
+      userId,
+      payload: {
+        intentId: resolved.id,
+        walletId: resolved.walletId,
+        signature,
+        stage: 'reconciliation',
+        ...(next === 'failed' ? { reason: excludedReason } : {}),
+      },
+    },
+    tx,
+  );
+}
+
+/**
  * Persists one already-priced swap and, for a live (non-baseline) real trade, evaluates and
  * records its decision — inside `tx`, so it commits atomically with everything else in
  * this page. Pricing itself already happened in `priceBatch`, before `tx` was opened.
@@ -487,14 +582,41 @@ async function persistOneSwap(
         )
       : null;
 
+  // Baseline can never legitimately match a live intent — the 90-day pull predates this
+  // wallet ever being connected to DegenCage (decision 9), so no `trade_intents` row for it
+  // could exist yet — but the `null` short-circuit below is what actually guarantees it,
+  // rather than relying on that being true in practice.
+  const matchedIntentId = isBaseline ? null : await findMatchingLiveIntentId(tx, walletId, swap.signature);
+
   const inserted = await tx
     .insert(trades)
-    .values(toNewTradeRow(walletId, swap, priced, isBaseline, lotMatch))
+    .values(toNewTradeRow(walletId, swap, priced, isBaseline, lotMatch, matchedIntentId))
     .onConflictDoNothing({ target: [trades.walletId, trades.signature] })
     .returning({ id: trades.id });
 
   if (inserted.length === 0) {
     return { tradePersisted: false, excludedPersisted: false };
+  }
+
+  // Same transaction as the trade insert above, as the plan requires — a crash between the
+  // two would otherwise leave a linked trade whose intent never actually resolved.
+  if (matchedIntentId) {
+    const next = isRealTrade ? 'confirmed' : 'failed';
+    const resolved = await resolveMatchedIntent(tx, matchedIntentId, next);
+
+    if (resolved) {
+      await recordIntentResolution(tx, correlationId, userId, resolved, swap.signature, next, swap.occurredAt, swap.excludedReason);
+    } else {
+      // The intent moved out of `signed`/`submitted` between the read above and this write —
+      // already resolved by a concurrent path. Not expected (this whole block runs inside
+      // `persistBatch`'s per-wallet row lock), but not fatal either: the trade row itself is
+      // already linked via `matchedIntentId` regardless of whether this resolve won.
+      logger.warn('reconciliation matched a live intent but could not resolve it — already resolved elsewhere', {
+        walletId,
+        intentId: matchedIntentId,
+        signature: swap.signature,
+      });
+    }
   }
 
   if (lotMatch) {
@@ -872,6 +994,85 @@ async function backfillLotMatching(
     .where(eq(wallets.id, walletId));
 }
 
+/**
+ * Grace period after `expires_at` — the intent's own blockhash-validity deadline, fixed at
+ * quote time from `blockhashWithMetadata` and never extended by signing or broadcasting (see
+ * the schema comment on `trade_intents.expires_at`) — before a `submitted` intent still in that
+ * state is swept to `failed` by `sweepStrandedSubmittedIntents` below.
+ *
+ * Not zero: a transaction that actually landed right at its blockhash's own deadline still
+ * needs a little time to reach Helius' `finalized` commitment and be indexed (comfortably
+ * under a minute in practice, even under load) before *this or a later* reconciliation run can
+ * see it via `getTransactionsForAddress` and resolve it through the linkage above instead.
+ * Sweeping the instant `expires_at` passes would race that lag and could fail a trade that was
+ * seconds from confirming — the plan's explicit "must not fire prematurely" requirement.
+ *
+ * 2 minutes is comfortably longer than that indexing lag while still resolving a genuinely
+ * stranded reservation promptly rather than leaving it indefinite — the exact gap this sweep
+ * exists to close (`.ai/decisions/live-intent-reservation-vs-quote-slot.md`'s "Known gap").
+ * A `submitted` intent can only ever still be *legitimately* in flight before this deadline:
+ * the blockhash it references cannot be accepted by the network afterward, landed or not, so
+ * there is no later point at which sweeping it could still be premature.
+ */
+const SWEEP_GRACE_PERIOD_MS = 2 * 60 * 1_000;
+
+/** `SWEEP_GRACE_PERIOD_MS`, restated as the interval literal the guarded UPDATE's SQL binds — one source of truth, so the two can never drift apart. */
+const SWEEP_GRACE_PERIOD_SQL_INTERVAL = `${Math.round(SWEEP_GRACE_PERIOD_MS / 1_000)} seconds`;
+
+/**
+ * Pure boundary check behind `sweepStrandedSubmittedIntents` below — exported and unit-tested
+ * directly against fixed clock values, per `.ai/decisions/migration-and-test-tooling.md`'s
+ * "DB-touching modules are split into a pure decision function plus a thin query" (the same
+ * treatment `isAfterLotWatermark`/`needsLotBackfill` above already get in this file).
+ *
+ * Not itself what the guarded UPDATE evaluates — that runs against the *database's* clock, by
+ * design (`.ai/patterns/guarded-state-transition.md`: "a time-based precondition uses the
+ * database's clock"), via `SWEEP_GRACE_PERIOD_SQL_INTERVAL` derived from the exact same
+ * `SWEEP_GRACE_PERIOD_MS` this function reads. This is the same threshold, restated in a form a
+ * unit test can drive directly, so the boundary itself — not just the query's shape — is
+ * covered by something that can actually fail if the grace period regresses.
+ */
+export function isStrandedSubmittedIntent(expiresAt: Date, now: Date): boolean {
+  return expiresAt.getTime() <= now.getTime() - SWEEP_GRACE_PERIOD_MS;
+}
+
+/**
+ * Step 5 (required by the Phase 4 review, `.ai/decisions/live-intent-reservation-vs-quote-slot.md`'s
+ * "Known gap"): a `submitted` intent whose transaction never lands on chain at all is otherwise
+ * unresolvable — the linkage in `persistOneSwap` only ever resolves a signature that *did*
+ * land, so a broadcast that silently never confirms would reserve allowance forever.
+ *
+ * A guarded, unconditional `UPDATE ... WHERE status = 'submitted' AND expires_at <= now() - grace
+ * RETURNING *` — same append-only convention as `intent-lifecycle.ts`'s `reapExpiredIntents`,
+ * just for the one status that reaper deliberately never touches (`QUOTE_SLOT_STATUSES`
+ * excludes `submitted` on purpose — see that file's doc comment). A single statement, atomic
+ * against Postgres' own MVCC — no wallet-row lock needed, same reasoning as
+ * `backfillLotMatching`'s final watermark clamp.
+ */
+async function sweepStrandedSubmittedIntents(walletId: string, userId: string, correlationId: string): Promise<void> {
+  const swept = await getDb()
+    .update(tradeIntents)
+    .set({ status: 'failed' })
+    .where(
+      and(
+        eq(tradeIntents.walletId, walletId),
+        eq(tradeIntents.status, 'submitted'),
+        sql`${tradeIntents.expiresAt} <= now() - ${SWEEP_GRACE_PERIOD_SQL_INTERVAL}::interval`,
+      ),
+    )
+    .returning({ id: tradeIntents.id });
+
+  for (const row of swept) {
+    await recordEvent({
+      eventType: 'trade.intent_failed',
+      occurredAt: new Date(),
+      correlationId,
+      userId,
+      payload: { intentId: row.id, walletId, reason: 'blockhash_expired_unresolved', stage: 'sweep' },
+    });
+  }
+}
+
 async function runReconciliation(
   walletId: string,
   walletAddress: string,
@@ -965,6 +1166,11 @@ async function runReconciliation(
       excludedPersisted += result.excludedPersisted;
       reconciledThroughSlot = Math.max(reconciledThroughSlot ?? 0, result.highestSlot);
     }
+
+    // After this run's own fresh Helius data has already had a chance to resolve any matching
+    // intent via the linkage above — so a `submitted` intent that genuinely confirmed in this
+    // very run is never at risk of being swept just because both happen in the same call.
+    await sweepStrandedSubmittedIntents(walletId, userId, correlationId);
   } catch (error) {
     await failReconciliation(walletId, userId, correlationId, error);
     throw error;

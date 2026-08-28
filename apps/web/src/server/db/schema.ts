@@ -374,6 +374,20 @@ export const trades = pgTable(
      * whole limit closed the way an unpriced `daily_notional_usd` trade does.
      */
     realizedLossUsd: numeric('realized_loss_usd', { precision: 38, scale: 12 }),
+    /**
+     * Phase 5: the `trade_intents` row this trade is the on-chain resolution of — set on
+     * insert when `reconcile-wallet.ts` finds a `signed`/`submitted` intent sharing this
+     * trade's `(wallet_id, signature)`. `null` for a trade with no matching intent, which is
+     * the common case: a trade observed on another app entirely, or one that predates the
+     * trading terminal. Never backfilled after the fact — the linkage is decided once, in the
+     * same transaction as the insert, alongside the intent's own guarded transition to
+     * `confirmed`/`failed` (`.ai/patterns/guarded-state-transition.md`).
+     *
+     * Forward reference: `tradeIntents` is declared later in this file. Safe because
+     * `.references()` takes a closure and drizzle only calls it lazily, well after this whole
+     * module has finished evaluating and both consts are assigned — never at this line.
+     */
+    tradeIntentId: uuid('trade_intent_id').references(() => tradeIntents.id),
   },
   (table) => [
     // The rolling-window sum's predicate: one wallet's live trades in a time range.
@@ -381,6 +395,9 @@ export const trades = pgTable(
     // `ON CONFLICT (wallet_id, signature) DO NOTHING` — idempotent re-reconciliation, scoped
     // per wallet (see the table comment above).
     uniqueIndex('trades_wallet_id_signature_idx').on(table.walletId, table.signature),
+    // Phase 5: the origin-tagging lookup ("routed through us" vs. external) and the dashboard's
+    // per-intent trade lookup both key off this.
+    index('trades_trade_intent_id_idx').on(table.tradeIntentId),
   ],
 );
 

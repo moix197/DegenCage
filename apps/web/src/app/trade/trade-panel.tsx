@@ -220,9 +220,33 @@ function outcomeCopyFor(dryRun: boolean | null) {
   return dryRun ? OUTCOME_COPY.dry_run : OUTCOME_COPY.broadcast;
 }
 
+/** Matches `dashboard-panel.tsx` — one cadence for every status poll in the app. */
+const STATUS_POLL_INTERVAL_MS = 15_000;
+
+/**
+ * Statuses reconciliation can no longer move off. Polling stops here: anything else would keep
+ * a timer alive forever for an intent whose story is already over.
+ */
+const TERMINAL_INTENT_STATUSES = new Set(['confirmed', 'failed', 'expired']);
+
+/**
+ * Reconciliation's verdict, once Helius has actually seen the transaction — distinct from the
+ * submit-time outcome above, which only ever says what *we* did with the signed bytes. Until
+ * one of these lands the trade is genuinely unresolved, and saying so is more honest than
+ * leaving the submit message as the last word.
+ */
+const STATUS_COPY: Record<string, string> = {
+  submitted: 'Waiting for the network to confirm this trade.',
+  signed: 'Waiting for the network to confirm this trade.',
+  confirmed: 'Confirmed on chain.',
+  failed: 'This trade did not land on chain. Your allowance has been released.',
+  expired: 'This quote expired before the trade landed. Your allowance has been released.',
+};
+
 /** What happened after the user signed. */
-function SubmitOutcome({ outcome }: { outcome: SubmitResponse }) {
+function SubmitOutcome({ outcome, liveStatus }: { outcome: SubmitResponse; liveStatus: string | null }) {
   const copy = outcomeCopyFor(outcome.dryRun);
+  const statusLine = liveStatus ? STATUS_COPY[liveStatus] : null;
 
   return (
     <Alert>
@@ -231,6 +255,7 @@ function SubmitOutcome({ outcome }: { outcome: SubmitResponse }) {
         <p>{copy.body}</p>
         <p>Signature: {outcome.signature}</p>
         {outcome.replayed ? <p>This submission had already been processed — nothing was done twice.</p> : null}
+        {statusLine ? <p>{statusLine}</p> : null}
       </AlertDescription>
     </Alert>
   );
@@ -247,6 +272,7 @@ export function TradePanel() {
   const [submitOutcome, setSubmitOutcome] = useState<SubmitResponse | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [accountSwitchNotice, setAccountSwitchNotice] = useState(false);
+  const [intentStatus, setIntentStatus] = useState<string | null>(null);
   const { capability, isSigning, error: signingError, sign, connectedAddress } = useSwapSigning();
 
   /**
@@ -267,10 +293,50 @@ export function TradePanel() {
       setResult(null);
       setError(null);
       setSubmitOutcome(null);
+      setIntentStatus(null);
       setSubmitError(null);
       setAccountSwitchNotice(true);
     }
   }, [connectedAddress]);
+
+  /**
+   * Reconciliation (Phase 5) is what actually resolves a submitted intent, and it runs on its
+   * own Helius-driven schedule — so the terminal polls rather than being told. Stops as soon as
+   * the intent reaches a status reconciliation can no longer move it off, and a failed poll is
+   * left to the next tick: a stale status line is not worth surfacing an error over.
+   */
+  const polledIntentId = submitOutcome?.intentId ?? null;
+
+  useEffect(() => {
+    if (polledIntentId === null || (intentStatus !== null && TERMINAL_INTENT_STATUSES.has(intentStatus))) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function poll(): Promise<void> {
+      try {
+        const response = await fetch(`/api/swap/intent/${polledIntentId}`);
+
+        if (!response.ok) return;
+
+        const body = (await response.json()) as { status?: string };
+
+        if (!cancelled && typeof body.status === 'string') {
+          setIntentStatus(body.status);
+        }
+      } catch {
+        // Next tick will try again.
+      }
+    }
+
+    const id = setInterval(() => void poll(), STATUS_POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [polledIntentId, intentStatus]);
 
   const decimals = SELLABLE_TOKENS.find((token) => token.mint === inputMint)?.decimals ?? 0;
   const baseUnits = toBaseUnits(amount, decimals);
@@ -280,6 +346,7 @@ export function TradePanel() {
     // A new quote invalidates the last submission's outcome: what is on screen must always
     // describe the quote currently in hand, never a previous one.
     setSubmitOutcome(null);
+    setIntentStatus(null);
     setSubmitError(null);
     setAccountSwitchNotice(false);
 
@@ -347,6 +414,7 @@ export function TradePanel() {
       }
 
       setSubmitOutcome(body);
+      setIntentStatus(body.status);
     } catch {
       setSubmitError(SUBMIT_ERROR_COPY.submit_unavailable!);
     } finally {
@@ -361,6 +429,7 @@ export function TradePanel() {
 
     setSubmitError(null);
     setSubmitOutcome(null);
+    setIntentStatus(null);
 
     // A refused signature is already described by the hook's own `error`; adding a second
     // message here would say the same thing twice.
@@ -449,7 +518,7 @@ export function TradePanel() {
         </Alert>
       ) : null}
 
-      {submitOutcome ? <SubmitOutcome outcome={submitOutcome} /> : null}
+      {submitOutcome ? <SubmitOutcome outcome={submitOutcome} liveStatus={intentStatus} /> : null}
 
       {/* Disabled is a courtesy; `/api/swap/submit` refuses a blocked or expired intent
           regardless of what this button allows. */}
