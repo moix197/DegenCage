@@ -245,12 +245,12 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Steps:**
 
-- [ ] Implement `use-swap-signing.ts` with explicit feature detection; never assume `signAndSendTransaction` exists
-- [ ] Wire trade-panel's Approve flow, including a clear "you're about to sign a real mainnet transaction" affordance (no devnet exists — decision context)
-- [ ] Implement `submit-service.ts`'s guarded transitions exactly per the pattern doc — no read-then-write; extract the message from signed bytes before hashing (never hash the signed tx as a whole); check fee payer == session wallet independently of the hash comparison; handle the zero-rows-returned case as an idempotent-replay check, not an automatic error
-- [ ] Implement `broadcast-transaction.ts` with the flag-gated simulate/send branch
-- [ ] Implement `/api/swap/submit/route.ts`
-- [ ] Add `chain.broadcast` flag + seed entry (off)
+- [x] Implement `use-swap-signing.ts` with explicit feature detection; never assume `signAndSendTransaction` exists
+- [x] Wire trade-panel's Approve flow, including a clear "you're about to sign a real mainnet transaction" affordance (no devnet exists — decision context)
+- [x] Implement `submit-service.ts`'s guarded transitions exactly per the pattern doc — no read-then-write; extract the message from signed bytes before hashing (never hash the signed tx as a whole); check fee payer == session wallet independently of the hash comparison; handle the zero-rows-returned case as an idempotent-replay check, not an automatic error
+- [x] Implement `broadcast-transaction.ts` with the flag-gated simulate/send branch
+- [x] Implement `/api/swap/submit/route.ts`
+- [x] Add `chain.broadcast` flag + seed entry (off)
 
 **Tests:**
 
@@ -263,10 +263,10 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual (real wallet, mainnet, `chain.broadcast` still off): approve a quote, sign, confirm submit returns a dry-run-verified result with no funds moved, confirm the intent row reaches `submitted` with `signature` recorded but nothing broadcast
-- [ ] Manual: attempt to submit an intent belonging to a different wallet (e.g. after account switch) → confirm server-side 403, not just a client-side block
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual (real wallet, mainnet, `chain.broadcast` still off): approve a quote, sign, confirm submit returns a dry-run-verified result with no funds moved, confirm the intent row reaches `submitted` with `signature` recorded but nothing broadcast — _**NOT VERIFIED**: no funded/signing wallet available; orchestrator declined the manual pass. Automated tests + code review are the only proof for this phase._
+- [ ] Manual: attempt to submit an intent belonging to a different wallet (e.g. after account switch) → confirm server-side 403, not just a client-side block — _**NOT VERIFIED**: no funded/signing wallet available; orchestrator declined the manual pass. Automated tests + code review are the only proof for this phase._
 
 **Kill switch / flag / instrumentation:**
 
@@ -277,13 +277,13 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): wire swap signing + submit verification, broadcast gated off`
+- [x] Changes committed: `feat(web): wire swap signing + submit verification, broadcast gated off`
 - [ ] Phase marked complete
 
 ---
