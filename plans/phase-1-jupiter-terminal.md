@@ -417,9 +417,9 @@ Initial review of `770ccb0` returned **red**; re-review after fixes returned **g
 - [x] Review follow-ups reflected back into this plan file
 - [x] Tests written and passing
 - [x] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
+- [x] Orchestrator (user) has verified and approved this phase
 - [x] Changes committed: `feat(web): link reconciled trades back to their originating trade intent`
-- [ ] Phase marked complete
+- [x] Phase marked complete
 
 ---
 
