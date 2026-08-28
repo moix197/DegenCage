@@ -172,20 +172,20 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Steps:**
 
-- [ ] Add `trade_intents` to `schema.ts`, run `pnpm db:generate`, review the generated SQL, run `pnpm db:migrate` locally
-- [ ] Register `JUPITER_API_KEY` in env config/README; obtain a Free-tier key from developers.jup.ag/portal for local/dev use
-- [ ] Implement `jupiter-client.ts` against `GET api.jup.ag/swap/v2/build` (no `platformFeeBps`/`feeAccount` per decision 10); code the error path defensively per the documented gap — only `400 {error: string}` is guaranteed, treat anything else (including a 200 that later fails simulation) as a possible balance/liquidity failure surfacing late
-- [ ] Migrate `jupiter-tokens.ts` to `api.jup.ag` + `x-api-key`; extend it (or add a sibling) for mint decimals
-- [ ] Implement `helius-simulate.ts`
-- [ ] Implement `assemble-transaction.ts` following Jupiter's documented CU-limit-via-simulation pattern exactly (1.2x buffer, 1,400,000 cap); base58-encode the blockhash; simulate-then-real-blockhash ordering; fail closed on simulation failure — all per the mechanisms section above
-- [ ] Implement `quote-service.ts`'s precondition checks (constitution `active`, reconciliation `current`) before any Jupiter call is made
-- [ ] Implement `quote-service.ts`'s pricing calls to `priceTrade` using the sold-leg-for-acquisitions / `otherAmountThreshold`-for-disposals rule — never pass the optimistic `outAmount` for a disposal's proceeds
-- [ ] Wire `loadWindowedTrades` + `evaluateTrade` + the fold rule (decision 4) — a dependency failure (Helius down, pricing unresolvable, Jupiter `/build` throwing) must fold to `unevaluable` → BLOCK, never fall through to allow
-- [ ] Implement the in-memory short-TTL quote cache keyed on `(walletId, inputMint, outputMint, amount, slippageBps)` — never omit `walletId`, since the cached response contains the requesting wallet's assembled instructions — to stay under the shared 1 RPS Free-tier bucket
-- [ ] Implement `/api/swap/quote/route.ts`
-- [ ] Add both feature flags + seed entries
-- [ ] Build `/trade/page.tsx` + `trade-panel.tsx` using Phase 1's new primitives
-- [ ] Link `/trade` from the dashboard
+- [x] Add `trade_intents` to `schema.ts`, run `pnpm db:generate`, review the generated SQL, run `pnpm db:migrate` locally
+- [ ] Register `JUPITER_API_KEY` in env config/README; obtain a Free-tier key from developers.jup.ag/portal for local/dev use — _registered in `.env.example` + README; **key not yet obtained — human step, blocks the manual checks below**_
+- [x] Implement `jupiter-client.ts` against `GET api.jup.ag/swap/v2/build` (no `platformFeeBps`/`feeAccount` per decision 10); code the error path defensively per the documented gap — only `400 {error: string}` is guaranteed, treat anything else (including a 200 that later fails simulation) as a possible balance/liquidity failure surfacing late
+- [x] Migrate `jupiter-tokens.ts` to `api.jup.ag` + `x-api-key`; extend it (or add a sibling) for mint decimals
+- [x] Implement `helius-simulate.ts`
+- [x] Implement `assemble-transaction.ts` following Jupiter's documented CU-limit-via-simulation pattern exactly (1.2x buffer, 1,400,000 cap); base58-encode the blockhash; simulate-then-real-blockhash ordering; fail closed on simulation failure — all per the mechanisms section above
+- [x] Implement `quote-service.ts`'s precondition checks (constitution `active`, reconciliation `current`) before any Jupiter call is made
+- [x] Implement `quote-service.ts`'s pricing calls to `priceTrade` using the sold-leg-for-acquisitions / `otherAmountThreshold`-for-disposals rule — never pass the optimistic `outAmount` for a disposal's proceeds
+- [x] Wire `loadWindowedTrades` + `evaluateTrade` + the fold rule (decision 4) — a dependency failure (Helius down, pricing unresolvable, Jupiter `/build` throwing) must fold to `unevaluable` → BLOCK, never fall through to allow
+- [x] Implement the in-memory short-TTL quote cache keyed on `(walletId, inputMint, outputMint, amount, slippageBps)` — never omit `walletId`, since the cached response contains the requesting wallet's assembled instructions — to stay under the shared 1 RPS Free-tier bucket
+- [x] Implement `/api/swap/quote/route.ts`
+- [x] Add both feature flags + seed entries
+- [x] Build `/trade/page.tsx` + `trade-panel.tsx` using Phase 1's new primitives
+- [x] Link `/trade` from the dashboard
 
 **Tests:**
 
@@ -198,11 +198,11 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual: with `trade.terminal` + `jupiter.swap_build` flipped on locally, connect a real wallet, request a quote for a pair with headroom → see quote + "allowed" verdict
-- [ ] Manual: request a quote that exceeds a configured limit → see the inline block alert with the correct reason and a working link to `/constitution/edit`
-- [ ] Manual: flip `chain.helius` off (or simulate Helius failure) → confirm the quote route fails closed to blocked/503, never a false "allow"
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual: with `trade.terminal` + `jupiter.swap_build` flipped on locally, connect a real wallet, request a quote for a pair with headroom → see quote + "allowed" verdict — _pending: needs a Jupiter API key + real wallet_
+- [ ] Manual: request a quote that exceeds a configured limit → see the inline block alert with the correct reason and a working link to `/constitution/edit` — _pending: needs a Jupiter API key + real wallet_
+- [ ] Manual: flip `chain.helius` off (or simulate Helius failure) → confirm the quote route fails closed to blocked/503, never a false "allow" — _pending: needs a Jupiter API key + real wallet_
 
 **Kill switch / flag / instrumentation:**
 
@@ -213,13 +213,13 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): add /trade quote + pre-trade rule verdict`
+- [x] Changes committed: `feat(web): add /trade quote + pre-trade rule verdict`
 - [ ] Phase marked complete
 
 ---
