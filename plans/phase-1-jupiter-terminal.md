@@ -311,14 +311,14 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Steps:**
 
-- [ ] Add the partial unique index to `schema.ts`, generate + review + apply the migration
-- [ ] Implement `reapExpiredIntents` (guarded `UPDATE`, not delete) in `intent-lifecycle.ts`
-- [ ] Implement `expireAndReserveLiveIntent`, wrapping the wallet-row-lock + guarded-expire + insert in one transaction, per the concurrency-guarantee rule in the mechanisms section above
-- [ ] Implement `loadLiveIntentUsd`, calling the reaper first and summing via `addUsd`/`sumTradeUsd` (not new decimal arithmetic)
-- [ ] Wire live-intent reservation into the allowance calculation used by `quote-service.ts`
-- [ ] Move Phase 2's plain intent insert into `expireAndReserveLiveIntent`'s locked transaction
-- [ ] Wire expire-on-account-switch into the existing revoke path (expire the old wallet's quote-slot intent unconditionally, not just time-expired ones; a `signed`/`submitted` intent survives the switch and keeps reserving allowance until Phase 5)
-- [ ] Surface the reset notice in `trade-panel.tsx`
+- [x] Add the partial unique index to `schema.ts`, generate + review + apply the migration
+- [x] Implement `reapExpiredIntents` (guarded `UPDATE`, not delete) in `intent-lifecycle.ts`
+- [x] Implement `expireAndReserveLiveIntent`, wrapping the wallet-row-lock + guarded-expire + insert in one transaction, per the concurrency-guarantee rule in the mechanisms section above
+- [x] Implement `loadLiveIntentUsd`, calling the reaper first and summing via `addUsd`/`sumTradeUsd` (not new decimal arithmetic)
+- [x] Wire live-intent reservation into the allowance calculation used by `quote-service.ts`
+- [x] Move Phase 2's plain intent insert into `expireAndReserveLiveIntent`'s locked transaction
+- [x] Wire expire-on-account-switch into the existing revoke path (expire the old wallet's quote-slot intent unconditionally, not just time-expired ones; a `signed`/`submitted` intent survives the switch and keeps reserving allowance until Phase 5)
+- [x] Surface the reset notice in `trade-panel.tsx`
 
 **Tests:**
 
@@ -330,10 +330,10 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual: request quote A near a limit's headroom, then request quote B before approving A → confirm B correctly sees A's reservation, and A is now `expired` in the DB
-- [ ] Manual: switch the connected wallet account mid-quote → confirm `/trade` shows the reset notice and the old intent is `expired`
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual: request quote A near a limit's headroom, then request quote B before approving A → confirm B correctly sees A's reservation, and A is now `expired` in the DB — _**NOT VERIFIED**: no funded/signing wallet; orchestrator declined the manual pass. Automated tests + code review (incl. mutation check) are the only proof._
+- [ ] Manual: switch the connected wallet account mid-quote → confirm `/trade` shows the reset notice and the old intent is `expired` — _**NOT VERIFIED**: no funded/signing wallet; orchestrator declined the manual pass. Automated tests + code review (incl. mutation check) are the only proof._
 
 **Kill switch / flag / instrumentation:**
 
@@ -343,13 +343,13 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): reserve allowance against live trade intents, expire on new quote and account switch`
+- [x] Changes committed: `feat(web): reserve allowance against live trade intents, expire on new quote and account switch`
 - [ ] Phase marked complete
 
 ---
