@@ -45,10 +45,12 @@ differentiator. The rule engine, commitment logic, and violation detection stay 
 **Constraints it creates:**
 
 - **`apps/web/src/app/layout.tsx` now imports `./globals.css`.** Required for Tailwind's
-  utility classes to resolve anywhere in the app, including on pages that don't otherwise
-  use them. The existing inline `style={{}}` on `<body>` is untouched and keeps winning on
-  specificity (inline style beats the `@layer base` rules Tailwind adds), so this import
-  causes no visible change to `/`, `/connect`, or `/constitution`.
+  utility classes to resolve anywhere in the app. `<html>` carries the `dark` class so
+  shadcn's dark-mode CSS variables drive the palette everywhere, and the previous inline
+  `style={{}}` on `<body>` is gone: `<body>` is now styled with
+  `bg-background text-foreground px-6 py-12` Tailwind utilities, sourcing color from those
+  same shadcn CSS variables and restoring the page padding the inline style used to
+  provide.
 - **Existing inline-style pages (`app/page.tsx`, `constitution/constitution-panel.tsx`) are
   left exactly as they are.** They are not
   migrated to Tailwind/shadcn as part of this change — that is a separate, opportunistic

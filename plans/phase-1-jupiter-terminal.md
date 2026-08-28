@@ -99,7 +99,7 @@ These are binding design decisions for Phases 2-5, added during revision review 
 **Risk:** low
 **Mode:** afk
 **Type:** frontend
-**Success criteria:** Existing pages (dashboard, feedback) render shadcn's dark palette correctly instead of the current light-on-dark-background bug; `input`, `label`, `form`, `select`, `dialog`, `skeleton`, `tooltip`, `sonner` primitives are installed under `apps/web/src/components/ui/` and compile/import cleanly, ready for Phase 2's swap form.
+**Success criteria:** Existing pages (dashboard, feedback) render shadcn's dark palette correctly instead of the current light-on-dark-background bug; `input`, `label`, `field`, `select`, `dialog`, `skeleton`, `tooltip`, `sonner` primitives are installed under `apps/web/src/components/ui/` and compile/import cleanly, ready for Phase 2's swap form.
 **Commit message:** `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
 
 **Allowed-exception justification:** this is the plan's one permitted "pure infrastructure prerequisite" phase (plan-sequential format spec). It has no user-facing surface of its own — nothing here is a shippable slice — but Phase 2 cannot legibly build a swap form on a codebase where shadcn renders its light palette on a hardcoded dark body, and none of `input`/`select`/`dialog`/`form` exist yet. Folding this into Phase 2 would blow that phase's file count past reason for an unrelated concern (CSS/theming vs. trade domain logic).
@@ -110,15 +110,15 @@ These are binding design decisions for Phases 2-5, added during revision review 
 |---|---|---|
 | modify | `apps/web/src/app/layout.tsx` | Add `dark` class alongside existing `cn('font-sans', geist.variable)` on `<html>`; remove the hardcoded inline dark `style` object on `<body>`; replace with Tailwind `bg-background text-foreground` classes so shadcn's own CSS variables (not an inline override) drive the palette |
 | verify | `apps/web/src/app/globals.css` | Confirm shadcn's `.dark` CSS variable block exists (added by the original `shadcn init`) and actually applies now that `<html>` carries the class; adjust only if missing/incomplete |
-| create | `apps/web/src/components/ui/input.tsx`, `label.tsx`, `form.tsx`, `select.tsx`, `dialog.tsx`, `skeleton.tsx`, `tooltip.tsx`, `sonner.tsx` | Vendored shadcn primitives via `pnpm dlx shadcn@latest add`, not hand-written |
+| create | `apps/web/src/components/ui/input.tsx`, `label.tsx`, `field.tsx`, `select.tsx`, `dialog.tsx`, `skeleton.tsx`, `tooltip.tsx`, `sonner.tsx` | Vendored shadcn primitives via `pnpm dlx shadcn@latest add` (`base-nova` ships no `form.tsx` — `field` is the real equivalent and composes directly with `react-hook-form`), not hand-written |
 | modify | `apps/web/package.json` | New deps pulled in by the above (expect `react-hook-form`, a resolver such as `@hookform/resolvers` + `zod` for `form.tsx`, `sonner` for toasts, `@base-ui/react` primitives per this project's shadcn style `base-nova`) — declare explicitly, don't let the CLI silently add unpinned ranges |
 
 **Steps:**
 
-- [ ] From `apps/web`, run `pnpm dlx shadcn@latest add input label form select dialog skeleton tooltip sonner`
-- [ ] Fix `layout.tsx` per the file-changes row above
-- [ ] Confirm `.dark` tokens in `globals.css` actually change the rendered palette (no leftover inline overrides elsewhere)
-- [ ] Run `pnpm typecheck` and `pnpm test` workspace-wide to confirm nothing regresses
+- [x] From `apps/web`, run `pnpm dlx shadcn@latest add input label field select dialog skeleton tooltip sonner`
+- [x] Fix `layout.tsx` per the file-changes row above
+- [x] Confirm `.dark` tokens in `globals.css` actually change the rendered palette (no leftover inline overrides elsewhere)
+- [x] Run `pnpm typecheck` and `pnpm test` workspace-wide to confirm nothing regresses
 
 **Tests:**
 
@@ -126,20 +126,20 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Verification:**
 
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm test` passes (no regressions)
+- [x] `pnpm typecheck` passes
+- [x] `pnpm test` passes (no regressions)
 - [ ] Manual: load `/dashboard` and `/feedback` (or wherever currently reachable) in a browser, confirm dark theme now renders shadcn's dark palette instead of light-on-dark
 - [ ] Manual: confirm each new primitive file imports without type errors (a throwaway local import is enough — no permanent smoke-test route needed)
 
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Documentation updated (see Documentation section)
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Documentation updated (see Documentation section)
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
+- [x] Changes committed: `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
 - [ ] Phase marked complete
 
 ---
