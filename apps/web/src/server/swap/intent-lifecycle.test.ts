@@ -220,10 +220,17 @@ describe('expireAllLiveIntentsForWallet', () => {
     const expired = await expireAllLiveIntentsForWallet('wallet-1', executor as never);
 
     expect(expired).toEqual(['live-1']);
-    const { sql } = whereSql(executor.updateCalls[0]!.where);
+    const { sql, params } = whereSql(executor.updateCalls[0]!.where);
     expect(sql).toContain('"wallet_id" =');
     expect(sql).toContain('"status" in');
     expect(sql).not.toContain('expires_at');
+    // Exactly QUOTE_SLOT_STATUSES — an account switch must expire only the wallet's quote-slot
+    // occupant; widening this to RESERVING_TRADE_INTENT_STATUSES would expire a `signed`/
+    // `submitted` intent that has already left the building and must keep reserving allowance
+    // until Phase 5 reconciles it (the Phase 4 review's blocking double-spend bug).
+    expect(params.filter((param) => typeof param === 'string' && param !== 'wallet-1')).toEqual([...QUOTE_SLOT_STATUSES]);
+    expect(params).not.toContain('signed');
+    expect(params).not.toContain('submitted');
   });
 });
 

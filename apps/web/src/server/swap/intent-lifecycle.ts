@@ -88,11 +88,15 @@ export async function reapExpiredIntents(
 }
 
 /**
- * Unconditionally expires every live intent for `walletId` — the account-switch path
- * (`server/auth/session.ts`'s `revokeSessionByIdHash`). Unlike `reapExpiredIntents`, this
- * carries no `expires_at` guard: the wallet is no longer the one connected, so its reservation
- * must not survive the switch even if the blockhash it was quoted against has not technically
- * expired yet.
+ * Unconditionally expires the wallet's quote-slot occupant (`QUOTE_SLOT_STATUSES`) — the
+ * account-switch path (`server/auth/session.ts`'s `revokeSessionByIdHash`). Unlike
+ * `reapExpiredIntents`, this carries no `expires_at` guard: the wallet is no longer the one
+ * connected, so an unsigned quote must not survive the switch even if the blockhash it was
+ * quoted against has not technically expired yet.
+ *
+ * Deliberately does not touch `signed`/`submitted`: a broadcast trade for the old wallet keeps
+ * reserving allowance across the switch until Phase 5 reconciliation resolves it — killing that
+ * reservation on switch would let the same broadcast trade be double-spent against next.
  *
  * @returns The ids expired, for the caller to record `trade.intent_expired` against.
  */

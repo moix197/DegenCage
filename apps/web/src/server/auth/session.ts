@@ -312,10 +312,15 @@ export function parseRevocationReason(value: string | null | undefined): Session
 }
 
 /**
- * The account-switch half of session revocation (Phase 4): every live trade intent for the
- * wallet the session is leaving dies with it, unconditionally — not just the ones that
- * happened to have timed out. A reservation must never outlive the wallet it was reserved
+ * The account-switch half of session revocation (Phase 4): the wallet's quote-slot intent
+ * (`quoted`/`approved`) dies with the session, unconditionally — not just the ones that
+ * happened to have timed out. An unsigned quote must never outlive the wallet it was quoted
  * against.
+ *
+ * A `signed`/`submitted` intent is deliberately left alone: it already left the building
+ * before the switch, and its reservation must keep holding allowance against the *old* wallet
+ * until Phase 5 reconciliation resolves it — expiring it here would free that allowance while
+ * the broadcast trade is still outstanding.
  *
  * Only ever called with a real `walletId` from `revokeSessionByIdHash`, below, and only when
  * `reason === 'account_switch'` — never for an ordinary logout or supersede-by-same-wallet,

@@ -2,7 +2,7 @@ import type { Constitution } from '@degencage/rules';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { tradeIntents, trades } from '../db/schema';
+import { RESERVING_TRADE_INTENT_STATUSES, tradeIntents, trades } from '../db/schema';
 import { createQuote, foldVerdict, QuotePreconditionError } from './quote-service';
 import type { JupiterBuildResponse } from './jupiter-client';
 
@@ -153,9 +153,18 @@ function makeLiveIntentFixture(initialRows: FakeIntentRow[] = []): { rows: FakeI
     return reaped.map((row) => ({ id: row.id }));
   }
 
-  /** `expireAllLive` inside `expireAndReserveLiveIntent`: quote-slot rows, unconditional. */
-  function expireQuoteSlotUnconditionally(): { id: string }[] {
-    const expired = rows.filter((row) => row.status === 'quoted' || row.status === 'approved');
+  /**
+   * `expireAllLive` inside `expireAndReserveLiveIntent`: expires whatever status set the real
+   * predicate actually carries, parsed via `whereSql` rather than a hardcoded parallel list —
+   * so a mutation widening `expireAllLive`'s status array (e.g. to
+   * `RESERVING_TRADE_INTENT_STATUSES`) shows up here as a `signed`/`submitted` row wrongly
+   * expired, instead of this fixture silently keeping its own separate quote-slot notion and
+   * passing regardless of what the real predicate targets.
+   */
+  function expireByPredicate(predicate: unknown): { id: string }[] {
+    const { params } = whereSql(predicate);
+    const statuses = params.filter((param): param is string => typeof param === 'string' && param !== 'wallet-1');
+    const expired = rows.filter((row) => statuses.includes(row.status));
     expired.forEach((row) => {
       row.status = 'expired';
     });
@@ -183,8 +192,11 @@ function makeLiveIntentFixture(initialRows: FakeIntentRow[] = []): { rows: FakeI
           // `loadLiveIntentUsd`'s query: [walletId, ...RESERVING_TRADE_INTENT_STATUSES,
           // windowStart, asOf, excludeIntentId?] — the exclusion, when present, is always the
           // last param (drizzle's `and()` drops the `undefined` condition entirely otherwise).
+          // Compared against the real status set's length rather than a hardcoded param count,
+          // so this stays correct if RESERVING_TRADE_INTENT_STATUSES ever gains/loses a status.
           const { params } = whereSql(predicate);
-          const excludeId = params.length === 8 ? (params[7] as string) : undefined;
+          const paramCountWithoutExclusion = 1 + RESERVING_TRADE_INTENT_STATUSES.length + 2;
+          const excludeId = params.length > paramCountWithoutExclusion ? (params[params.length - 1] as string) : undefined;
 
           return Promise.resolve(
             rows
@@ -206,7 +218,7 @@ function makeLiveIntentFixture(initialRows: FakeIntentRow[] = []): { rows: FakeI
   transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
     callback({
       select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
-      update: () => ({ set: () => ({ where: () => ({ returning: async () => expireQuoteSlotUnconditionally() }) }) }),
+      update: () => ({ set: () => ({ where: (predicate: unknown) => ({ returning: async () => expireByPredicate(predicate) }) }) }),
       insert: () => ({
         values: (values: Record<string, unknown>) => {
           insertedValuesSpy(values);
