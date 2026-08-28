@@ -78,7 +78,16 @@ async function loadCachedPrice(mint: string, minuteBucket: Date): Promise<string
   return rows[0]?.usdPrice ?? null;
 }
 
+/**
+ * Never persists a minute bucket that hasn't closed yet — its "close" is just the partial
+ * value at fetch time, not a settled price, and reconciliation must never see it as such.
+ * The live value is still returned to the caller by `getSolUsdPrice`; only the write is skipped.
+ */
 async function cachePrice(mint: string, minuteBucket: Date, usdPrice: string): Promise<void> {
+  if (minuteBucket.getTime() >= minuteBucketUtc(new Date()).getTime()) {
+    return;
+  }
+
   await getDb()
     .insert(tokenPrices)
     .values({ mint, minuteBucketUtc: minuteBucket, usdPrice, source: 'binance', fetchedAt: new Date() })
