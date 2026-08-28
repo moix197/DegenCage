@@ -6,7 +6,12 @@ external call; the four cap tiers come from Jupiter Tokens v2's `mcap` field, bu
 $1B / $100M / $10M by one exported threshold constant in
 `apps/web/src/server/chain/classify-token.ts`. Anything unlisted, missing `mcap`, or
 resolved while the kill switch is off becomes `MICRO_CAP` with
-`classification: 'unknown'` — both persisted on the trade row.
+`classification: 'unknown'` — both persisted on the row that records the trade.
+
+`classifyToken()` runs at two moments, not one: `reconcile-wallet.ts` classifies a trade that
+already happened, and `quote-service.ts` classifies the bought leg of a *proposed* swap before a
+signature exists, to decide which tier allowance it would consume. Same function, same
+fail-closed default, stamped on `trade_intents.acquired_tier`.
 
 This **supersedes** the original identity-based tiers
 (`STABLE | SOL | BTC | ETH | ALT | MEMECOIN`) shipped with the constitution schema.
@@ -39,6 +44,11 @@ below $Y mcap" rule is a threshold change, not a new tier vocabulary.
   so `trades.acquired_tier` and `trades.classification` are written once at classification
   time. A token that later moons must not retroactively rewrite past violations — the
   append-only rule that governs violations governs their inputs too.
+- **A pre-trade stamp and a reconciliation stamp are two independent readings, and may
+  disagree.** `trade_intents.acquired_tier` is the tier the *verdict* was computed against;
+  reconciliation classifies the landed trade afresh and writes its own `trades.acquired_tier`.
+  Neither is corrected from the other: the intent's stamp is what makes a past block or allow
+  reconstructible, and rewriting it to match a later mcap read would falsify the audit trail.
 - **The 90-day backfill classifies historical trades at *today's* mcap.** Backfilled trades
   are baseline-only and never surfaced as violations, so this is tolerable, but a backfilled
   tier badge is not a contemporaneous judgement and the UI must not present it as one.
@@ -46,10 +56,15 @@ below $Y mcap" rule is a threshold change, not a new tier vocabulary.
   `MICRO_CAP` + `'known'` (a genuine sub-$10M read) are different facts; the status page
   shows "counted as micro cap" only for the former. Collapsing them would make the audit
   trail unable to distinguish a real classification from a provider outage.
-- **Classification never throws into the reconcile pipeline.** Timeout, client error,
-  unlisted mint, `mcap: null`, and `classification.jupiter_mcap` off all resolve to the same
-  fail-closed default. This is load-bearing: `reconcileWallet` rethrows, so a raising
-  classifier would fail an entire wallet's reconciliation.
+- **Classification never throws — into reconciliation or into a quote.** Timeout, client
+  error, unlisted mint, `mcap: null`, and `classification.jupiter_mcap` off all resolve to the
+  same fail-closed default. Load-bearing in both directions: `reconcileWallet` rethrows, so a
+  raising classifier would fail an entire wallet's reconciliation; and pre-trade the default
+  must be a *tier* rather than an exception, because `MICRO_CAP` charges the trade against the
+  tightest allowance a caging user is likely to have written. A provider outage therefore
+  tightens the verdict instead of loosening it, which is the only acceptable direction for a
+  limit the user asked us to enforce — this is why classification failure, unlike pricing
+  failure, does not itself block the quote.
 - **`mcap` arrives as a JSON number and stays one.** It is confined to threshold comparison
   and never enters USD or allowance arithmetic, which remains exact-decimal `BigInt`
   ([usd-pricing-source](usd-pricing-source.md)).
