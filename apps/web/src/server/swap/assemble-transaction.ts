@@ -175,6 +175,13 @@ export function swapInstructions(build: JupiterBuildResponse): Instruction[] {
   ];
 }
 
+/**
+ * The fee payer is set *before* lookup-table compression, not after: compression decides which
+ * accounts may be replaced by a table index, and an account that is not yet known to the
+ * message as the fee payer is not automatically protected from that. It happens to be safe
+ * today only because the taker is also a signer of every swap — a fact this ordering no
+ * longer has to depend on.
+ */
 function compileV0Message(
   instructions: Instruction[],
   feePayer: Address,
@@ -185,8 +192,8 @@ function compileV0Message(
   return pipe(
     createTransactionMessage({ version: 0 }),
     (message) => appendTransactionMessageInstructions(instructions, message),
-    (message) => compressTransactionMessageUsingAddressLookupTables(message, lookupTables),
     (message) => setTransactionMessageFeePayer(feePayer, message),
+    (message) => compressTransactionMessageUsingAddressLookupTables(message, lookupTables),
     (message) => setTransactionMessageLifetimeUsingBlockhash({ blockhash, lastValidBlockHeight }, message),
     (message) => compileTransaction(message),
   );
@@ -224,6 +231,19 @@ async function measureComputeUnits(
   return simulation.unitsConsumed;
 }
 
+/**
+ * Jupiter's own compute-budget instructions, minus any `SetComputeUnitLimit`. The limit is
+ * ours to set — measured by simulation, not guessed — and a message carrying two of them is
+ * rejected on chain as `DuplicateInstruction`, which would fail the swap after the user
+ * signed it. Everything else `/build` returns there (the CU *price*, discriminator 3) is
+ * passed through untouched.
+ */
+export function passthroughComputeBudgetInstructions(build: JupiterBuildResponse): Instruction[] {
+  return build.computeBudgetInstructions
+    .map(toInstruction)
+    .filter((instruction) => instruction.data?.[0] !== SET_COMPUTE_UNIT_LIMIT_DISCRIMINATOR);
+}
+
 export interface AssembledTransaction {
   /** The compiled message bytes, base64 — what the wallet is handed to sign in Phase 3. */
   messageBase64: string;
@@ -254,7 +274,7 @@ export async function assembleSwapTransaction(build: JupiterBuildResponse, taker
   const computeUnitLimit = computeUnitLimitFrom(unitsConsumed);
 
   const compiled = compileV0Message(
-    [setComputeUnitLimitInstruction(computeUnitLimit), ...build.computeBudgetInstructions.map(toInstruction), ...instructions],
+    [setComputeUnitLimitInstruction(computeUnitLimit), ...passthroughComputeBudgetInstructions(build), ...instructions],
     feePayer,
     blockhash,
     lastValidBlockHeight,

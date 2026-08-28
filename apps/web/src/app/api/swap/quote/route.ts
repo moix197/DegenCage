@@ -22,7 +22,15 @@ export const dynamic = 'force-dynamic';
 
 /** Jupiter's own default; the terminal does not expose a slippage control yet. */
 const DEFAULT_SLIPPAGE_BPS = 50;
-const MAX_SLIPPAGE_BPS = 5_000;
+/**
+ * 5% — above Jupiter's own "high slippage" warning band, and wide enough for a genuinely
+ * illiquid pair, while bounding the gap between the quote the user is shown and what the swap
+ * can actually fill at. A request asking for more than this is not a trade that needs a wider
+ * tolerance, it is a trade that needs a smaller size. Out-of-range values are **rejected**,
+ * never clamped: silently trading something other than what was asked for is the kind of
+ * quiet accommodation this product exists to refuse.
+ */
+const MAX_SLIPPAGE_BPS = 500;
 
 interface QuoteRequestBody {
   inputMint?: unknown;

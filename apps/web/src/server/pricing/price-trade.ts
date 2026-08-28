@@ -9,6 +9,18 @@ import { isStablecoin } from '../chain/stablecoin-mints';
  * silently folded into the notional sum as zero (CLAUDE.md).
  */
 
+/**
+ * Which leg denominates the result, when the caller must decide rather than let the search
+ * order below decide for it. Pre-trade callers always name one (see
+ * `.ai/decisions/pre-trade-slippage-pricing.md`): only the caller knows whether the limit
+ * being evaluated is a ceiling (a bigger number must be *more* likely to block, so it prices
+ * the sold leg, whose amount an exact-in swap fixes) or a floor (a *smaller* proceeds figure
+ * is the one that blocks, so it prices the bought leg's guaranteed minimum). Omitted keeps the
+ * inferred search order, which is what post-execution reconciliation wants: by then both
+ * amounts are real on-chain facts, so the most liquid leg is simply the most accurate one.
+ */
+export type PricedLeg = 'sold' | 'bought';
+
 export interface PriceableTrade {
   soldMint: string;
   boughtMint: string;
@@ -17,6 +29,8 @@ export interface PriceableTrade {
   soldDecimals: number;
   boughtDecimals: number;
   occurredAt: Date;
+  /** Omit to infer from liquidity (see `PricedLeg`) — every pre-trade caller must name one. */
+  leg?: PricedLeg;
 }
 
 export interface PricedTrade {
@@ -54,11 +68,43 @@ function multiplyUsd(a: string, b: string): string {
 }
 
 /**
+ * Prices exactly the leg the caller named, through whichever source that mint has: face value
+ * for a stablecoin, Binance for SOL, Birdeye for anything else. No fallback to the *other*
+ * leg — that is the point of naming one, since the other leg is the one the caller decided
+ * must not be able to move the number.
+ */
+async function priceNamedLeg(mint: string, amountBaseUnits: string, decimals: number, occurredAt: Date): Promise<PricedTrade> {
+  if (isStablecoin(mint)) {
+    return { usdValue: baseUnitsToDecimalString(amountBaseUnits, decimals), priceSource: 'stablecoin' };
+  }
+
+  const isSol = mint === SOL_MINT;
+  const price = isSol ? await getSolUsdPrice(occurredAt) : await getBirdeyeUsdPrice(mint, occurredAt);
+
+  if (price === null) return { usdValue: null, priceSource: null };
+
+  return {
+    usdValue: multiplyUsd(baseUnitsToDecimalString(amountBaseUnits, decimals), price),
+    priceSource: isSol ? 'binance' : 'birdeye',
+  };
+}
+
+/**
  * Prices `trade`'s known leg: a stablecoin leg needs no external call; a SOL leg is priced
  * from the cached Binance klines minute bucket. Neither present (an alt↔alt swap) is
  * unresolvable in Phase 4 and returns `usdValue: null`.
+ *
+ * `trade.leg`, when set, overrides all of that and prices only the named leg.
  */
 export async function priceTrade(trade: PriceableTrade): Promise<PricedTrade> {
+  if (trade.leg === 'sold') {
+    return priceNamedLeg(trade.soldMint, trade.soldAmountBaseUnits, trade.soldDecimals, trade.occurredAt);
+  }
+
+  if (trade.leg === 'bought') {
+    return priceNamedLeg(trade.boughtMint, trade.boughtAmountBaseUnits, trade.boughtDecimals, trade.occurredAt);
+  }
+
   if (isStablecoin(trade.soldMint)) {
     return { usdValue: baseUnitsToDecimalString(trade.soldAmountBaseUnits, trade.soldDecimals), priceSource: 'stablecoin' };
   }

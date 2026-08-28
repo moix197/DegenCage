@@ -24,6 +24,8 @@ const {
   selectMock,
   transactionMock,
   insertedValuesSpy,
+  getSolUsdPriceMock,
+  getBirdeyeUsdPriceMock,
 } = vi.hoisted(() => ({
   loadReconciliationStateMock: vi.fn(),
   classifyTokenMock: vi.fn(),
@@ -36,6 +38,8 @@ const {
   selectMock: vi.fn(),
   transactionMock: vi.fn(),
   insertedValuesSpy: vi.fn(),
+  getSolUsdPriceMock: vi.fn(),
+  getBirdeyeUsdPriceMock: vi.fn(),
 }));
 
 vi.mock('../dashboard/dashboard-state', () => ({ loadReconciliationState: loadReconciliationStateMock }));
@@ -48,15 +52,24 @@ vi.mock('./jupiter-client', () => ({ buildSwap: buildSwapMock, BLOCKHASH_SLOTS_T
 vi.mock('./assemble-transaction', () => ({ assembleSwapTransaction: assembleSwapTransactionMock }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
 vi.mock('../db/client', () => ({ getDb: () => ({ select: selectMock, transaction: transactionMock }) }));
+// The leaf price *sources* are mocked so no case here makes a network call; `priceTrade`
+// itself stays real, since which leg it prices is the thing under test.
+vi.mock('../pricing/binance-klines', () => ({
+  getSolUsdPrice: getSolUsdPriceMock,
+  SOL_MINT: 'So11111111111111111111111111111111111111112',
+}));
+vi.mock('../pricing/birdeye-price', () => ({ getBirdeyeUsdPrice: getBirdeyeUsdPriceMock }));
 
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const BONK = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
+const SOL = 'So11111111111111111111111111111111111111112';
 const WALLET_ADDRESS = 'BPFLoaderUpgradeab1e11111111111111111111111';
 
-const DAILY_NOTIONAL: Constitution = {
-  schemaVersion: 1,
-  limits: [{ id: 'limit-daily', type: 'daily_notional_usd', maxUsd: '500', windowHours: 24 }],
-};
+function dailyNotional(maxUsd: string): Constitution {
+  return { schemaVersion: 1, limits: [{ id: 'limit-daily', type: 'daily_notional_usd', maxUsd, windowHours: 24 }] };
+}
+
+const DAILY_NOTIONAL: Constitution = dailyNotional('500');
 
 /** Each test uses a distinct amount so the module-level short-TTL quote cache never leaks between them. */
 let amountCounter = 0;
@@ -118,6 +131,8 @@ beforeEach(() => {
   classifyTokenMock.mockResolvedValue({ tier: 'MICRO_CAP', classification: 'known' });
   lookupTokenDecimalsMock.mockResolvedValue(new Map([[USDC, 6], [BONK, 5]]));
   loadWindowedTradesMock.mockResolvedValue([]);
+  getSolUsdPriceMock.mockResolvedValue(null);
+  getBirdeyeUsdPriceMock.mockResolvedValue(null);
   isFeatureEnabledMock.mockResolvedValue(true);
   buildSwapMock.mockResolvedValue(buildResponse());
   assembleSwapTransactionMock.mockResolvedValue({
@@ -298,7 +313,23 @@ describe('createQuote slippage-safe pricing', () => {
     expect(result.quote.usdValue).toBe('250.000000');
   });
 
-  it('prices the bought leg off otherAmountThreshold, never the optimistic outAmount', async () => {
+  it('prices a sale off the exact sold leg too, never the stable leg’s slippage-shrinkable threshold', async () => {
+    buildSwapMock.mockResolvedValue(
+      buildResponse({ inputMint: BONK, outputMint: USDC, inAmount: '5000000', outAmount: '400000000', otherAmountThreshold: '300000000' }),
+    );
+    lookupTokenDecimalsMock.mockResolvedValue(new Map([[BONK, 5], [USDC, 6]]));
+    getBirdeyeUsdPriceMock.mockResolvedValue('0.000002');
+
+    const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC }));
+
+    // 5000000 base units of 5-decimal BONK = 50 BONK at $0.000002. The $300 guaranteed-minimum
+    // proceeds are the *floor*-limit figure; a ceiling limit must never be denominated in a
+    // number the request's own slippage can shrink.
+    expect(result.quote.usdValue).toBe('0.00010000000');
+    expect(getBirdeyeUsdPriceMock).toHaveBeenCalledWith(BONK, expect.any(Date));
+  });
+
+  it('blocks rather than falling back to the stable bought leg when the sold leg has no price', async () => {
     buildSwapMock.mockResolvedValue(
       buildResponse({ inputMint: BONK, outputMint: USDC, inAmount: '5000000', outAmount: '400000000', otherAmountThreshold: '300000000' }),
     );
@@ -306,9 +337,37 @@ describe('createQuote slippage-safe pricing', () => {
 
     const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC }));
 
-    // The guaranteed minimum (300000000 base units of 6-decimal USDC = $300) is the worst-case
-    // proceeds — never the $400 the aggregator optimistically quoted.
-    expect(result.quote.usdValue).toBe('300.000000');
+    expect(result.quote.usdValue).toBeNull();
+    expect(result.verdict).toBe('block');
+  });
+
+  /**
+   * The bypass this rule exists to close: SOL→USDC is the dominant path in the terminal, and
+   * pricing it off `otherAmountThreshold` let a scripted POST discount its own recorded
+   * notional by whatever slippage it asked for.
+   */
+  it('records a SOL→USDC quote at wide slippage off the exact sold SOL, and still blocks', async () => {
+    selectReturns([constitutionRow('active', dailyNotional('145'))]);
+    buildSwapMock.mockResolvedValue(
+      buildResponse({
+        inputMint: SOL,
+        outputMint: USDC,
+        inAmount: '1000000000',
+        outAmount: '150000000',
+        otherAmountThreshold: '142500000',
+        slippageBps: 500,
+      }),
+    );
+    lookupTokenDecimalsMock.mockResolvedValue(new Map([[SOL, 9], [USDC, 6]]));
+    getSolUsdPriceMock.mockResolvedValue('150');
+
+    const result = await createQuote(quoteParams({ inputMint: SOL, outputMint: USDC, slippageBps: 500 }));
+
+    // 1 SOL at $150. Priced off the threshold this reads as $142.50, slips under the $145
+    // limit, and the trade the user forbade themselves goes through.
+    expect(result.quote.usdValue).toBe('150.000000000');
+    expect(result.verdict).toBe('block');
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ usdValue: '150.000000000', status: 'blocked' }));
   });
 
   it('writes the same figure to the intent row that the limits were evaluated against', async () => {

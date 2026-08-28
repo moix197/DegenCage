@@ -138,17 +138,20 @@ export function foldVerdict(evaluations: LimitEvaluation[]): 'allow' | 'block' {
 }
 
 /**
- * Prices the quote for the *ceiling* limits (`daily_notional_usd`,
- * `asset_tier_acquisition_usd`) off amounts that cannot be inflated by favourable execution:
- * the sold leg is `inAmount`, which for an exact-in swap is fixed no matter how the swap
- * fills, and the bought leg — reached only when neither mint is a stablecoin or SOL — is
- * `otherAmountThreshold`, the guaranteed minimum.
+ * Prices the quote for the *ceiling* limits (`daily_notional_usd`, `asset_tier_acquisition_usd`)
+ * off the **sold leg**, named explicitly rather than inferred: `inAmount` is the amount we
+ * hand Jupiter for an exact-in swap, so it is fixed no matter how the swap fills, and nothing
+ * in the request can shrink it.
  *
- * The optimistic `outAmount` is never used. The acquired token count has no documented upper
- * bound, so pricing off it would understate the risk of exactly the trades that execute better
- * than quoted (`.ai/decisions/pre-trade-slippage-pricing.md`).
+ * Neither the optimistic `outAmount` nor the `otherAmountThreshold` floor may denominate a
+ * ceiling limit. The threshold is `inAmount * (1 - slippageBps/1e4)` in spirit — pricing a
+ * ceiling off it lets a caller understate its own recorded notional by raising its slippage,
+ * and understatement is the direction that lets a trade through a limit that should have
+ * blocked it (`.ai/decisions/pre-trade-slippage-pricing.md`). `otherAmountThreshold` is still
+ * carried on the trade as the bought leg, because that is the right — worst-case — figure
+ * for the floor-type direction (`rolling_loss_usd` proceeds).
  */
-async function priceQuote(build: JupiterBuildResponse, occurredAt: Date): Promise<{ usdValue: string | null; priceSource: string | null }> {
+async function priceCeilingLimits(build: JupiterBuildResponse, occurredAt: Date): Promise<{ usdValue: string | null; priceSource: string | null }> {
   const decimals = await lookupTokenDecimals([build.inputMint, build.outputMint]);
   const soldDecimals = decimals.get(build.inputMint);
   const boughtDecimals = decimals.get(build.outputMint);
@@ -167,6 +170,7 @@ async function priceQuote(build: JupiterBuildResponse, occurredAt: Date): Promis
     soldDecimals,
     boughtDecimals,
     occurredAt,
+    leg: 'sold',
   });
 }
 
@@ -257,7 +261,7 @@ async function evaluateQuote(params: QuoteRequestParams, constitution: Constitut
   // Server clock at build time (decision 15) — never a client-supplied instant.
   const occurredAt = new Date();
   const [{ usdValue }, classification, lossLimitEnabled] = await Promise.all([
-    priceQuote(build, occurredAt),
+    priceCeilingLimits(build, occurredAt),
     classifyToken(build.outputMint),
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
   ]);
@@ -388,6 +392,10 @@ async function persistIntent(
  */
 export async function createQuote(params: QuoteRequestParams): Promise<QuoteResult> {
   const constitution = await assertPreconditions(params);
+  // Read before `/build`, not after: this is the fallback for a response that carries no
+  // `fetchedAt`, and a clock read once the call has already returned dates the blockhash
+  // later than it was fetched — which would push `expires_at` past the real lifetime.
+  const requestedAt = new Date();
   const build = await buildOrReuseQuote(params);
   const evaluated = await evaluateQuote(params, constitution.document, build);
 
@@ -395,7 +403,7 @@ export async function createQuote(params: QuoteRequestParams): Promise<QuoteResu
   // a Helius simulation on a trade that must never be signed, and would hand the browser a
   // message it has no business holding.
   const assembled = evaluated.verdict === 'allow' ? await assembleSwapTransaction(build, params.walletAddress) : null;
-  const expiresAt = deriveExpiresAt(build, evaluated.occurredAt);
+  const expiresAt = deriveExpiresAt(build, requestedAt);
   const intentId = await persistIntent(params, constitution.id, evaluated, assembled, expiresAt);
 
   return {

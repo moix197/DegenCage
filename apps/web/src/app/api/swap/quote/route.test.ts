@@ -95,6 +95,11 @@ describe('POST /api/swap/quote', () => {
     ['a fractional amount', { ...VALID_BODY, amount: '1.5' }],
     ['a numeric amount', { ...VALID_BODY, amount: 100 }],
     ['a negative slippage', { ...VALID_BODY, slippageBps: -1 }],
+    ['a fractional slippage', { ...VALID_BODY, slippageBps: 12.5 }],
+    // Rejected, never clamped: a wider tolerance than the ceiling is a smaller trade, and
+    // quietly executing something other than what was asked for is the accommodation this
+    // product refuses (`.ai/decisions/pre-trade-slippage-pricing.md`).
+    ['a slippage one bp over the 500 ceiling', { ...VALID_BODY, slippageBps: 501 }],
     ['an absurd slippage', { ...VALID_BODY, slippageBps: 10_000 }],
   ])('400s on %s', async (_label, body) => {
     const response = await POST(quoteRequest(body));
@@ -137,6 +142,13 @@ describe('POST /api/swap/quote', () => {
     expect(createQuoteMock).toHaveBeenCalledWith(
       expect.objectContaining({ walletId: SESSION.walletId, walletAddress: SESSION.walletAddress, userId: SESSION.userId }),
     );
+  });
+
+  it('accepts the 500 bps ceiling itself and forwards it unchanged', async () => {
+    const response = await POST(quoteRequest({ ...VALID_BODY, slippageBps: 500 }));
+
+    expect(response.status).toBe(200);
+    expect(createQuoteMock).toHaveBeenCalledWith(expect.objectContaining({ slippageBps: 500 }));
   });
 
   it('defaults slippage rather than leaving it undefined', async () => {

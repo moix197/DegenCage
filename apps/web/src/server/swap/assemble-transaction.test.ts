@@ -8,6 +8,7 @@ import {
   decodeBlockhash,
   MAX_COMPUTE_UNIT_LIMIT,
   parseLookupTableAddresses,
+  passthroughComputeBudgetInstructions,
   resolveLookupTables,
   setComputeUnitLimitInstruction,
   swapInstructions,
@@ -37,6 +38,7 @@ const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const JUPITER_PROGRAM = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
 const LOOKUP_TABLE = 'AddressLookupTab1e1111111111111111111111111';
+const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
 const RENT_SYSVAR = 'SysvarRent111111111111111111111111111111111';
 /** A real mainnet blockhash string; `/build` hands the same value back as raw bytes. */
 const BLOCKHASH = '4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi';
@@ -129,6 +131,42 @@ describe('swapInstructions', () => {
 
   it('omits a null cleanup and a null tip instead of emitting a placeholder', () => {
     expect(swapInstructions(buildResponse({ cleanupInstruction: null })).length).toBe(3);
+  });
+});
+
+describe('passthroughComputeBudgetInstructions', () => {
+  it('drops a CU limit Jupiter returned — ours is measured, and two of them is DuplicateInstruction', () => {
+    const build = buildResponse({
+      computeBudgetInstructions: [
+        { programId: COMPUTE_BUDGET_PROGRAM, accounts: [], data: Buffer.from(setComputeUnitLimitInstruction(900_000).data as Uint8Array).toString('base64') },
+        // Discriminator 3: `SetComputeUnitPrice`, which is Jupiter's to decide and is kept.
+        { programId: COMPUTE_BUDGET_PROGRAM, accounts: [], data: Buffer.from([3, 0, 0, 0, 0, 0, 0, 0, 0]).toString('base64') },
+      ],
+    });
+
+    const passed = passthroughComputeBudgetInstructions(build);
+
+    expect(passed).toHaveLength(1);
+    expect(passed[0]!.data![0]).toBe(3);
+  });
+
+  it('keeps every compute-budget instruction when none of them is a limit', () => {
+    expect(passthroughComputeBudgetInstructions(buildResponse())).toHaveLength(1);
+  });
+
+  it('emits exactly one SetComputeUnitLimit into the signed message', async () => {
+    simulateTransactionMock.mockResolvedValue({ err: null, unitsConsumed: 250_000, logs: null });
+    const build = buildResponse({
+      computeBudgetInstructions: [
+        { programId: COMPUTE_BUDGET_PROGRAM, accounts: [], data: Buffer.from(setComputeUnitLimitInstruction(900_000).data as Uint8Array).toString('base64') },
+      ],
+    });
+
+    const assembled = await assembleSwapTransaction(build, TAKER);
+    const messageBytes = new Uint8Array(Buffer.from(assembled.messageBase64, 'base64'));
+
+    expect(containsBytes(messageBytes, setComputeUnitLimitInstruction(300_000).data as Uint8Array)).toBe(true);
+    expect(containsBytes(messageBytes, setComputeUnitLimitInstruction(900_000).data as Uint8Array)).toBe(false);
   });
 });
 
