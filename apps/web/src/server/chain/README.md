@@ -3,7 +3,8 @@
 Answers "what did this wallet actually do, on any app, whether or not it went through us".
 Chain transactions in, `trades` rows out. Nothing here signs, quotes, or blocks anything:
 this module observes. The rule *verdict* on what it observes comes from `packages/rules`;
-this module only feeds it and records what came back.
+this module only feeds it and records what came back. The one exception is
+`broadcast-transaction.ts` — the write side of the same RPC, described at the end.
 
 Decisions that outlive this module live in `.ai/`:
 [chain-data-source](../../../../../.ai/decisions/chain-data-source.md),
@@ -58,6 +59,8 @@ POST /api/wallet/reconcile ──> reconcileWallet(correlationId)
 | `ASSET_TIER_MCAP_THRESHOLDS_USD` | the $1B / $100M / $10M bucket boundaries, in one place |
 | `lookupTokenMcaps(mints)` | batched Jupiter Tokens v2 `mcap` read, TTL-cached per mint |
 | `CLASSIFICATION_JUPITER_MCAP_FLAG` | the kill switch classification checks |
+| `broadcastSignedTransaction(base64)` | the one write path to the network — simulates or sends depending on `chain.broadcast`; throws `BroadcastError`, never resolves permissively |
+| `CHAIN_BROADCAST_FLAG` | the kill switch that decides which of the two it does |
 
 ## Invariants a change must not break
 
@@ -162,16 +165,17 @@ wrapped so it can never mask or throw past the original error.
 
 ## Kill switches
 
-Three, at different layers, all seeded by `src/server/db/seed.ts`:
+Four, at different layers, all seeded by `src/server/db/seed.ts`:
 
 | Flag | Off means |
 | ---- | --------- |
 | `chain.helius_reconcile` | the route answers `503` and the status page hides the control — no run starts |
 | `chain.helius` | the client throws — an already-started run fails closed rather than persisting a truncated history |
 | `classification.jupiter_mcap` | no Jupiter call is made and every non-stablecoin mint classifies `MICRO_CAP` + `'unknown'`. Reconciliation still runs and still records trades; tier limits simply see everything as the most conservative tier |
+| `chain.broadcast` | seeded **off**, and the only one on the *write* side: a verified signed transaction is simulated rather than sent (`dryRun: true`). Off is the designed mode until Phase 6, not a degraded one |
 
-Neither deletes anything already reconciled; both stop new reads. A flag lookup that itself
-fails is treated as off.
+None of them deletes anything already reconciled; the first three stop new reads and the
+fourth stops the one write. A flag lookup that itself fails is treated as off.
 
 ## Serving the pre-trade path too
 
@@ -194,3 +198,31 @@ switch exists to turn tier classification off (whose fail-closed answer is `MICR
 flipping it must not silently disable pricing too. Its callers are gated by
 `jupiter.swap_build` instead. Its fail-closed contract is the same — an unresolved mint is
 simply absent from the result, and the caller blocks rather than guessing a decimal scale.
+
+## `broadcast-transaction.ts` — the only way out to the network
+
+The one function in the codebase that can move funds: `broadcastSignedTransaction(base64)`,
+called once by `server/swap/submit-service.ts`.
+
+**The call site is identical in both modes.** With `chain.broadcast` off it *simulates* the
+signed bytes and returns `dryRun: true`; with the flag on it *sends* them and returns the
+network signature. Phase 6's job is therefore to flip a flag row, not to edit code — a send
+path that only comes into existence when someone changes an `if` is a path nothing has ever
+exercised, which is the worst thing to discover with real money in flight.
+
+- **Fail closed in both modes.** A dry run whose simulation reports an error is a *failure*,
+  not a warning — the wallet signed something the chain would reject, and the intent is marked
+  `failed` rather than reported as verified. A send that returns no signature throws for the
+  same reason. There is no outcome where unverified bytes read as submitted.
+- **The dry run keeps the user's own blockhash** (`replaceRecentBlockhash: false`), unlike the
+  compute-unit pass in `assemble-transaction.ts`. Swapping in a fresh one would simulate a
+  transaction that does not exist.
+- **`skipPreflight: false`, `maxRetries: 0`** on the real send: the validator's own simulation
+  stays in front of the broadcast, and the RPC never rebroadcasts on our behalf — an unbounded
+  retry against an external API is forbidden, and a rebroadcast we did not ask for is one the
+  audit trail cannot explain.
+- **`chain.helius` is checked explicitly on the send path**, not inherited from the read
+  wrapper: killing the Helius integration must also stop the one call that spends money.
+- **`HELIUS_RPC_BASE` is repeated here rather than shared.** Deliberate — the write side of the
+  RPC lives in one file, behind one flag, with no shared helper a later refactor could widen.
+  The read-side client has no `sendTransaction` for the same reason.

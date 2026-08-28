@@ -14,7 +14,7 @@ import {
 } from '@solana/kit';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { constitutions } from '../db/schema';
+import { constitutions, events } from '../db/schema';
 import { submitSignedSwap, SubmitRejectedError } from './submit-service';
 
 /**
@@ -183,6 +183,24 @@ function signTransitionReturns(rows: unknown[]): void {
   });
 }
 
+/**
+ * Programs the reads this service makes: the constitution, the intent row, and the
+ * `trade.intent_submitted` event a replay reads the original submit's outcome back from.
+ */
+function selectReturns(intent: unknown[], submittedEvents: unknown[] = []): void {
+  selectMock.mockImplementation((table: unknown) => {
+    if (table === constitutions) return [CONSTITUTION];
+    if (table === events) return submittedEvents;
+
+    return intent;
+  });
+}
+
+/** The event a completed submit recorded — the only record of whether it simulated or sent. */
+function submittedEvent(dryRun: boolean) {
+  return { payload: { intentId: INTENT_ID, dryRun } };
+}
+
 function eventTypes(): string[] {
   return recordEventMock.mock.calls.map(([event]) => (event as { eventType: string }).eventType);
 }
@@ -190,7 +208,7 @@ function eventTypes(): string[] {
 beforeEach(() => {
   vi.clearAllMocks();
   signTransitionReturns([intentRow({ status: 'signed', signature: FIXTURE.signature })]);
-  selectMock.mockImplementation((table: unknown) => (table === constitutions ? [CONSTITUTION] : [intentRow()]));
+  selectReturns([intentRow()]);
   recordEventMock.mockResolvedValue(undefined);
   broadcastMock.mockResolvedValue({ dryRun: true, networkSignature: null, logs: [] });
   loadWindowedTradesMock.mockResolvedValue([]);
@@ -315,13 +333,11 @@ describe('submitSignedSwap idempotency', () => {
     updateMock.mockClear();
     broadcastMock.mockClear();
     signTransitionReturns([]);
-    selectMock.mockImplementation((table: unknown) =>
-      table === constitutions ? [CONSTITUTION] : [intentRow({ status: 'submitted', signature: FIXTURE.signature })],
-    );
+    selectReturns([intentRow({ status: 'submitted', signature: FIXTURE.signature })], [submittedEvent(true)]);
 
     const second = await submitSignedSwap(submitParams());
 
-    expect(second).toEqual({ intentId: INTENT_ID, status: 'submitted', signature: FIXTURE.signature, dryRun: false, replayed: true });
+    expect(second).toEqual({ intentId: INTENT_ID, status: 'submitted', signature: FIXTURE.signature, dryRun: true, replayed: true });
     expect(eventTypes()).toEqual([]);
     expect(updateMock).toHaveBeenCalledTimes(1);
     expect(broadcastMock).not.toHaveBeenCalled();
@@ -329,12 +345,37 @@ describe('submitSignedSwap idempotency', () => {
 
   it.each(['signed', 'submitted', 'confirmed'])('treats a replay against an already-%s intent as a no-op', async (status) => {
     signTransitionReturns([]);
-    selectMock.mockImplementation((table: unknown) => (table === constitutions ? [CONSTITUTION] : [intentRow({ status, signature: FIXTURE.signature })]));
+    selectReturns([intentRow({ status, signature: FIXTURE.signature })], [submittedEvent(true)]);
 
     const result = await submitSignedSwap(submitParams());
 
     expect(result).toMatchObject({ status, replayed: true, signature: FIXTURE.signature });
     expect(eventTypes()).toEqual([]);
+  });
+
+  it('reports what the original submit did, not what the broadcast flag says now', async () => {
+    signTransitionReturns([]);
+    // `chain.broadcast` is on today — the state Phase 6 leaves behind — while the submit being
+    // replayed was recorded as a real send. Re-reading the flag happens to agree here; the point
+    // is that the answer comes from the event, so it stays right when the flag moves.
+    isFeatureEnabledMock.mockResolvedValue(true);
+    selectReturns([intentRow({ status: 'submitted', signature: FIXTURE.signature })], [submittedEvent(false)]);
+
+    await expect(submitSignedSwap(submitParams())).resolves.toMatchObject({ dryRun: false, replayed: true });
+
+    // And the inverse: a dry run replayed while the flag is on must not read as broadcast.
+    selectReturns([intentRow({ status: 'submitted', signature: FIXTURE.signature })], [submittedEvent(true)]);
+
+    await expect(submitSignedSwap(submitParams())).resolves.toMatchObject({ dryRun: true, replayed: true });
+  });
+
+  it('reports an unknown outcome rather than guessing when no completed submit was recorded', async () => {
+    signTransitionReturns([]);
+    // A concurrent submit still mid-broadcast: the row is `signed`, and nothing has been
+    // recorded yet about whether it simulated or sent.
+    selectReturns([intentRow({ status: 'signed', signature: FIXTURE.signature })], []);
+
+    await expect(submitSignedSwap(submitParams())).resolves.toMatchObject({ dryRun: null, replayed: true });
   });
 
   it('does not re-record a submit that another caller completed while this one was verifying', async () => {

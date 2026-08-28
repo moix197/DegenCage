@@ -83,8 +83,12 @@ interface SubmitResponse {
   intentId: string;
   status: string;
   signature: string;
-  /** True while `chain.broadcast` is off: the signed transaction was verified by simulation, not sent. */
-  dryRun: boolean;
+  /**
+   * True while `chain.broadcast` is off: the signed transaction was verified by simulation, not
+   * sent. `null` on a replay whose original submit has not recorded an outcome yet — unknown,
+   * which is neither of the two.
+   */
+  dryRun: boolean | null;
   replayed: boolean;
   correlationId: string;
 }
@@ -193,20 +197,38 @@ function QuoteDetails({ result }: { result: QuoteResponse }) {
 }
 
 /**
- * What happened after the user signed. `dryRun` is not a detail to hide: while
- * `chain.broadcast` is off the transaction was verified against the network and deliberately
- * *not* sent, and telling the user it traded would be a lie.
+ * `dryRun` is not a detail to hide: while `chain.broadcast` is off the transaction was verified
+ * against the network and deliberately *not* sent, and telling the user it traded would be a
+ * lie. An unknown outcome gets its own wording for the same reason — guessing either way is
+ * that same lie in one of its two directions.
  */
+const OUTCOME_COPY = {
+  dry_run: {
+    title: 'Verified — not broadcast',
+    body: 'Your signature was checked against the transaction we approved and simulated on chain. Broadcasting is switched off, so no funds moved.',
+  },
+  broadcast: { title: 'Submitted', body: 'Your signed transaction was broadcast.' },
+  unknown: {
+    title: 'Already submitted',
+    body: 'This submission was already handled and its outcome is still being recorded. Check the dashboard for the result.',
+  },
+} as const;
+
+function outcomeCopyFor(dryRun: boolean | null) {
+  if (dryRun === null) return OUTCOME_COPY.unknown;
+
+  return dryRun ? OUTCOME_COPY.dry_run : OUTCOME_COPY.broadcast;
+}
+
+/** What happened after the user signed. */
 function SubmitOutcome({ outcome }: { outcome: SubmitResponse }) {
+  const copy = outcomeCopyFor(outcome.dryRun);
+
   return (
     <Alert>
-      <AlertTitle>{outcome.dryRun ? 'Verified — not broadcast' : 'Submitted'}</AlertTitle>
+      <AlertTitle>{copy.title}</AlertTitle>
       <AlertDescription>
-        <p>
-          {outcome.dryRun
-            ? 'Your signature was checked against the transaction we approved and simulated on chain. Broadcasting is switched off, so no funds moved.'
-            : 'Your signed transaction was broadcast.'}
-        </p>
+        <p>{copy.body}</p>
         <p>Signature: {outcome.signature}</p>
         {outcome.replayed ? <p>This submission had already been processed — nothing was done twice.</p> : null}
       </AlertDescription>

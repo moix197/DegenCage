@@ -5,10 +5,10 @@ import { and, eq, gt, inArray, sql } from 'drizzle-orm';
 import { getBase58Decoder, getCompiledTransactionMessageDecoder, getTransactionDecoder, type Address } from '@solana/kit';
 
 import { recordEvent } from '../../observability/events';
-import { broadcastSignedTransaction, CHAIN_BROADCAST_FLAG, type BroadcastResult } from '../chain/broadcast-transaction';
+import { broadcastSignedTransaction, type BroadcastResult } from '../chain/broadcast-transaction';
 import { LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
 import { getDb } from '../db/client';
-import { constitutions, tradeIntents, type TradeIntentRow, type TradeIntentStatus } from '../db/schema';
+import { constitutions, events, tradeIntents, type TradeIntentRow, type TradeIntentStatus } from '../db/schema';
 import { isFeatureEnabled } from '../flags/feature-flags';
 import { loadWindowedTrades } from '../rules/rolling-allowance';
 import { foldVerdict } from './quote-service';
@@ -51,6 +51,9 @@ const SIGNABLE_STATUSES = ['quoted', 'approved'] as const satisfies readonly Tra
 
 /** Statuses that mean this intent's submit already succeeded once — the idempotent-replay set. */
 const ALREADY_SUBMITTED_STATUSES: readonly TradeIntentStatus[] = ['signed', 'submitted', 'confirmed'];
+
+/** Written on a completed submit and read back on a replay — one constant so the two cannot drift apart. */
+const SUBMITTED_EVENT_TYPE = 'trade.intent_submitted';
 
 /** Same fallback window as `quote-service.ts` — enough history for any limit the constitution carries. */
 const DEFAULT_WINDOW_HOURS = 24;
@@ -95,8 +98,12 @@ export interface SubmitResult {
   status: TradeIntentStatus;
   /** The transaction signature, base58 — recorded before anything is broadcast. */
   signature: string;
-  /** `true` when `chain.broadcast` was off and the bytes were verified by simulation instead of sent. */
-  dryRun: boolean;
+  /**
+   * `true` when the bytes were verified by simulation instead of sent — what *this intent's*
+   * submit actually did, never what `chain.broadcast` happens to say now. `null` only on a
+   * replay of a submit that has not recorded an outcome yet (see `loadOriginalSubmitDryRun`).
+   */
+  dryRun: boolean | null;
   /** `true` when this call found the work already done and changed nothing (no events recorded). */
   replayed: boolean;
 }
@@ -200,6 +207,34 @@ async function recordFailure(params: SubmitRequestParams, reason: SubmitRejectio
 }
 
 /**
+ * What the *original* submit did, read back from the event it recorded rather than from
+ * `chain.broadcast` as it stands now.
+ *
+ * The flag is a fact about the present, not about the submit being replayed. Once Phase 6
+ * turns it on, re-reading it here would answer the replay of a genuinely broadcast trade with
+ * "verified, not broadcast" — telling a user no funds moved when they did. The audit trail is
+ * the only record of which of the two actually happened, so it is the one that answers.
+ *
+ * `null` is a third answer, not a dry run: no completed submit has been recorded for this
+ * intent yet, which is what a concurrent submit still mid-broadcast looks like from here.
+ *
+ * Keyed on `userId` first so the existing `events_user_id_event_type_occurred_at_idx` covers
+ * the lookup, with the intent id matched in SQL — the same shape as `admin/login-rate-limit.ts`'s
+ * payload predicate, not a scan filtered in JS.
+ */
+async function loadOriginalSubmitDryRun(params: SubmitRequestParams): Promise<boolean | null> {
+  const rows = await getDb()
+    .select({ payload: events.payload })
+    .from(events)
+    .where(and(eq(events.userId, params.userId), eq(events.eventType, SUBMITTED_EVENT_TYPE), sql`${events.payload}->>'intentId' = ${params.intentId}`))
+    .limit(1);
+
+  const recorded = rows[0]?.payload.dryRun;
+
+  return typeof recorded === 'boolean' ? recorded : null;
+}
+
+/**
  * Why did the guarded `UPDATE` match nothing?
  *
  * The distinction matters more than it looks. An intent already `signed`/`submitted`/
@@ -231,7 +266,7 @@ async function resolveZeroRowOutcome(params: SubmitRequestParams, presented: Pre
       intentId: intent.id,
       status: intent.status,
       signature: intent.signature ?? presented.signature,
-      dryRun: !(await isFeatureEnabled(CHAIN_BROADCAST_FLAG)),
+      dryRun: await loadOriginalSubmitDryRun(params),
       replayed: true,
     };
   }
@@ -366,7 +401,7 @@ export async function submitSignedSwap(params: SubmitRequestParams): Promise<Sub
   }
 
   await recordEvent({
-    eventType: 'trade.intent_submitted',
+    eventType: SUBMITTED_EVENT_TYPE,
     occurredAt: new Date(),
     correlationId: params.correlationId,
     userId: params.userId,
