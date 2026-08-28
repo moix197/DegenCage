@@ -9,7 +9,7 @@ import { getDb } from '@/server/db/client';
 import { trades, type TokenClassificationQuality } from '@/server/db/schema';
 import { buildDashboardState, loadReconciliationState } from '@/server/dashboard/dashboard-state';
 import { FEEDBACK_CAPTURE_FLAG } from '@/server/feedback/feedback';
-import { DASHBOARD_DISCIPLINE_VIEW_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
+import { DASHBOARD_DISCIPLINE_VIEW_FLAG, TRADE_TERMINAL_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
 import { captureError } from '@/observability/error-tracking';
 import { recordEvent } from '@/observability/events';
 import { DashboardPanel } from './dashboard-panel';
@@ -103,12 +103,13 @@ function formatUsd(usdValue: string | null): string {
  * `daily_notional_usd` limit all render an explicit state — never a false "$0 spent today".
  */
 export default async function DashboardPage() {
-  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled, feedbackCaptureEnabled] = await Promise.all([
+  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled, feedbackCaptureEnabled, tradeTerminalEnabled] = await Promise.all([
     resolveSession(),
     isFeatureEnabled(DASHBOARD_DISCIPLINE_VIEW_FLAG),
     isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG),
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
     isFeatureEnabled(FEEDBACK_CAPTURE_FLAG),
+    isFeatureEnabled(TRADE_TERMINAL_FLAG),
   ]);
 
   if (!dashboardEnabled || !reconcileEnabled) {
@@ -181,10 +182,14 @@ export default async function DashboardPage() {
     <main className="mx-auto flex max-w-3xl flex-col gap-6">
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
 
-      {/* The dashboard stays read-only (decision 5); enforcement lives on `/trade`. */}
-      <p>
-        <a href="/trade">Trade through DegenCage →</a>
-      </p>
+      {/* The dashboard stays read-only (decision 5); enforcement lives on `/trade`. Gated on
+          the same `TRADE_TERMINAL_FLAG` that route itself checks, so the dashboard never
+          advertises a route the user cannot reach. */}
+      {tradeTerminalEnabled ? (
+        <p>
+          <a href="/trade">Trade through DegenCage →</a>
+        </p>
+      ) : null}
 
       <DashboardPanel initial={initial} />
 

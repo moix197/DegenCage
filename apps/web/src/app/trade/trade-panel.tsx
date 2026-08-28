@@ -224,6 +224,24 @@ function outcomeCopyFor(dryRun: boolean | null) {
 const STATUS_POLL_INTERVAL_MS = 15_000;
 
 /**
+ * Reports a failed status poll without pulling `@sentry/nextjs`'s browser SDK into this page's
+ * initial bundle — same lazy-import gate as `dashboard-panel.tsx`'s `reportRefreshFailure`
+ * (`.ai/decisions/observability-stack.md`). The `.catch` matters here for the same reason: a
+ * poll typically fails because the network is down, which is exactly when this dynamic
+ * `import()` also fails to load, so `console.error` is the fallback that keeps the original
+ * error from being swallowed (CLAUDE.md's no-silent-failures rule).
+ */
+function reportStatusPollFailure(error: unknown): void {
+  import('@/observability/error-tracking')
+    .then(({ captureError }) => {
+      captureError(error, { component: 'trade-panel', route: '/api/swap/intent/[id]' });
+    })
+    .catch((importError: unknown) => {
+      console.error('trade-panel: failed to load error-tracking module', importError, error);
+    });
+}
+
+/**
  * Statuses reconciliation can no longer move off. Polling stops here: anything else would keep
  * a timer alive forever for an intent whose story is already over.
  */
@@ -252,7 +270,7 @@ const STATUS_COPY: Record<string, string> = {
 };
 
 /** What happened after the user signed. */
-function SubmitOutcome({ outcome, liveStatus }: { outcome: SubmitResponse; liveStatus: string | null }) {
+function SubmitOutcome({ outcome, liveStatus, statusPollFailed }: { outcome: SubmitResponse; liveStatus: string | null; statusPollFailed: boolean }) {
   const copy = outcomeCopyFor(outcome.dryRun);
   const statusLine = liveStatus ? STATUS_COPY[liveStatus] : null;
 
@@ -264,6 +282,10 @@ function SubmitOutcome({ outcome, liveStatus }: { outcome: SubmitResponse; liveS
         <p>Signature: {outcome.signature}</p>
         {outcome.replayed ? <p>This submission had already been processed — nothing was done twice.</p> : null}
         {statusLine ? <p>{statusLine}</p> : null}
+        {/* Minimal, non-alarming: the trade already succeeded or is pending regardless of
+            whether we can currently re-check it — this only says the status check itself is
+            having trouble, not that anything is wrong with the trade. */}
+        {statusPollFailed ? <p className="text-sm text-muted-foreground">Could not refresh this status just now — still watching, will keep trying.</p> : null}
       </AlertDescription>
     </Alert>
   );
@@ -281,6 +303,7 @@ export function TradePanel() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [accountSwitchNotice, setAccountSwitchNotice] = useState(false);
   const [intentStatus, setIntentStatus] = useState<string | null>(null);
+  const [statusPollFailed, setStatusPollFailed] = useState(false);
   const { capability, isSigning, error: signingError, sign, connectedAddress } = useSwapSigning();
 
   /**
@@ -302,6 +325,7 @@ export function TradePanel() {
       setError(null);
       setSubmitOutcome(null);
       setIntentStatus(null);
+      setStatusPollFailed(false);
       setSubmitError(null);
       setAccountSwitchNotice(true);
     }
@@ -310,8 +334,11 @@ export function TradePanel() {
   /**
    * Reconciliation (Phase 5) is what actually resolves a submitted intent, and it runs on its
    * own Helius-driven schedule — so the terminal polls rather than being told. Stops as soon as
-   * the intent reaches a status reconciliation can no longer move it off, and a failed poll is
-   * left to the next tick: a stale status line is not worth surfacing an error over.
+   * the intent reaches a status reconciliation can no longer move it off. A failed tick is left
+   * for the next one to retry (no backoff scheme here), but it is never silent: it is reported
+   * via `reportStatusPollFailure` and surfaced as a minimal, non-alarming note next to the last
+   * known status (CLAUDE.md's no-silent-failures rule) — cleared again the moment a tick
+   * succeeds.
    */
   const polledIntentId = submitOutcome?.intentId ?? null;
 
@@ -351,15 +378,23 @@ export function TradePanel() {
       try {
         const response = await fetch(`/api/swap/intent/${polledIntentId}`);
 
-        if (!response.ok) return;
+        if (!response.ok) {
+          if (!cancelled) setStatusPollFailed(true);
+          reportStatusPollFailure(new Error(`intent status poll failed with status ${response.status}`));
+          return;
+        }
 
         const body = (await response.json()) as { status?: string };
 
         if (!cancelled && typeof body.status === 'string') {
           setIntentStatus(body.status);
+          setStatusPollFailed(false);
         }
-      } catch {
-        // Next tick will try again.
+      } catch (error) {
+        // Next tick will try again — no backoff here — but the failure itself must still be
+        // visible rather than silently swallowed.
+        if (!cancelled) setStatusPollFailed(true);
+        reportStatusPollFailure(error);
       } finally {
         inFlight = false;
       }
@@ -389,6 +424,7 @@ export function TradePanel() {
     // describe the quote currently in hand, never a previous one.
     setSubmitOutcome(null);
     setIntentStatus(null);
+    setStatusPollFailed(false);
     setSubmitError(null);
     setAccountSwitchNotice(false);
 
@@ -472,6 +508,7 @@ export function TradePanel() {
     setSubmitError(null);
     setSubmitOutcome(null);
     setIntentStatus(null);
+    setStatusPollFailed(false);
 
     // A refused signature is already described by the hook's own `error`; adding a second
     // message here would say the same thing twice.
@@ -560,7 +597,7 @@ export function TradePanel() {
         </Alert>
       ) : null}
 
-      {submitOutcome ? <SubmitOutcome outcome={submitOutcome} liveStatus={intentStatus} /> : null}
+      {submitOutcome ? <SubmitOutcome outcome={submitOutcome} liveStatus={intentStatus} statusPollFailed={statusPollFailed} /> : null}
 
       {/* Disabled is a courtesy; `/api/swap/submit` refuses a blocked or expired intent
           regardless of what this button allows. */}
