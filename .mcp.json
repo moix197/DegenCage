@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jupiter": {
+      "type": "http",
+      "url": "https://developers.jup.ag/docs/mcp"
+    }
+  }
+}
