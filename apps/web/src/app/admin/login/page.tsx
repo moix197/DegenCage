@@ -10,22 +10,19 @@ export default async function AdminLoginPage({ searchParams }: { searchParams: P
   const params = await searchParams;
 
   return (
-    <main style={{ maxWidth: '24rem', margin: '4rem auto', display: 'flex', flexDirection: 'column', gap: '1rem', padding: '1.5rem' }}>
-      <h1 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Admin sign-in</h1>
-      {params.error ? <p style={{ color: 'crimson', fontSize: '0.9rem' }}>Wrong secret.</p> : null}
-      <form method="POST" action="/api/admin/login" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+    <main className="mx-auto my-16 flex max-w-sm flex-col gap-4">
+      <h1 className="text-[1.1rem] font-semibold">Admin sign-in</h1>
+      {params.error ? <p className="text-[0.9rem] text-destructive">Wrong secret.</p> : null}
+      <form method="POST" action="/api/admin/login" className="flex flex-col gap-3">
         <input
           type="password"
           name="secret"
           placeholder="Shared secret"
           required
           autoFocus
-          style={{ padding: '0.5rem', border: '1px solid #ccc', borderRadius: '4px' }}
+          className="rounded border border-input bg-background p-2 text-foreground"
         />
-        <button
-          type="submit"
-          style={{ padding: '0.5rem', border: 'none', borderRadius: '4px', background: '#111', color: '#fff', cursor: 'pointer' }}
-        >
+        <button type="submit" className="cursor-pointer rounded bg-primary p-2 text-primary-foreground">
           Continue
         </button>
       </form>
