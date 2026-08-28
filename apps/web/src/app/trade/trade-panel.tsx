@@ -335,7 +335,14 @@ export function TradePanel() {
     async function poll(): Promise<void> {
       const status = intentStatusRef.current;
 
-      if (inFlight || (status !== null && TERMINAL_INTENT_STATUSES.has(status))) {
+      if (status !== null && TERMINAL_INTENT_STATUSES.has(status)) {
+        // A terminal status can only be observed after a previous tick's response — nothing
+        // left to reconcile, so stop ticking instead of polling forever.
+        clearInterval(id);
+        return;
+      }
+
+      if (inFlight) {
         return;
       }
 
@@ -358,12 +365,14 @@ export function TradePanel() {
       }
     }
 
+    // `id` must exist before `poll` can reference it (the terminal-status branch above calls
+    // clearInterval(id)), so the interval is created before the immediate first call below.
     // Fires once immediately, per intent — a just-submitted intent should never sit on a stale
     // status for a full interval before its first real check — then continues on the same
     // cadence for as long as this same intent is being polled, regardless of how many status
     // transitions it goes through before reaching a terminal one.
-    void poll();
     const id = setInterval(() => void poll(), STATUS_POLL_INTERVAL_MS);
+    void poll();
 
     return () => {
       cancelled = true;
