@@ -16,7 +16,7 @@ import {
   type StoredSession,
 } from './session';
 
-const { selectMock, updateMock, insertMock, cookieGetMock, recordEventMock, captureErrorMock } =
+const { selectMock, updateMock, insertMock, cookieGetMock, recordEventMock, captureErrorMock, expireAllLiveIntentsForWalletMock } =
   vi.hoisted(() => ({
     selectMock: vi.fn(),
     updateMock: vi.fn(),
@@ -24,6 +24,7 @@ const { selectMock, updateMock, insertMock, cookieGetMock, recordEventMock, capt
     cookieGetMock: vi.fn(),
     recordEventMock: vi.fn(),
     captureErrorMock: vi.fn(),
+    expireAllLiveIntentsForWalletMock: vi.fn(),
   }));
 
 vi.mock('../db/client', () => ({
@@ -32,6 +33,11 @@ vi.mock('../db/client', () => ({
 vi.mock('next/headers', () => ({ cookies: async () => ({ get: cookieGetMock }) }));
 vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
 vi.mock('../../observability/error-tracking', () => ({ captureError: captureErrorMock }));
+// Phase 4: account-switch intent expiry is a whole other module's concern
+// (`server/swap/intent-lifecycle.ts`), tested on its own in `intent-lifecycle.test.ts` — this
+// file only asserts that `revokeSessionByIdHash` calls it with the right wallet, at the right
+// choke point, when (and only when) `reason === 'account_switch'`.
+vi.mock('../swap/intent-lifecycle', () => ({ expireAllLiveIntentsForWallet: expireAllLiveIntentsForWalletMock }));
 
 const SESSION_ID = 'opaque-session-id';
 const WALLET_ADDRESS = 'So11111111111111111111111111111111111111112';
@@ -123,6 +129,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   cookieGetMock.mockReturnValue(undefined);
   captureUpdate();
+  // No live intent to expire by default — the account-switch cases below override this.
+  expireAllLiveIntentsForWalletMock.mockResolvedValue([]);
 });
 
 describe('buildSessionCookie', () => {
@@ -383,6 +391,48 @@ describe('revokeSession', () => {
   });
 
   /**
+   * Phase 4: the client-watcher's revoke (`app/api/auth/verify/route.ts`'s `DELETE` handler)
+   * is one of the two choke points a real account switch reaches — the other is
+   * `supersedePreviousSession`, tested below. Both must expire every live intent for the
+   * *old* wallet, not just the ones that happened to time out, and both must write
+   * `trade.intent_expired` for each one so the reservation's release is on the audit trail.
+   */
+  it('expires the old wallet’s live intents and records one event per intent on an account switch', async () => {
+    cookieGetMock.mockReturnValue({ value: SESSION_ID });
+    captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+    expireAllLiveIntentsForWalletMock.mockResolvedValue(['intent-1', 'intent-2']);
+
+    await revokeSession('trade-intent-3b', 'account_switch', undefined, 'wallet-1', 'user-1');
+
+    expect(expireAllLiveIntentsForWalletMock).toHaveBeenCalledWith('wallet-1', expect.anything());
+    const expiredEvents = recordEventMock.mock.calls.map((call) => call[0]).filter((event) => (event as { eventType: string }).eventType === 'trade.intent_expired');
+    expect(expiredEvents).toMatchObject([
+      { correlationId: 'trade-intent-3b', userId: 'user-1', payload: { intentId: 'intent-1', walletId: 'wallet-1', reason: 'account_switch' } },
+      { correlationId: 'trade-intent-3b', userId: 'user-1', payload: { intentId: 'intent-2', walletId: 'wallet-1', reason: 'account_switch' } },
+    ]);
+  });
+
+  /** No `walletId` passed (the pre-Phase-4 call shape) must not attempt the expiry at all. */
+  it('does not touch trade intents when no walletId is known for the switch', async () => {
+    cookieGetMock.mockReturnValue({ value: SESSION_ID });
+    captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+
+    await revokeSession('trade-intent-3c', 'account_switch');
+
+    expect(expireAllLiveIntentsForWalletMock).not.toHaveBeenCalled();
+  });
+
+  /** A revoke for any other reason must never touch trade intents, even with a walletId in hand. */
+  it('never expires trade intents for a plain logout', async () => {
+    cookieGetMock.mockReturnValue({ value: SESSION_ID });
+    captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+
+    await revokeSession('trade-intent-3d', 'client_request', undefined, 'wallet-1', 'user-1');
+
+    expect(expireAllLiveIntentsForWalletMock).not.toHaveBeenCalled();
+  });
+
+  /**
    * A sign-out that did not happen must not be reportable as one. Swallowing this is how
    * the caller ends up answering 200 over a session row that still resolves — the user is
    * told they are signed out while their old identity is still live.
@@ -545,5 +595,40 @@ describe('supersedePreviousSession', () => {
     expect(bound).toContain(PREVIOUS_ID_HASH);
     expect(bound).not.toContain(OTHER_ADDRESS);
     expect(bound).not.toContain(WALLET_ADDRESS);
+  });
+
+  /**
+   * Phase 4's other choke point: a real switch caught server-side, by a sign-in proving a
+   * different address, must expire the *old* wallet's live intents exactly as the
+   * client-watcher's `revokeSession` does — using `previous.walletId`, which this call site
+   * already has, no lookup needed.
+   */
+  it('expires the old wallet’s live intents through the same executor on a real switch', async () => {
+    captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+    expireAllLiveIntentsForWalletMock.mockResolvedValue(['intent-9']);
+    const executor = pooledExecutor();
+
+    await supersedePreviousSession(executor as never, previousSession(WALLET_ADDRESS), OTHER_ADDRESS, 'trade-intent-13');
+
+    expect(expireAllLiveIntentsForWalletMock).toHaveBeenCalledWith('wallet-1', executor);
+    expect(recordEventMock.mock.calls.map((call) => call[0])).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          eventType: 'trade.intent_expired',
+          correlationId: 'trade-intent-13',
+          userId: 'user-1',
+          payload: { intentId: 'intent-9', walletId: 'wallet-1', reason: 'account_switch' },
+        }),
+      ]),
+    );
+  });
+
+  /** Signing in again as the *same* wallet is a supersede, not a switch — nothing to expire. */
+  it('does not expire trade intents when the same wallet signs in again', async () => {
+    captureUpdate([{ walletAddress: WALLET_ADDRESS }]);
+
+    await supersedePreviousSession(pooledExecutor() as never, previousSession(WALLET_ADDRESS), WALLET_ADDRESS, 'trade-intent-14');
+
+    expect(expireAllLiveIntentsForWalletMock).not.toHaveBeenCalled();
   });
 });

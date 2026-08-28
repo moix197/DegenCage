@@ -145,3 +145,62 @@ describe('priceTrade', () => {
     });
   });
 });
+
+/**
+ * The pre-trade gate names its leg rather than letting liquidity order pick one: a ceiling
+ * limit must be denominated in the sold leg (fixed by an exact-in swap), a floor limit in the
+ * bought leg's guaranteed minimum. See `.ai/decisions/pre-trade-slippage-pricing.md`.
+ */
+describe('priceTrade explicit leg selection', () => {
+  it('prices the named sold leg even when the bought leg is the stable, "easier" one', async () => {
+    getSolUsdPriceMock.mockResolvedValue('150');
+
+    const result = await priceTrade(
+      trade({
+        leg: 'sold',
+        soldMint: SOL_MINT,
+        soldAmountBaseUnits: '1000000000',
+        soldDecimals: 9,
+        boughtMint: USDC_MINT,
+        boughtAmountBaseUnits: '142500000',
+        boughtDecimals: 6,
+      }),
+    );
+
+    // 1 SOL at $150 — not the $142.50 guaranteed minimum the slippage moved.
+    expect(result).toEqual({ usdValue: '150.000000000', priceSource: 'binance' });
+  });
+
+  it('prices the named bought leg even when the sold leg is the stable one', async () => {
+    const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+    const result = await priceTrade(
+      trade({
+        leg: 'bought',
+        soldMint: USDC_MINT,
+        soldAmountBaseUnits: '150000000',
+        soldDecimals: 6,
+        boughtMint: USDT_MINT,
+        boughtAmountBaseUnits: '142500000',
+        boughtDecimals: 6,
+      }),
+    );
+
+    // The floor direction: worst-case proceeds, which maximise an estimated loss.
+    expect(result).toEqual({ usdValue: '142.500000', priceSource: 'stablecoin' });
+  });
+
+  it('returns null rather than falling back to the other leg when the named one is unpriceable', async () => {
+    getBirdeyeUsdPriceMock.mockResolvedValue(null);
+
+    const result = await priceTrade(trade({ leg: 'sold', soldMint: ALT_MINT, boughtMint: USDC_MINT, boughtDecimals: 6 }));
+
+    expect(result).toEqual({ usdValue: null, priceSource: null });
+    expect(getBirdeyeUsdPriceMock).toHaveBeenCalledWith(ALT_MINT, expect.any(Date));
+  });
+
+  it('leaves the inferred order alone when no leg is named — reconciliation is unchanged', async () => {
+    const result = await priceTrade(trade({ soldMint: ALT_MINT, boughtMint: USDC_MINT, boughtAmountBaseUnits: '7000000', boughtDecimals: 6 }));
+
+    expect(result).toEqual({ usdValue: '7.000000', priceSource: 'stablecoin' });
+  });
+});

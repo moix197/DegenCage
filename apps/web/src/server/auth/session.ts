@@ -8,6 +8,7 @@ import { recordEvent, type DatabaseExecutor } from '../../observability/events';
 import { logger } from '../../observability/logger';
 import { getDb } from '../db/client';
 import { sessions, users, wallets } from '../db/schema';
+import { expireAllLiveIntentsForWallet } from '../swap/intent-lifecycle';
 
 /**
  * Session issuance and, more importantly, `resolveSession` — the **only** legitimate
@@ -311,6 +312,43 @@ export function parseRevocationReason(value: string | null | undefined): Session
 }
 
 /**
+ * The account-switch half of session revocation (Phase 4): the wallet's quote-slot intent
+ * (`quoted`/`approved`) dies with the session, unconditionally — not just the ones that
+ * happened to have timed out. An unsigned quote must never outlive the wallet it was quoted
+ * against.
+ *
+ * A `signed`/`submitted` intent is deliberately left alone: it already left the building
+ * before the switch, and its reservation must keep holding allowance against the *old* wallet
+ * until Phase 5 reconciliation resolves it — expiring it here would free that allowance while
+ * the broadcast trade is still outstanding.
+ *
+ * Only ever called with a real `walletId` from `revokeSessionByIdHash`, below, and only when
+ * `reason === 'account_switch'` — never for an ordinary logout or supersede-by-same-wallet,
+ * which have nothing to invalidate.
+ */
+async function expireLiveIntentsForSwitchedWallet(
+  executor: DatabaseExecutor,
+  correlationId: string,
+  userId: string | null,
+  walletId: string,
+): Promise<void> {
+  const expiredIds = await expireAllLiveIntentsForWallet(walletId, executor);
+
+  for (const intentId of expiredIds) {
+    await recordEvent(
+      {
+        eventType: 'trade.intent_expired',
+        occurredAt: new Date(),
+        correlationId,
+        userId,
+        payload: { intentId, walletId, reason: 'account_switch' },
+      },
+      executor,
+    );
+  }
+}
+
+/**
  * Revokes one session by its key at rest, through whichever executor the caller is in.
  *
  * `WHERE revoked_at IS NULL` keeps it idempotent: a second revoke of the same row matches
@@ -318,6 +356,12 @@ export function parseRevocationReason(value: string | null | undefined): Session
  *
  * @param executor - Pass an open transaction to make the revoke atomic with whatever
  *   replaces the session; defaults to the pooled client for a standalone revoke.
+ * @param walletId - The wallet the dying session was bound to, when the caller already has
+ *   it (`supersedePreviousSession` does, from `previous.walletId`; the client-watcher's
+ *   `revokeSession` is handed it by the route that already resolved it for
+ *   `auth.wallet_account_switched`). `null` skips the account-switch intent expiry below
+ *   rather than looking the wallet up — this function must not gain a new query path that a
+ *   test mocking only `sessions` cannot see coming.
  * @returns Whether this call was the one that killed it.
  */
 async function revokeSessionByIdHash(
@@ -326,6 +370,7 @@ async function revokeSessionByIdHash(
   correlationId: string,
   reason: SessionRevocationReason,
   userId: string | null = null,
+  walletId: string | null = null,
 ): Promise<boolean> {
   const revoked = await executor
     .update(sessions)
@@ -352,6 +397,10 @@ async function revokeSessionByIdHash(
     executor,
   );
 
+  if (reason === 'account_switch' && walletId) {
+    await expireLiveIntentsForSwitchedWallet(executor, correlationId, userId, walletId);
+  }
+
   return true;
 }
 
@@ -363,11 +412,18 @@ async function revokeSessionByIdHash(
  * Which session dies is decided by the cookie alone. A throw here is *not* swallowed: the
  * caller must translate it into a failed response rather than report a sign-out that did
  * not happen.
+ *
+ * @param walletId - The wallet this session was bound to, when the caller already resolved it
+ *   (`app/api/auth/verify/route.ts`'s `DELETE` handler, for `reason: 'account_switch'`) — see
+ *   `revokeSessionByIdHash`'s doc for why this is threaded through rather than looked up here.
+ * @param userId - Same shape, for the `trade.intent_expired` events the switch may write.
  */
 export async function revokeSession(
   correlationId: string,
   reason: SessionRevocationReason,
   sessionId: string | undefined = undefined,
+  walletId: string | null = null,
+  userId: string | null = null,
 ): Promise<void> {
   const id = sessionId ?? (await readSessionCookie());
 
@@ -375,7 +431,7 @@ export async function revokeSession(
     return;
   }
 
-  await revokeSessionByIdHash(getDb(), hashSessionId(id), correlationId, reason);
+  await revokeSessionByIdHash(getDb(), hashSessionId(id), correlationId, reason, userId, walletId);
 }
 
 /**
@@ -436,6 +492,7 @@ export async function supersedePreviousSession(
     correlationId,
     switched ? 'account_switch' : 'superseded_by_sign_in',
     previous.userId,
+    previous.walletId,
   );
 
   if (!revoked) {

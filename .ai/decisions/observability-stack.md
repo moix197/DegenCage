@@ -53,6 +53,26 @@ standing rule we knowingly violate.
   ([monorepo-package-shape](monorepo-package-shape.md)).
 - **Every rule decision writes an event, including allows.** A log of only blocks cannot
   compute a rules-followed percentage.
+- **Two rule-decision event types, deliberately not merged.** `rule.decision_recorded` is
+  reconciliation's *retrospective* verdict on a trade that already happened;
+  `rule.pre_trade_decision` is the pre-signature verdict that decided whether a trade happens
+  at all. Same engine, opposite standing — one is a report, the other is an enforcement action
+  — and the discipline metrics have to distinguish "we saw that afterwards" from "we stopped
+  it". Folding them into one type behind a `stage` field would bury that distinction in a
+  payload nothing can index on.
+- **A rule evaluation emits `rule.pre_trade_decision` even when transaction assembly then
+  fails**, with `intentId: null` and `assemblyFailed: true`. No `trade_intents` row is written
+  in that case — nothing was assembled, so there is nothing signable to point at — but the
+  decision *was* reached, and the audit trail must never lose a decision that was actually
+  made. Before this, an `allow` that died in assembly survived only as a Sentry capture.
+- **The intent-keyed family is one trade attempt's audit trail**, correlated by the
+  trade-intent id: `trade.intent_created`, `rule.pre_trade_decision`, `trade.intent_signed`,
+  `trade.intent_submitted`, `trade.intent_confirmed`, `trade.intent_failed`,
+  `trade.intent_expired`, plus `trade.intent_poll_resolve_attempted` /
+  `trade.intent_poll_resolve_timed_out` from the status-poll route. Unlike the two decision
+  types, `trade.intent_failed` genuinely *is* one fact reached from several places
+  (submit-time verification, reconciliation, the blockhash-expiry sweep) and carries
+  `payload.stage` to separate them.
 - Events carry both `occurred_at` and `observed_at`
   ([event-time-vs-observation-time](event-time-vs-observation-time.md)).
 - **All logging goes through one internal module.** No scattered `console.log`, no vendor

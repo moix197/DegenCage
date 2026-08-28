@@ -1,6 +1,7 @@
 import { desc, eq } from 'drizzle-orm';
 
 import type { AssetTier } from '@degencage/rules';
+import { Badge } from '@/components/ui/badge';
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { applyDuePendingChanges } from '@/server/constitution/pending-changes';
@@ -8,7 +9,7 @@ import { getDb } from '@/server/db/client';
 import { trades, type TokenClassificationQuality } from '@/server/db/schema';
 import { buildDashboardState, loadReconciliationState } from '@/server/dashboard/dashboard-state';
 import { FEEDBACK_CAPTURE_FLAG } from '@/server/feedback/feedback';
-import { DASHBOARD_DISCIPLINE_VIEW_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
+import { DASHBOARD_DISCIPLINE_VIEW_FLAG, TRADE_TERMINAL_FLAG, isFeatureEnabled } from '@/server/flags/feature-flags';
 import { captureError } from '@/observability/error-tracking';
 import { recordEvent } from '@/observability/events';
 import { DashboardPanel } from './dashboard-panel';
@@ -41,6 +42,7 @@ interface TradeRowView {
   classification: TokenClassificationQuality | null;
   isRoundTripClose: boolean;
   realizedLossUsd: string | null;
+  tradeIntentId: string | null;
 }
 
 async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
@@ -57,6 +59,7 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
       classification: trades.classification,
       isRoundTripClose: trades.isRoundTripClose,
       realizedLossUsd: trades.realizedLossUsd,
+      tradeIntentId: trades.tradeIntentId,
     })
     .from(trades)
     .where(eq(trades.walletId, walletId))
@@ -75,6 +78,16 @@ function formatTierBadge(tier: AssetTier | null, classification: TokenClassifica
   return classification === 'unknown' ? `${tier} — counted as micro cap` : tier;
 }
 
+/**
+ * BLOCKING 3: a trade with a `tradeIntentId` was routed through us — resolved from the
+ * `trade_intents` row Phase 5's `reconcile-wallet.ts` linked it to; `null` means it was observed
+ * on another app entirely (or predates the terminal). Distinguished by text label, not color
+ * alone — a colorblind reader must be able to tell the two apart.
+ */
+function TradeOriginBadge({ tradeIntentId }: { tradeIntentId: string | null }) {
+  return tradeIntentId ? <Badge variant="secondary">Routed through us</Badge> : <Badge variant="outline">Observed elsewhere</Badge>;
+}
+
 function formatMint(mint: string | null): string {
   if (!mint) return '—';
   return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
@@ -90,12 +103,13 @@ function formatUsd(usdValue: string | null): string {
  * `daily_notional_usd` limit all render an explicit state — never a false "$0 spent today".
  */
 export default async function DashboardPage() {
-  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled, feedbackCaptureEnabled] = await Promise.all([
+  const [session, dashboardEnabled, reconcileEnabled, lossLimitEnabled, feedbackCaptureEnabled, tradeTerminalEnabled] = await Promise.all([
     resolveSession(),
     isFeatureEnabled(DASHBOARD_DISCIPLINE_VIEW_FLAG),
     isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG),
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
     isFeatureEnabled(FEEDBACK_CAPTURE_FLAG),
+    isFeatureEnabled(TRADE_TERMINAL_FLAG),
   ]);
 
   if (!dashboardEnabled || !reconcileEnabled) {
@@ -168,6 +182,15 @@ export default async function DashboardPage() {
     <main className="mx-auto flex max-w-3xl flex-col gap-6">
       <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Dashboard</h1>
 
+      {/* The dashboard stays read-only (decision 5); enforcement lives on `/trade`. Gated on
+          the same `TRADE_TERMINAL_FLAG` that route itself checks, so the dashboard never
+          advertises a route the user cannot reach. */}
+      {tradeTerminalEnabled ? (
+        <p>
+          <a href="/trade">Trade through DegenCage →</a>
+        </p>
+      ) : null}
+
       <DashboardPanel initial={initial} />
 
       {/* Ships dark by default (`FEEDBACK_CAPTURE_FLAG` not seeded enabled) — surfaced at
@@ -182,6 +205,7 @@ export default async function DashboardPage() {
           {tradesList.map((trade) => (
             <li key={trade.signature}>
               <span>{trade.isBaseline ? '[pre-commitment activity — private]' : '[live]'}</span>{' '}
+              <TradeOriginBadge tradeIntentId={trade.tradeIntentId} />{' '}
               {trade.excludedReason ? (
                 <span>
                   excluded ({trade.excludedReason}) — {formatMint(trade.soldMint)} → {formatMint(trade.boughtMint)}

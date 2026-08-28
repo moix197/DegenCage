@@ -1,0 +1,2 @@
+DROP INDEX "trade_intents_wallet_live_idx";--> statement-breakpoint
+CREATE UNIQUE INDEX "trade_intents_wallet_live_idx" ON "trade_intents" USING btree ("wallet_id") WHERE status in ('quoted','approved');

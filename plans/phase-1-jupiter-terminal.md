@@ -45,7 +45,7 @@ These are binding design decisions for Phases 2-5, added during revision review 
 2. Build the real message the user will sign, using `unitsConsumed * 1.2` (capped 1,400,000) as the CU limit, and the **actual blockhash from `/build`'s `blockhashWithMetadata`** (base58-encoded per above) — never the replaced blockhash used only for step 1's simulation.
 
 **Single-live-intent concurrency guarantee.** A `SELECT` (any live intent?) followed by an `INSERT` is not sufficient — two concurrent `/api/swap/quote` calls for the same wallet can both read "none live" before either writes. Phase 4 introduces two layers, per `.ai/patterns/guarded-state-transition.md`'s "lock + SQL guard are belt-and-braces" guidance:
-- A **partial unique index**, `uniqueIndex('trade_intents_wallet_live_idx').on(table.walletId).where(sql\`status in ('quoted','approved','signed','submitted')\`)` — the first partial index in this codebase (drizzle-orm 0.44.5 supports `.where()` chained after `.on()`; no other schema table uses one yet, so there's no copy-paste precedent to follow). It's a hard DB-level backstop: at most one live row per wallet, full stop.
+- A **partial unique index**, `uniqueIndex('trade_intents_wallet_live_idx').on(table.walletId).where(sql\`status in ('quoted','approved')\`)` — the first partial index in this codebase (drizzle-orm 0.44.5 supports `.where()` chained after `.on()`; no other schema table uses one yet, so there's no copy-paste precedent to follow). It's a hard DB-level backstop: at most one row occupying the wallet's **quote slot**, full stop. `signed`/`submitted` are deliberately excluded from the predicate — a post-review fix (see `.ai/decisions/live-intent-reservation-vs-quote-slot.md`): the index protects only against two concurrent unsigned quotes racing, not against a `signed`/`submitted` intent, which must be free to coexist with a fresh quote once the wallet has moved on from it.
 - Inside `getDb().transaction()`, lock the wallet row first (`SELECT ... FROM wallets WHERE id = $1 FOR UPDATE`, the same lock-the-parent-row convention already used in `reconcile-wallet.ts`), then expire the prior live intent (guarded `UPDATE`), then insert the new one — all under one lock, so two concurrent requests serialize instead of racing.
 - **Postgres partial-index predicates must be immutable** — `expires_at > now()` cannot appear in the index predicate, only `status`. This is exactly why time-based expiry cannot be handled by read-side filtering alone (see the reaper below): a row whose wall-clock expiry has passed but whose `status` hasn't been flipped yet still counts as the wallet's one live row against the unique index, and would block a new insert even though it should logically be gone.
 
@@ -99,7 +99,7 @@ These are binding design decisions for Phases 2-5, added during revision review 
 **Risk:** low
 **Mode:** afk
 **Type:** frontend
-**Success criteria:** Existing pages (dashboard, feedback) render shadcn's dark palette correctly instead of the current light-on-dark-background bug; `input`, `label`, `form`, `select`, `dialog`, `skeleton`, `tooltip`, `sonner` primitives are installed under `apps/web/src/components/ui/` and compile/import cleanly, ready for Phase 2's swap form.
+**Success criteria:** Existing pages (dashboard, feedback) render shadcn's dark palette correctly instead of the current light-on-dark-background bug; `input`, `label`, `field`, `select`, `dialog`, `skeleton`, `tooltip`, `sonner` primitives are installed under `apps/web/src/components/ui/` and compile/import cleanly, ready for Phase 2's swap form.
 **Commit message:** `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
 
 **Allowed-exception justification:** this is the plan's one permitted "pure infrastructure prerequisite" phase (plan-sequential format spec). It has no user-facing surface of its own — nothing here is a shippable slice — but Phase 2 cannot legibly build a swap form on a codebase where shadcn renders its light palette on a hardcoded dark body, and none of `input`/`select`/`dialog`/`form` exist yet. Folding this into Phase 2 would blow that phase's file count past reason for an unrelated concern (CSS/theming vs. trade domain logic).
@@ -110,15 +110,15 @@ These are binding design decisions for Phases 2-5, added during revision review 
 |---|---|---|
 | modify | `apps/web/src/app/layout.tsx` | Add `dark` class alongside existing `cn('font-sans', geist.variable)` on `<html>`; remove the hardcoded inline dark `style` object on `<body>`; replace with Tailwind `bg-background text-foreground` classes so shadcn's own CSS variables (not an inline override) drive the palette |
 | verify | `apps/web/src/app/globals.css` | Confirm shadcn's `.dark` CSS variable block exists (added by the original `shadcn init`) and actually applies now that `<html>` carries the class; adjust only if missing/incomplete |
-| create | `apps/web/src/components/ui/input.tsx`, `label.tsx`, `form.tsx`, `select.tsx`, `dialog.tsx`, `skeleton.tsx`, `tooltip.tsx`, `sonner.tsx` | Vendored shadcn primitives via `pnpm dlx shadcn@latest add`, not hand-written |
+| create | `apps/web/src/components/ui/input.tsx`, `label.tsx`, `field.tsx`, `select.tsx`, `dialog.tsx`, `skeleton.tsx`, `tooltip.tsx`, `sonner.tsx` | Vendored shadcn primitives via `pnpm dlx shadcn@latest add` (`base-nova` ships no `form.tsx` — `field` is the real equivalent and composes directly with `react-hook-form`), not hand-written |
 | modify | `apps/web/package.json` | New deps pulled in by the above (expect `react-hook-form`, a resolver such as `@hookform/resolvers` + `zod` for `form.tsx`, `sonner` for toasts, `@base-ui/react` primitives per this project's shadcn style `base-nova`) — declare explicitly, don't let the CLI silently add unpinned ranges |
 
 **Steps:**
 
-- [ ] From `apps/web`, run `pnpm dlx shadcn@latest add input label form select dialog skeleton tooltip sonner`
-- [ ] Fix `layout.tsx` per the file-changes row above
-- [ ] Confirm `.dark` tokens in `globals.css` actually change the rendered palette (no leftover inline overrides elsewhere)
-- [ ] Run `pnpm typecheck` and `pnpm test` workspace-wide to confirm nothing regresses
+- [x] From `apps/web`, run `pnpm dlx shadcn@latest add input label field select dialog skeleton tooltip sonner`
+- [x] Fix `layout.tsx` per the file-changes row above
+- [x] Confirm `.dark` tokens in `globals.css` actually change the rendered palette (no leftover inline overrides elsewhere)
+- [x] Run `pnpm typecheck` and `pnpm test` workspace-wide to confirm nothing regresses
 
 **Tests:**
 
@@ -126,21 +126,21 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Verification:**
 
-- [ ] `pnpm typecheck` passes
-- [ ] `pnpm test` passes (no regressions)
-- [ ] Manual: load `/dashboard` and `/feedback` (or wherever currently reachable) in a browser, confirm dark theme now renders shadcn's dark palette instead of light-on-dark
-- [ ] Manual: confirm each new primitive file imports without type errors (a throwaway local import is enough — no permanent smoke-test route needed)
+- [x] `pnpm typecheck` passes
+- [x] `pnpm test` passes (no regressions)
+- [ ] Manual: load `/dashboard` and `/feedback` (or wherever currently reachable) in a browser, confirm dark theme now renders shadcn's dark palette instead of light-on-dark — _deferred: rolled into Phase 2's manual verification pass, when the app is run locally_
+- [x] Manual: confirm each new primitive file imports without type errors (a throwaway local import is enough — no permanent smoke-test route needed)
 
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Documentation updated (see Documentation section)
-- [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
-- [ ] Phase marked complete
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Documentation updated (see Documentation section)
+- [x] Orchestrator (user) has verified and approved this phase
+- [x] Changes committed: `fix(web): apply dark theme tokens to html root, add shadcn primitives for trade form`
+- [x] Phase marked complete
 
 ---
 
@@ -172,20 +172,20 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Steps:**
 
-- [ ] Add `trade_intents` to `schema.ts`, run `pnpm db:generate`, review the generated SQL, run `pnpm db:migrate` locally
-- [ ] Register `JUPITER_API_KEY` in env config/README; obtain a Free-tier key from developers.jup.ag/portal for local/dev use
-- [ ] Implement `jupiter-client.ts` against `GET api.jup.ag/swap/v2/build` (no `platformFeeBps`/`feeAccount` per decision 10); code the error path defensively per the documented gap — only `400 {error: string}` is guaranteed, treat anything else (including a 200 that later fails simulation) as a possible balance/liquidity failure surfacing late
-- [ ] Migrate `jupiter-tokens.ts` to `api.jup.ag` + `x-api-key`; extend it (or add a sibling) for mint decimals
-- [ ] Implement `helius-simulate.ts`
-- [ ] Implement `assemble-transaction.ts` following Jupiter's documented CU-limit-via-simulation pattern exactly (1.2x buffer, 1,400,000 cap); base58-encode the blockhash; simulate-then-real-blockhash ordering; fail closed on simulation failure — all per the mechanisms section above
-- [ ] Implement `quote-service.ts`'s precondition checks (constitution `active`, reconciliation `current`) before any Jupiter call is made
-- [ ] Implement `quote-service.ts`'s pricing calls to `priceTrade` using the sold-leg-for-acquisitions / `otherAmountThreshold`-for-disposals rule — never pass the optimistic `outAmount` for a disposal's proceeds
-- [ ] Wire `loadWindowedTrades` + `evaluateTrade` + the fold rule (decision 4) — a dependency failure (Helius down, pricing unresolvable, Jupiter `/build` throwing) must fold to `unevaluable` → BLOCK, never fall through to allow
-- [ ] Implement the in-memory short-TTL quote cache keyed on `(walletId, inputMint, outputMint, amount, slippageBps)` — never omit `walletId`, since the cached response contains the requesting wallet's assembled instructions — to stay under the shared 1 RPS Free-tier bucket
-- [ ] Implement `/api/swap/quote/route.ts`
-- [ ] Add both feature flags + seed entries
-- [ ] Build `/trade/page.tsx` + `trade-panel.tsx` using Phase 1's new primitives
-- [ ] Link `/trade` from the dashboard
+- [x] Add `trade_intents` to `schema.ts`, run `pnpm db:generate`, review the generated SQL, run `pnpm db:migrate` locally
+- [ ] Register `JUPITER_API_KEY` in env config/README; obtain a Free-tier key from developers.jup.ag/portal for local/dev use — _registered in `.env.example` + README; **key not yet obtained — human step, blocks the manual checks below**_
+- [x] Implement `jupiter-client.ts` against `GET api.jup.ag/swap/v2/build` (no `platformFeeBps`/`feeAccount` per decision 10); code the error path defensively per the documented gap — only `400 {error: string}` is guaranteed, treat anything else (including a 200 that later fails simulation) as a possible balance/liquidity failure surfacing late
+- [x] Migrate `jupiter-tokens.ts` to `api.jup.ag` + `x-api-key`; extend it (or add a sibling) for mint decimals
+- [x] Implement `helius-simulate.ts`
+- [x] Implement `assemble-transaction.ts` following Jupiter's documented CU-limit-via-simulation pattern exactly (1.2x buffer, 1,400,000 cap); base58-encode the blockhash; simulate-then-real-blockhash ordering; fail closed on simulation failure — all per the mechanisms section above
+- [x] Implement `quote-service.ts`'s precondition checks (constitution `active`, reconciliation `current`) before any Jupiter call is made
+- [x] Implement `quote-service.ts`'s pricing calls to `priceTrade` using the sold-leg-for-acquisitions / `otherAmountThreshold`-for-disposals rule — never pass the optimistic `outAmount` for a disposal's proceeds
+- [x] Wire `loadWindowedTrades` + `evaluateTrade` + the fold rule (decision 4) — a dependency failure (Helius down, pricing unresolvable, Jupiter `/build` throwing) must fold to `unevaluable` → BLOCK, never fall through to allow
+- [x] Implement the in-memory short-TTL quote cache keyed on `(walletId, inputMint, outputMint, amount, slippageBps)` — never omit `walletId`, since the cached response contains the requesting wallet's assembled instructions — to stay under the shared 1 RPS Free-tier bucket
+- [x] Implement `/api/swap/quote/route.ts`
+- [x] Add both feature flags + seed entries
+- [x] Build `/trade/page.tsx` + `trade-panel.tsx` using Phase 1's new primitives
+- [x] Link `/trade` from the dashboard
 
 **Tests:**
 
@@ -198,11 +198,11 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual: with `trade.terminal` + `jupiter.swap_build` flipped on locally, connect a real wallet, request a quote for a pair with headroom → see quote + "allowed" verdict
-- [ ] Manual: request a quote that exceeds a configured limit → see the inline block alert with the correct reason and a working link to `/constitution/edit`
-- [ ] Manual: flip `chain.helius` off (or simulate Helius failure) → confirm the quote route fails closed to blocked/503, never a false "allow"
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual: with `trade.terminal` + `jupiter.swap_build` flipped on locally, connect a real wallet, request a quote for a pair with headroom → see quote + "allowed" verdict — _pending: needs a Jupiter API key + real wallet_
+- [ ] Manual: request a quote that exceeds a configured limit → see the inline block alert with the correct reason and a working link to `/constitution/edit` — _pending: needs a Jupiter API key + real wallet_
+- [ ] Manual: flip `chain.helius` off (or simulate Helius failure) → confirm the quote route fails closed to blocked/503, never a false "allow" — _pending: needs a Jupiter API key + real wallet_
 
 **Kill switch / flag / instrumentation:**
 
@@ -213,13 +213,13 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): add /trade quote + pre-trade rule verdict`
+- [x] Changes committed: `feat(web): add /trade quote + pre-trade rule verdict`
 - [ ] Phase marked complete
 
 ---
@@ -229,7 +229,7 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 **Risk:** high
 **Mode:** hil
 **Type:** mixed
-**Success criteria:** From an allowed quote on `/trade`, the user clicks Approve, the wallet is prompted to sign the exact compiled v0 transaction from Phase 2 (feature-detected `signTransaction` vs. `signAndSendTransaction` against `wallet.features`), the client posts the signed bytes to `/api/swap/submit`, and the server: verifies the intent is still `approved`/unexpired, hashes the signed bytes and confirms they match `tx_message_hash`, re-runs `evaluateTrade` (still allow?), records the signature, and — because `chain.broadcast` is seeded off — simulates via Helius instead of broadcasting, returning a "verified, ready to broadcast" result. This is the full mechanical pipeline exercised end to end for the first time, deliberately short of moving real funds (decision 14 — that's Phase 6).
+**Success criteria:** From an allowed quote on `/trade`, the user clicks Approve, the wallet is prompted to sign the exact compiled v0 transaction from Phase 2 (the connected account's features are read: `signTransaction` is used, and `signAndSendTransaction` is detected and **refused** with its own message — it broadcasts from inside the wallet, bypassing `/api/swap/submit`'s verification and the `chain.broadcast` kill switch; see `.ai/decisions/swap-signing-and-submit.md`), the client posts the signed bytes to `/api/swap/submit`, and the server: verifies the intent is still `approved`/unexpired, hashes the signed bytes and confirms they match `tx_message_hash`, re-runs `evaluateTrade` (still allow?), records the signature, and — because `chain.broadcast` is seeded off — simulates via Helius instead of broadcasting, returning a "verified, ready to broadcast" result. This is the full mechanical pipeline exercised end to end for the first time, deliberately short of moving real funds (decision 14 — that's Phase 6).
 **Commit message:** `feat(web): wire swap signing + submit verification, broadcast gated off`
 
 **File changes:**
@@ -245,12 +245,12 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Steps:**
 
-- [ ] Implement `use-swap-signing.ts` with explicit feature detection; never assume `signAndSendTransaction` exists
-- [ ] Wire trade-panel's Approve flow, including a clear "you're about to sign a real mainnet transaction" affordance (no devnet exists — decision context)
-- [ ] Implement `submit-service.ts`'s guarded transitions exactly per the pattern doc — no read-then-write; extract the message from signed bytes before hashing (never hash the signed tx as a whole); check fee payer == session wallet independently of the hash comparison; handle the zero-rows-returned case as an idempotent-replay check, not an automatic error
-- [ ] Implement `broadcast-transaction.ts` with the flag-gated simulate/send branch
-- [ ] Implement `/api/swap/submit/route.ts`
-- [ ] Add `chain.broadcast` flag + seed entry (off)
+- [x] Implement `use-swap-signing.ts` with explicit feature detection; never assume `signAndSendTransaction` exists
+- [x] Wire trade-panel's Approve flow, including a clear "you're about to sign a real mainnet transaction" affordance (no devnet exists — decision context)
+- [x] Implement `submit-service.ts`'s guarded transitions exactly per the pattern doc — no read-then-write; extract the message from signed bytes before hashing (never hash the signed tx as a whole); check fee payer == session wallet independently of the hash comparison; handle the zero-rows-returned case as an idempotent-replay check, not an automatic error
+- [x] Implement `broadcast-transaction.ts` with the flag-gated simulate/send branch
+- [x] Implement `/api/swap/submit/route.ts`
+- [x] Add `chain.broadcast` flag + seed entry (off)
 
 **Tests:**
 
@@ -263,10 +263,10 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual (real wallet, mainnet, `chain.broadcast` still off): approve a quote, sign, confirm submit returns a dry-run-verified result with no funds moved, confirm the intent row reaches `submitted` with `signature` recorded but nothing broadcast
-- [ ] Manual: attempt to submit an intent belonging to a different wallet (e.g. after account switch) → confirm server-side 403, not just a client-side block
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual (real wallet, mainnet, `chain.broadcast` still off): approve a quote, sign, confirm submit returns a dry-run-verified result with no funds moved, confirm the intent row reaches `submitted` with `signature` recorded but nothing broadcast — _**NOT VERIFIED**: no funded/signing wallet available; orchestrator declined the manual pass. Automated tests + code review are the only proof for this phase._
+- [ ] Manual: attempt to submit an intent belonging to a different wallet (e.g. after account switch) → confirm server-side 403, not just a client-side block — _**NOT VERIFIED**: no funded/signing wallet available; orchestrator declined the manual pass. Automated tests + code review are the only proof for this phase._
 
 **Kill switch / flag / instrumentation:**
 
@@ -277,13 +277,13 @@ No automated tests — justified because: `layout.tsx`'s change is presentationa
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): wire swap signing + submit verification, broadcast gated off`
+- [x] Changes committed: `feat(web): wire swap signing + submit verification, broadcast gated off`
 - [ ] Phase marked complete
 
 ---
@@ -303,22 +303,22 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 | Action | File | What changes |
 |---|---|---|
 | create | `apps/web/src/server/db/migrations/00xx_*.sql` | Partial unique index migration, generated via `pnpm db:generate` after the schema change below |
-| modify | `apps/web/src/server/db/schema.ts` | Add a partial unique index on `trade_intents.wallet_id`, restricted to live statuses (`quoted`/`approved`/`signed`/`submitted`) via a `sql` predicate on `.where(...)` — the first partial index in this codebase; the predicate can only reference `status` (Postgres requires partial-index predicates to be immutable, so `expires_at > now()` cannot appear here) — see the concurrency-guarantee rule above for the exact expression |
+| modify | `apps/web/src/server/db/schema.ts` | Add a partial unique index on `trade_intents.wallet_id`, restricted to the **quote-slot** statuses (`quoted`/`approved`) via a `sql` predicate on `.where(...)` — the first partial index in this codebase; the predicate can only reference `status` (Postgres requires partial-index predicates to be immutable, so `expires_at > now()` cannot appear here) — see the concurrency-guarantee rule above for the exact expression. A separate, wider status set (`quoted`/`approved`/`signed`/`submitted`) governs allowance *reservation*, not this index — see `.ai/decisions/live-intent-reservation-vs-quote-slot.md` |
 | create | `apps/web/src/server/swap/intent-lifecycle.ts` | `reapExpiredIntents(walletId, executor)` — guarded `UPDATE ... SET status='expired' WHERE wallet_id=$1 AND status IN (live) AND expires_at <= now() RETURNING id`; deliberately append-only (`UPDATE`, not the `DELETE` pattern `challenge-reaper.ts`/`login-attempt-reaper.ts` use), since intents must stay in the audit trail. `expireAndReserveLiveIntent(walletId, insertFn, executor)` — wraps a wallet-row lock (`SELECT ... FROM wallets WHERE id=$1 FOR UPDATE`, the same convention `reconcile-wallet.ts` already uses), a guarded unconditional expire of the prior live intent, and the caller's insert, all in one `getDb().transaction()`. `loadLiveIntentUsd(walletId, windowHours, asOf, executor)` — calls `reapExpiredIntents` first, then sums remaining live intents' `usd_value` via `addUsd`/`sumTradeUsd` from `packages/rules/src/evaluate.ts` (reused, not reimplemented) |
 | modify | `apps/web/src/server/swap/quote-service.ts` | Move the `trade_intents` insert (built in Phase 2) inside `expireAndReserveLiveIntent`'s locked transaction; fold `loadLiveIntentUsd`'s sum into the `windowedHistory` passed to `evaluateTrade` (UNION of persisted trades + live intents, excluding any intent whose signature already landed in `trades`); record `trade.intent_expired` when a prior intent is actually expired this way |
-| modify | `apps/web/src/client/wallet/account-switch.ts` (or its server-side counterpart in `session.ts`) | On confirmed account switch, expire **all** of the old wallet's live intents unconditionally (not just time-expired ones) — reuse the guarded expire helper, called from wherever session revocation already happens |
+| modify | `apps/web/src/client/wallet/account-switch.ts` (or its server-side counterpart in `session.ts`) | On confirmed account switch, expire the old wallet's **quote-slot** intent unconditionally (not just time-expired ones) — reuse the guarded expire helper, called from wherever session revocation already happens. A `signed`/`submitted` intent is deliberately left alone: it keeps reserving allowance against the old wallet until Phase 5 reconciliation resolves it — see `.ai/decisions/live-intent-reservation-vs-quote-slot.md` |
 | modify | `apps/web/src/app/trade/trade-panel.tsx` | Render a reset notice when the account-switch watcher fires mid-session (reuses the existing `wallet-account-watch.ts` subscription) |
 
 **Steps:**
 
-- [ ] Add the partial unique index to `schema.ts`, generate + review + apply the migration
-- [ ] Implement `reapExpiredIntents` (guarded `UPDATE`, not delete) in `intent-lifecycle.ts`
-- [ ] Implement `expireAndReserveLiveIntent`, wrapping the wallet-row-lock + guarded-expire + insert in one transaction, per the concurrency-guarantee rule in the mechanisms section above
-- [ ] Implement `loadLiveIntentUsd`, calling the reaper first and summing via `addUsd`/`sumTradeUsd` (not new decimal arithmetic)
-- [ ] Wire live-intent reservation into the allowance calculation used by `quote-service.ts`
-- [ ] Move Phase 2's plain intent insert into `expireAndReserveLiveIntent`'s locked transaction
-- [ ] Wire expire-on-account-switch into the existing revoke path (expire ALL live intents for the old wallet unconditionally, not just time-expired ones)
-- [ ] Surface the reset notice in `trade-panel.tsx`
+- [x] Add the partial unique index to `schema.ts`, generate + review + apply the migration
+- [x] Implement `reapExpiredIntents` (guarded `UPDATE`, not delete) in `intent-lifecycle.ts`
+- [x] Implement `expireAndReserveLiveIntent`, wrapping the wallet-row-lock + guarded-expire + insert in one transaction, per the concurrency-guarantee rule in the mechanisms section above
+- [x] Implement `loadLiveIntentUsd`, calling the reaper first and summing via `addUsd`/`sumTradeUsd` (not new decimal arithmetic)
+- [x] Wire live-intent reservation into the allowance calculation used by `quote-service.ts`
+- [x] Move Phase 2's plain intent insert into `expireAndReserveLiveIntent`'s locked transaction
+- [x] Wire expire-on-account-switch into the existing revoke path (expire the old wallet's quote-slot intent unconditionally, not just time-expired ones; a `signed`/`submitted` intent survives the switch and keeps reserving allowance until Phase 5)
+- [x] Surface the reset notice in `trade-panel.tsx`
 
 **Tests:**
 
@@ -330,10 +330,10 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual: request quote A near a limit's headroom, then request quote B before approving A → confirm B correctly sees A's reservation, and A is now `expired` in the DB
-- [ ] Manual: switch the connected wallet account mid-quote → confirm `/trade` shows the reset notice and the old intent is `expired`
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual: request quote A near a limit's headroom, then request quote B before approving A → confirm B correctly sees A's reservation, and A is now `expired` in the DB — _**NOT VERIFIED**: no funded/signing wallet; orchestrator declined the manual pass. Automated tests + code review (incl. mutation check) are the only proof._
+- [ ] Manual: switch the connected wallet account mid-quote → confirm `/trade` shows the reset notice and the old intent is `expired` — _**NOT VERIFIED**: no funded/signing wallet; orchestrator declined the manual pass. Automated tests + code review (incl. mutation check) are the only proof._
 
 **Kill switch / flag / instrumentation:**
 
@@ -343,13 +343,13 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): reserve allowance against live trade intents, expire on new quote and account switch`
+- [x] Changes committed: `feat(web): reserve allowance against live trade intents, expire on new quote and account switch`
 - [ ] Phase marked complete
 
 ---
@@ -373,10 +373,11 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Steps:**
 
-- [ ] Add `trade_intent_id` column + migration
-- [ ] Extend `reconcile-wallet.ts`'s insert path to look up and link the originating intent, guarded-transitioning it
-- [ ] Record `trade.intent_confirmed` / `trade.intent_failed` from the reconcile path
-- [ ] Add status polling to the trade page
+- [x] Add `trade_intent_id` column + migration
+- [x] Extend `reconcile-wallet.ts`'s insert path to look up and link the originating intent, guarded-transitioning it
+- [x] Record `trade.intent_confirmed` / `trade.intent_failed` from the reconcile path
+- [x] Add status polling to the trade page
+- [x] **Required:** a blockhash-expiry-driven `submitted → failed` sweep (guarded `UPDATE`, same append-only convention as `reapExpiredIntents`) for a `submitted` intent whose transaction never lands on chain at all — rationale: without this, a broadcast that silently never confirms keeps reserving allowance forever, since reconciliation only ever resolves a signature that *did* land (see `.ai/decisions/live-intent-reservation-vs-quote-slot.md`)
 
 **Tests:**
 
@@ -386,30 +387,57 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual: after Phase 3's dry-run submit completes for a real signature (if one was actually sent — otherwise defer this specific check to Phase 6), confirm the reconcile job links it and the terminal shows the status flip
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual: after Phase 3's dry-run submit completes for a real signature (if one was actually sent — otherwise defer this specific check to Phase 6), confirm the reconcile job links it and the terminal shows the status flip — _**NOT VERIFIED**: no real signature was ever broadcast (Phase 3 left broadcast gated off), so there is nothing on chain to reconcile. Deferred to Phase 6 as the phase itself anticipated. Automated tests + code review are the only proof._
 
 **Kill switch / flag / instrumentation:**
 
 - No new flag — rides on `chain.helius_reconcile` (existing) and `trade.terminal`
 - Events: `trade.intent_confirmed`, `trade.intent_failed` (from the reconcile path, distinct from Phase 3's submit-time `trade.intent_failed` on verification failure — same event type, different `payload.stage`)
 
+**Review follow-ups (post-review additions):**
+
+Initial review of `770ccb0` returned **red**; re-review after fixes returned **green**. Landed beyond the original plan:
+
+- `GET /api/swap/intent/[id]` (new route) — drives resolution for the polled intent, since `reconcileWallet()` was otherwise unreachable from `/trade` and the required sweep would never have fired for a user who stays on the terminal. Baseline-incomplete wallets skip the attempt; the rest is bounded by an 8s deadline emitting `trade.intent_poll_resolve_timed_out`.
+- `resolveIntentOutcome()` — separates landed-but-excluded-from-accounting (`lst_swap` / `wrap_unwrap` / `missing_block_time` → `confirmed`) from genuine on-chain failure (`no_net_change` / `pure_receive` / `pure_send` → `failed`). No new intent status was introduced.
+- The sweep covers stranded `signed` intents too, not just `submitted` (a crash between `transitionToSigned` and `transitionFromSigned` otherwise reserved allowance permanently).
+- Dashboard trades are badged "Routed through us" / "Observed elsewhere" off `trade_intent_id`.
+
+**Accepted gap (documented in `.ai/decisions/live-intent-reservation-vs-quote-slot.md`):** a transaction landing *after* its intent was swept to `failed` cannot relink, so it renders as "Observed elsewhere" — a self-routed trade misreported as external. Allowance is unaffected (counted once, no double-spend). Widening `RECONCILABLE_INTENT_STATUSES` to include `failed` was rejected as riskier than the gap.
+
+**Open, deferred by the orchestrator:** `/trade`'s terminal-failure copy is a hedge ("either it never landed on chain, or it landed without completing the swap") because the poll response carries no `reason` field to distinguish the two cases.
+
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
-- [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): link reconciled trades back to their originating trade intent`
-- [ ] Phase marked complete
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
+- [x] Orchestrator (user) has verified and approved this phase
+- [x] Changes committed: `feat(web): link reconciled trades back to their originating trade intent`
+- [x] Phase marked complete
 
 ---
 
 ### Phase 6: Dry-run pass, then one live tiny swap
+
+> **DEFERRED — 2026-08-28, by orchestrator decision.** Not run. Skipped until the terminal has a
+> usable UI worth exercising with real funds. Nothing in this phase is blocked or broken; it is
+> waiting on product readiness, not on a defect.
+>
+> **What this leaves unproven:** `chain.broadcast` has never been flipped on, so no signature has
+> ever reached the chain. Everything Phases 3-5 built downstream of broadcast — submit, on-chain
+> confirmation, Phase 5's reconcile → link → confirm/failed path, tier classification and
+> lot-matching against a real trade — has automated tests and code review as its only proof. The
+> first real `/build` response shape, real ALT accounts, and real CU consumption are still
+> unexercised; the plan itself expects that list of surprises to be non-empty.
+>
+> **Consequence for the merge:** Phase 1 ships to `main` with the live path unverified on chain.
+> Do not treat `chain.broadcast` as safe to flip until this phase actually runs.
 
 **Risk:** high (real funds)
 **Mode:** hil
@@ -469,17 +497,24 @@ No automated tests beyond what Phases 2-5 already cover — justified because: t
 - No path falls through to "allow" on a dependency failure anywhere in the quote or submit pipeline.
 - Every kill switch (`trade.terminal`, `jupiter.swap_build`, `chain.broadcast`) is flippable at runtime with no deploy and defaults to the state specified in its phase — confirmed by construction, since `isFeatureEnabled` reads the `feature_flags` table (existing Phase 0 infra), never an env var or compiled constant.
 
+**Final verification record (automated half, 2026-08-28):**
+
+- `pnpm test` — 672 passing, 44 files. `pnpm typecheck` — clean, both packages. `pnpm build` — exit 0, all routes compile.
+- End-to-end code review of the full branch diff vs `main`: **no blocking findings**. All eight focus areas PASS — guarded transitions (all six `update(tradeIntents)` carry `status IN (...)`, no `DELETE`s), fail-closed externals, no float money-math, allowance UNION with signature dedupe, account-switch reaching the server, `resolveSession()`-only wallet identity, runtime-flippable kill switches seeded `false`, `packages/rules` still zero-I/O.
+- Six non-blocking findings were fixed rather than deferred (`4da03d4`, `197edc2`, `41038db`, `acef5a8`, `54eff31`). The one that mattered: pre-trade pricing was caching the *in-progress* minute candle into `token_prices` as though it were a settled close, silently corrupting data Phase 0 depends on. Also fixed: a rule evaluation could emit no `rule.pre_trade_decision` if assembly threw; the correlation id stopped at the Jupiter/Helius boundary.
+- Knowledge base synced (`3dfb009`, `964e92d`, `41a66c0`, `66cda6b`). Three rows of the Knowledge Base Impact table below turned out NOT to match shipped code and were documented as-shipped instead: intent expiry derives from `blockhashSlotsToExpiry=150` (`fetchedAt + 150x400ms`), not from `lastValidBlockHeight`; `pre-trade-slippage-pricing.md` was factually wrong — pre-trade prices exactly one number, the sold leg, and nothing prices the bought leg or `otherAmountThreshold`; the flags doc had no flag inventory to extend.
+
 **Steps:**
 
 - [ ] Every preceding phase's Steps/Verification/Phase review checkboxes are ticked in this plan file
-- [ ] Reviewer handoff prompt emitted, scoped to the entire Phase 1 change end-to-end
-- [ ] Code-reviewer agent reviews the entire change end-to-end — explicit focus: guarded-state-transition correctness on every `trade_intents` transition, fail-closed behavior on every external dependency (Jupiter build, Helius simulate/broadcast, pricing, classification), no float money-math, allowance reservation correctly UNIONs persisted trades and live intents with no double count, account-switch invalidation actually reaches the server side (not just client display)
-- [ ] Any changes from the final review reflected back into this plan file
-- [ ] `pnpm test` passes workspace-wide
-- [ ] `pnpm typecheck` passes workspace-wide
-- [ ] No CLAUDE.md invariants violated (packages/rules stays zero-I/O; every kill switch/flag/instrumentation present per feature; rule state append-only)
-- [ ] Feature tested manually end-to-end on a real wallet: golden path, blocked-attempt path, account-switch mid-quote, Helius-outage fail-closed check, expired-quote resubmission attempt
-- [ ] Overall success criteria met
+- [x] Reviewer handoff prompt emitted, scoped to the entire Phase 1 change end-to-end
+- [x] Code-reviewer agent reviews the entire change end-to-end — explicit focus: guarded-state-transition correctness on every `trade_intents` transition, fail-closed behavior on every external dependency (Jupiter build, Helius simulate/broadcast, pricing, classification), no float money-math, allowance reservation correctly UNIONs persisted trades and live intents with no double count, account-switch invalidation actually reaches the server side (not just client display)
+- [x] Any changes from the final review reflected back into this plan file
+- [x] `pnpm test` passes workspace-wide
+- [x] `pnpm typecheck` passes workspace-wide
+- [x] No CLAUDE.md invariants violated (packages/rules stays zero-I/O; every kill switch/flag/instrumentation present per feature; rule state append-only)
+- [ ] Feature tested manually end-to-end on a real wallet: golden path, blocked-attempt path, account-switch mid-quote, Helius-outage fail-closed check, expired-quote resubmission attempt — _**NOT VERIFIED**: requires a funded wallet and a browser. Several of these cannot be exercised at all while Phase 6 is deferred and `chain.broadcast` is seeded `false`._
+- [ ] Overall success criteria met — _**PARTIAL**: the automated half is met (see the review record below). The on-chain half — broadcast, confirm, reconcile against a real signature — is unmet by construction while Phase 6 is deferred._
 - [ ] All phase checkboxes above are ticked
 
 ## Documentation

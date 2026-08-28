@@ -34,16 +34,16 @@ export default async function AdminMetricsPage() {
   const snapshot = await buildMetricsSnapshot(new Date());
 
   return (
-    <main style={{ maxWidth: '60rem', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '2rem', padding: '1.5rem' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+    <main className="mx-auto flex max-w-[60rem] flex-col gap-8">
+      <div className="flex items-start justify-between">
         <div>
-          <h1 style={{ fontSize: '1.25rem', fontWeight: 600 }}>Phase 0 success signals</h1>
+          <h1 className="text-xl font-semibold">Phase 0 success signals</h1>
           <p>Computed live from the event log — {snapshot.generatedAt}</p>
         </div>
         <form method="POST" action="/api/admin/logout">
           <button
             type="submit"
-            style={{ padding: '0.4rem 0.75rem', border: '1px solid #ccc', borderRadius: '4px', background: 'transparent', cursor: 'pointer', fontSize: '0.85rem' }}
+            className="cursor-pointer rounded border border-border bg-transparent px-3 py-[0.4rem] text-[0.85rem]"
           >
             Log out
           </button>
@@ -78,10 +78,10 @@ function formatNumber(value: number): string {
 
 function Section({ title, note, children }: { title: string; note?: string; children: React.ReactNode }) {
   return (
-    <section style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-      <h2 style={{ fontSize: '1rem', fontWeight: 600 }}>{title}</h2>
-      {note ? <p style={{ fontSize: '0.85rem', opacity: 0.75 }}>{note}</p> : null}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1.5rem' }}>{children}</div>
+    <section className="flex flex-col gap-2">
+      <h2 className="text-base font-semibold">{title}</h2>
+      {note ? <p className="text-[0.85rem] text-muted-foreground">{note}</p> : null}
+      <div className="flex flex-wrap gap-6">{children}</div>
     </section>
   );
 }
@@ -89,8 +89,8 @@ function Section({ title, note, children }: { title: string; note?: string; chil
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div>
-      <div style={{ fontSize: '0.75rem', opacity: 0.7 }}>{label}</div>
-      <div style={{ fontSize: '1.1rem', fontWeight: 600 }}>{value}</div>
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="text-[1.1rem] font-semibold">{value}</div>
     </div>
   );
 }
@@ -105,13 +105,13 @@ function OnboardingSection({ snapshot }: { snapshot: MetricsSnapshot }) {
       <Stat label="Activated" value={formatNumber(onboarding.activatedUserCount)} />
       <Stat label="Completion rate" value={formatPercentOrNoData(onboarding.rate, onboarding.sessionUserCount)} />
       {cohortDays.length > 0 ? (
-        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <table className="w-full border-collapse">
           <thead>
             <tr>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Cohort day</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Sessions</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Activated</th>
-              <th style={{ textAlign: 'left' }}>Rate</th>
+              <th className="pr-4 text-left">Cohort day</th>
+              <th className="pr-4 text-left">Sessions</th>
+              <th className="pr-4 text-left">Activated</th>
+              <th className="text-left">Rate</th>
             </tr>
           </thead>
           <tbody>
@@ -119,9 +119,9 @@ function OnboardingSection({ snapshot }: { snapshot: MetricsSnapshot }) {
               const cohort = onboarding.byDayCohort[day]!;
               return (
                 <tr key={day}>
-                  <td style={{ paddingRight: '1rem' }}>{day}</td>
-                  <td style={{ paddingRight: '1rem' }}>{formatNumber(cohort.sessionUserCount)}</td>
-                  <td style={{ paddingRight: '1rem' }}>{formatNumber(cohort.activatedUserCount)}</td>
+                  <td className="pr-4">{day}</td>
+                  <td className="pr-4">{formatNumber(cohort.sessionUserCount)}</td>
+                  <td className="pr-4">{formatNumber(cohort.activatedUserCount)}</td>
                   <td>{formatPercentOrNoData(cohort.rate, cohort.sessionUserCount)}</td>
                 </tr>
               );
@@ -183,13 +183,13 @@ function RulesKeptSection({ snapshot }: { snapshot: MetricsSnapshot }) {
       <Stat label="Unevaluable (excluded)" value={formatNumber(rulesKept.unevaluableCount)} />
       <Stat label="Rules kept rate" value={formatPercentOrNoData(rulesKept.rulesKeptRate, rulesKept.totalDecidedEvaluations)} />
       {userIds.length > 0 ? (
-        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <table className="w-full border-collapse">
           <thead>
             <tr>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>User</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Decided evaluations</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Allowed</th>
-              <th style={{ textAlign: 'left' }}>Rate</th>
+              <th className="pr-4 text-left">User</th>
+              <th className="pr-4 text-left">Decided evaluations</th>
+              <th className="pr-4 text-left">Allowed</th>
+              <th className="text-left">Rate</th>
             </tr>
           </thead>
           <tbody>
@@ -197,9 +197,9 @@ function RulesKeptSection({ snapshot }: { snapshot: MetricsSnapshot }) {
               const user = rulesKept.byUser[userId]!;
               return (
                 <tr key={userId}>
-                  <td style={{ paddingRight: '1rem' }}>{userId}</td>
-                  <td style={{ paddingRight: '1rem' }}>{formatNumber(user.totalDecidedEvaluations)}</td>
-                  <td style={{ paddingRight: '1rem' }}>{formatNumber(user.allowedCount)}</td>
+                  <td className="pr-4">{userId}</td>
+                  <td className="pr-4">{formatNumber(user.totalDecidedEvaluations)}</td>
+                  <td className="pr-4">{formatNumber(user.allowedCount)}</td>
                   <td>{formatPercentOrNoData(user.rulesKeptRate, user.totalDecidedEvaluations)}</td>
                 </tr>
               );
@@ -220,23 +220,23 @@ function ExternalViolationsSection({ snapshot }: { snapshot: MetricsSnapshot }) 
       {snapshot.externalViolations.length === 0 ? (
         <p>No active constitutions yet.</p>
       ) : (
-        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+        <table className="w-full border-collapse">
           <thead>
             <tr>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>User</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Live violations/week</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Baseline counterfactual/week</th>
-              <th style={{ textAlign: 'left', paddingRight: '1rem' }}>Baseline unevaluable</th>
-              <th style={{ textAlign: 'left' }}>Baseline span (days of 90)</th>
+              <th className="pr-4 text-left">User</th>
+              <th className="pr-4 text-left">Live violations/week</th>
+              <th className="pr-4 text-left">Baseline counterfactual/week</th>
+              <th className="pr-4 text-left">Baseline unevaluable</th>
+              <th className="text-left">Baseline span (days of 90)</th>
             </tr>
           </thead>
           <tbody>
             {snapshot.externalViolations.map((row) => (
               <tr key={row.userId}>
-                <td style={{ paddingRight: '1rem' }}>{row.userId}</td>
-                <td style={{ paddingRight: '1rem' }}>{formatNumber(row.liveViolationsPerWeek)}</td>
-                <td style={{ paddingRight: '1rem' }}>{formatNumber(row.baselineViolationsPerWeek)}</td>
-                <td style={{ paddingRight: '1rem' }}>{formatNumber(row.baselineUnevaluableCount)}</td>
+                <td className="pr-4">{row.userId}</td>
+                <td className="pr-4">{formatNumber(row.liveViolationsPerWeek)}</td>
+                <td className="pr-4">{formatNumber(row.baselineViolationsPerWeek)}</td>
+                <td className="pr-4">{formatNumber(row.baselineUnevaluableCount)}</td>
                 <td>{formatNumber(row.baselineActualSpanDays)}</td>
               </tr>
             ))}
@@ -283,10 +283,10 @@ function FeedbackSection({ snapshot }: { snapshot: MetricsSnapshot }) {
       {snapshot.recentFeedback.length === 0 ? (
         <p>No feedback submitted yet.</p>
       ) : (
-        <ul style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', width: '100%' }}>
+        <ul className="flex w-full flex-col gap-2">
           {snapshot.recentFeedback.map((submission, index) => (
             <li key={index}>
-              <span style={{ fontSize: '0.75rem', opacity: 0.7 }}>
+              <span className="text-xs text-muted-foreground">
                 {submission.occurredAt.toISOString()}
                 {submission.context ? ` — ${submission.context}` : ''}
               </span>

@@ -3,12 +3,14 @@ import { featureFlags } from './schema';
 import { WALLET_CONNECT_FLAG } from '../auth/solana-siws';
 import { CHAIN_HELIUS_FLAG } from '../chain/helius-client';
 import { CLASSIFICATION_JUPITER_MCAP_FLAG } from '../chain/jupiter-tokens';
+import { CHAIN_BROADCAST_FLAG } from '../chain/broadcast-transaction';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
 import { CONSTITUTION_AUTHOR_FLAG } from '../constitution/commitment';
 import { CONSTITUTION_PENDING_CHANGE_APPLY_FLAG } from '../constitution/pending-changes';
-import { DASHBOARD_DISCIPLINE_VIEW_FLAG, HOME_STATUS_PANEL_FLAG } from '../flags/feature-flags';
+import { DASHBOARD_DISCIPLINE_VIEW_FLAG, HOME_STATUS_PANEL_FLAG, TRADE_TERMINAL_FLAG } from '../flags/feature-flags';
 import { PRICING_BINANCE_FLAG } from '../pricing/binance-klines';
 import { PRICING_BIRDEYE_FLAG } from '../pricing/birdeye-price';
+import { JUPITER_SWAP_BUILD_FLAG } from '../swap/jupiter-client';
 import {
   captureError,
   flushErrorTracking,
@@ -45,6 +47,16 @@ const SEED_FLAGS: { key: string; enabled: boolean }[] = [
   // apply out of the box, the exact bug this flag's own kill-switch review finding exists to
   // let ops recover from at runtime, not the default state.
   { key: CONSTITUTION_PENDING_CHANGE_APPLY_FLAG, enabled: true },
+  // Phase 1 of the trading terminal ships dark (decision 8): `/trade` is the first surface
+  // that can block a real trade, and `jupiter.swap_build` is the integration behind it. Both
+  // are flipped on deliberately, per environment, never by default.
+  { key: TRADE_TERMINAL_FLAG, enabled: false },
+  { key: JUPITER_SWAP_BUILD_FLAG, enabled: false },
+  // The one flag in this repo that can move real money. Off is the designed state, not a
+  // degraded one (decision 14): every phase before Phase 6 exercises the whole pipeline —
+  // quote, evaluate, compile, sign, verify, simulate — with this off and nothing sent. It is
+  // flipped by a human, for one throwaway wallet, once the dry-run pass has been recorded.
+  { key: CHAIN_BROADCAST_FLAG, enabled: false },
 ];
 
 async function seedFeatureFlags(): Promise<void> {

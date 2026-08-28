@@ -1,0 +1,791 @@
+import type { Constitution } from '@degencage/rules';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { RESERVING_TRADE_INTENT_STATUSES, tradeIntents, trades } from '../db/schema';
+import { createQuote, foldVerdict, QuotePreconditionError } from './quote-service';
+import type { JupiterBuildResponse } from './jupiter-client';
+
+/**
+ * The gate itself: what blocks, what does not, and what gets written down.
+ *
+ * `priceTrade` is deliberately **not** mocked — the slippage-safe leg rule is the thing under
+ * test in the pricing cases, and mocking it would assert only that a mock was called. Its
+ * stablecoin paths need no I/O, so every fixture here sells or buys a stablecoin leg.
+ */
+
+const {
+  loadReconciliationStateMock,
+  classifyTokenMock,
+  lookupTokenDecimalsMock,
+  loadWindowedTradesMock,
+  isFeatureEnabledMock,
+  buildSwapMock,
+  assembleSwapTransactionMock,
+  recordEventMock,
+  selectMock,
+  updateMock,
+  transactionMock,
+  insertedValuesSpy,
+  getSolUsdPriceMock,
+  getBirdeyeUsdPriceMock,
+} = vi.hoisted(() => ({
+  loadReconciliationStateMock: vi.fn(),
+  classifyTokenMock: vi.fn(),
+  lookupTokenDecimalsMock: vi.fn(),
+  loadWindowedTradesMock: vi.fn(),
+  isFeatureEnabledMock: vi.fn(),
+  buildSwapMock: vi.fn(),
+  assembleSwapTransactionMock: vi.fn(),
+  recordEventMock: vi.fn(),
+  selectMock: vi.fn(),
+  updateMock: vi.fn(),
+  transactionMock: vi.fn(),
+  insertedValuesSpy: vi.fn(),
+  getSolUsdPriceMock: vi.fn(),
+  getBirdeyeUsdPriceMock: vi.fn(),
+}));
+
+vi.mock('../dashboard/dashboard-state', () => ({ loadReconciliationState: loadReconciliationStateMock }));
+vi.mock('../chain/classify-token', () => ({ classifyToken: classifyTokenMock }));
+vi.mock('../chain/jupiter-tokens', () => ({ lookupTokenDecimals: lookupTokenDecimalsMock }));
+vi.mock('../chain/reconcile-wallet', () => ({ LOSS_LIMIT_ENABLED_FLAG: 'rules.loss_limit_enabled' }));
+vi.mock('../rules/rolling-allowance', () => ({ loadWindowedTrades: loadWindowedTradesMock }));
+vi.mock('../flags/feature-flags', () => ({ isFeatureEnabled: isFeatureEnabledMock }));
+vi.mock('./jupiter-client', () => ({ buildSwap: buildSwapMock, BLOCKHASH_SLOTS_TO_EXPIRY: 150, JupiterBuildError: Error }));
+vi.mock('./assemble-transaction', () => ({ assembleSwapTransaction: assembleSwapTransactionMock }));
+vi.mock('../../observability/events', () => ({ recordEvent: recordEventMock }));
+vi.mock('../db/client', () => ({ getDb: () => ({ select: selectMock, update: updateMock, transaction: transactionMock }) }));
+// The leaf price *sources* are mocked so no case here makes a network call; `priceTrade`
+// itself stays real, since which leg it prices is the thing under test.
+vi.mock('../pricing/binance-klines', () => ({
+  getSolUsdPrice: getSolUsdPriceMock,
+  SOL_MINT: 'So11111111111111111111111111111111111111112',
+}));
+vi.mock('../pricing/birdeye-price', () => ({ getBirdeyeUsdPrice: getBirdeyeUsdPriceMock }));
+
+const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const BONK = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
+const SOL = 'So11111111111111111111111111111111111111112';
+const WALLET_ADDRESS = 'BPFLoaderUpgradeab1e11111111111111111111111';
+
+function dailyNotional(maxUsd: string): Constitution {
+  return { schemaVersion: 1, limits: [{ id: 'limit-daily', type: 'daily_notional_usd', maxUsd, windowHours: 24 }] };
+}
+
+const DAILY_NOTIONAL: Constitution = dailyNotional('500');
+
+/**
+ * Each test uses a distinct amount so the module-level short-TTL quote cache never leaks
+ * between them — and they stay within a base unit of each other, since the amount is now also
+ * the priced sold leg ($100 of 6-decimal USDC, comfortably under `DAILY_NOTIONAL`'s $500).
+ */
+let amountCounter = 0;
+
+function nextAmount(): string {
+  amountCounter += 1;
+  return `${100_000_000 + amountCounter}`;
+}
+
+function constitutionRow(status: string, document: Constitution = DAILY_NOTIONAL) {
+  return { id: 'constitution-1', userId: 'user-1', status, document, activatedAt: new Date() };
+}
+
+/**
+ * The `constitutions` lookup keeps its original one-shape mock; `tradeIntents`/`trades` — the
+ * two tables `intent-lifecycle.ts`'s live-intent reservation reads — always answer empty here,
+ * since no test in this file is exercising that reservation itself (`intent-lifecycle.test.ts`
+ * owns that). Discriminating on the real table object `.from()` is called with, the same
+ * convention `reconcile-wallet.test.ts`'s fake `tx()` uses, is what lets one shared
+ * `selectMock` serve three different query shapes without every existing test having to know
+ * about the two it does not care about.
+ */
+function selectReturns(constitutionRows: unknown[]): void {
+  selectMock.mockImplementation(() => ({
+    from: (table: unknown) => {
+      if (table === tradeIntents || table === trades) {
+        return { where: () => Promise.resolve([]) };
+      }
+
+      return { where: () => ({ limit: async () => constitutionRows }) };
+    },
+  }));
+}
+
+const pgDialect = new PgDialect();
+
+function whereSql(node: unknown): { sql: string; params: unknown[] } {
+  return pgDialect.sqlToQuery(node as Parameters<PgDialect['sqlToQuery']>[0]);
+}
+
+interface FakeIntentRow {
+  id: string;
+  status: string;
+  usdValue: string | null;
+  createdAt: Date;
+  expiresAt: Date;
+  signature: string | null;
+  acquiredTier: string | null;
+}
+
+/**
+ * A tiny in-memory `trade_intents` fake for `wallet-1`, faithful enough to exercise
+ * `createQuote`'s real live-intent reservation and expiry lifecycle across two or more
+ * sequential calls — unlike `selectReturns` above, whose `tradeIntents`/`trades` rows are
+ * always empty. Backs the Phase 4 review's blocking-fix regression tests below.
+ *
+ * `findLiveQuoteSlotIntentId`'s `select({id})` (one projected column) and `loadLiveIntentUsd`'s
+ * `select({id, usdValue, createdAt, signature, acquiredTier})` (five) are the two different
+ * `tradeIntents` reads `createQuote` issues per call — distinguished here by projection key
+ * count, since both otherwise query the same table through the same mocked `selectMock`.
+ */
+function makeLiveIntentFixture(initialRows: FakeIntentRow[] = []): { rows: FakeIntentRow[] } {
+  const rows = [...initialRows];
+  let insertCounter = 0;
+
+  /** `reapExpiredIntents`: quote-slot rows only, guarded by the database clock. */
+  function reapQuoteSlotByClock(): { id: string }[] {
+    const now = Date.now();
+    const reaped = rows.filter((row) => (row.status === 'quoted' || row.status === 'approved') && row.expiresAt.getTime() <= now);
+    reaped.forEach((row) => {
+      row.status = 'expired';
+    });
+    return reaped.map((row) => ({ id: row.id }));
+  }
+
+  /**
+   * `expireAllLive` inside `expireAndReserveLiveIntent`: expires whatever status set the real
+   * predicate actually carries, parsed via `whereSql` rather than a hardcoded parallel list —
+   * so a mutation widening `expireAllLive`'s status array (e.g. to
+   * `RESERVING_TRADE_INTENT_STATUSES`) shows up here as a `signed`/`submitted` row wrongly
+   * expired, instead of this fixture silently keeping its own separate quote-slot notion and
+   * passing regardless of what the real predicate targets.
+   */
+  function expireByPredicate(predicate: unknown): { id: string }[] {
+    const { params } = whereSql(predicate);
+    const statuses = params.filter((param): param is string => typeof param === 'string' && param !== 'wallet-1');
+    const expired = rows.filter((row) => statuses.includes(row.status));
+    expired.forEach((row) => {
+      row.status = 'expired';
+    });
+    return expired.map((row) => ({ id: row.id }));
+  }
+
+  selectMock.mockImplementation((projection?: Record<string, unknown>) => ({
+    from: (table: unknown) => {
+      if (table === trades) {
+        return { where: () => Promise.resolve([]) };
+      }
+
+      if (table !== tradeIntents) {
+        return { where: () => ({ limit: async () => [constitutionRow('active')] }) };
+      }
+
+      const isQuoteSlotLookup = !!projection && Object.keys(projection).length === 1;
+
+      return {
+        where: (predicate: unknown) => {
+          if (isQuoteSlotLookup) {
+            return Promise.resolve(rows.filter((row) => row.status === 'quoted' || row.status === 'approved').map((row) => ({ id: row.id })));
+          }
+
+          // `loadLiveIntentUsd`'s query: [walletId, ...RESERVING_TRADE_INTENT_STATUSES,
+          // windowStart, asOf, excludeIntentId?] — the exclusion, when present, is always the
+          // last param (drizzle's `and()` drops the `undefined` condition entirely otherwise).
+          // Compared against the real status set's length rather than a hardcoded param count,
+          // so this stays correct if RESERVING_TRADE_INTENT_STATUSES ever gains/loses a status.
+          const { params } = whereSql(predicate);
+          const paramCountWithoutExclusion = 1 + RESERVING_TRADE_INTENT_STATUSES.length + 2;
+          const excludeId = params.length > paramCountWithoutExclusion ? (params[params.length - 1] as string) : undefined;
+
+          return Promise.resolve(
+            rows
+              .filter((row) => ['quoted', 'approved', 'signed', 'submitted'].includes(row.status))
+              .filter((row) => row.id !== excludeId)
+              .map((row) => ({ id: row.id, usdValue: row.usdValue, createdAt: row.createdAt, signature: row.signature, acquiredTier: row.acquiredTier })),
+          );
+        },
+      };
+    },
+  }));
+
+  updateMock.mockImplementation((table: unknown) => ({
+    set: () => ({
+      where: () => ({ returning: async () => (table === tradeIntents ? reapQuoteSlotByClock() : []) }),
+    }),
+  }));
+
+  transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
+    callback({
+      select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
+      update: () => ({ set: () => ({ where: (predicate: unknown) => ({ returning: async () => expireByPredicate(predicate) }) }) }),
+      insert: () => ({
+        values: (values: Record<string, unknown>) => {
+          insertedValuesSpy(values);
+          insertCounter += 1;
+          const id = `intent-${insertCounter}`;
+          rows.push({
+            id,
+            status: values.status as string,
+            usdValue: (values.usdValue as string | null) ?? null,
+            createdAt: new Date(),
+            expiresAt: values.expiresAt as Date,
+            signature: null,
+            acquiredTier: (values.acquiredTier as string | null) ?? null,
+          });
+          return { returning: async () => [{ id }] };
+        },
+      }),
+    }),
+  );
+
+  return { rows };
+}
+
+function buildResponse(overrides: Partial<JupiterBuildResponse> = {}): JupiterBuildResponse {
+  return {
+    inputMint: USDC,
+    outputMint: BONK,
+    inAmount: '100000000',
+    outAmount: '900000000',
+    otherAmountThreshold: '800000000',
+    swapMode: 'ExactIn',
+    slippageBps: 50,
+    priceImpactPct: '0.001',
+    routePlan: [{ swapInfo: { ammKey: 'amm', label: 'Orca', inputMint: USDC, outputMint: BONK, inAmount: '1', outAmount: '2' }, percent: 100 }],
+    computeBudgetInstructions: [],
+    setupInstructions: [],
+    swapInstruction: { programId: USDC, accounts: [], data: '' },
+    cleanupInstruction: null,
+    otherInstructions: [],
+    tipInstruction: null,
+    addressesByLookupTableAddress: null,
+    blockhashWithMetadata: { blockhash: [1, 2, 3], lastValidBlockHeight: 300_000_000, fetchedAt: { secs_since_epoch: 1_800_000_000, nanos_since_epoch: 0 } },
+    ...overrides,
+  };
+}
+
+/**
+ * `/build` echoes the amount it was asked for — the exact-in premise `createQuote` asserts —
+ * so the fixture derives `inAmount` from the request rather than pinning it independently.
+ */
+function buildSwapReturns(overrides: Partial<JupiterBuildResponse> = {}): void {
+  buildSwapMock.mockImplementation(async ({ amount }: { amount: string }) => buildResponse({ inAmount: amount, ...overrides }));
+}
+
+function quoteParams(overrides: Record<string, unknown> = {}) {
+  return {
+    walletId: 'wallet-1',
+    walletAddress: WALLET_ADDRESS,
+    userId: 'user-1',
+    inputMint: USDC,
+    outputMint: BONK,
+    amount: nextAmount(),
+    slippageBps: 50,
+    correlationId: 'correlation-1',
+    ...overrides,
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  selectReturns([constitutionRow('active')]);
+  loadReconciliationStateMock.mockResolvedValue('current');
+  classifyTokenMock.mockResolvedValue({ tier: 'MICRO_CAP', classification: 'known' });
+  lookupTokenDecimalsMock.mockResolvedValue(new Map([[USDC, 6], [BONK, 5]]));
+  loadWindowedTradesMock.mockResolvedValue([]);
+  getSolUsdPriceMock.mockResolvedValue(null);
+  getBirdeyeUsdPriceMock.mockResolvedValue(null);
+  isFeatureEnabledMock.mockResolvedValue(true);
+  buildSwapReturns();
+  assembleSwapTransactionMock.mockResolvedValue({
+    messageBase64: 'bWVzc2FnZQ==',
+    txMessageHash: 'a'.repeat(64),
+    computeUnitLimit: 120_000,
+    blockhash: 'Blockhash1111111111111111111111111111111111',
+    lastValidBlockHeight: 300_000_000,
+  });
+  recordEventMock.mockResolvedValue(undefined);
+  // `reapExpiredIntents` (top of `createQuote`, and inside `loadLiveIntentUsd`) — no live
+  // intent to reap by default in any of these tests.
+  updateMock.mockReturnValue({ set: () => ({ where: () => ({ returning: async () => [] }) }) });
+  transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
+    callback({
+      // `expireAndReserveLiveIntent`'s wallet-row lock — the row itself is never read.
+      select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
+      // `expireAndReserveLiveIntent`'s guarded expire of the wallet's prior live intent — no
+      // prior live intent by default, so `persistIntent` never records `trade.intent_expired`
+      // unless a test overrides this.
+      update: () => ({ set: () => ({ where: () => ({ returning: async () => [] }) }) }),
+      insert: () => ({
+        values: (values: unknown) => {
+          insertedValuesSpy(values);
+          return { returning: async () => [{ id: 'intent-1' }] };
+        },
+      }),
+    }),
+  );
+});
+
+describe('foldVerdict', () => {
+  it('allows only when every limit allowed', () => {
+    expect(foldVerdict([{ verdict: 'allow' }, { verdict: 'allow' }] as never)).toBe('allow');
+  });
+
+  it('blocks on a single violation', () => {
+    expect(foldVerdict([{ verdict: 'allow' }, { verdict: 'violation' }] as never)).toBe('block');
+  });
+
+  it('blocks on an unevaluable limit — never treats "we could not check" as "fine"', () => {
+    expect(foldVerdict([{ verdict: 'allow' }, { verdict: 'unevaluable' }] as never)).toBe('block');
+  });
+});
+
+describe('createQuote preconditions', () => {
+  it('refuses to quote when the user has no constitution at all', async () => {
+    selectReturns([]);
+
+    await expect(createQuote(quoteParams())).rejects.toMatchObject({ reason: 'constitution_not_active' });
+    expect(buildSwapMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['draft', 'committing'])('refuses to quote against a %s constitution', async (status) => {
+    selectReturns([constitutionRow(status)]);
+
+    await expect(createQuote(quoteParams())).rejects.toBeInstanceOf(QuotePreconditionError);
+    expect(buildSwapMock).not.toHaveBeenCalled();
+  });
+
+  it('proceeds once the constitution is active', async () => {
+    const result = await createQuote(quoteParams());
+
+    expect(result.verdict).toBe('allow');
+    expect(buildSwapMock).toHaveBeenCalledOnce();
+  });
+
+  it.each(['never', 'in_progress', 'failed'])('refuses to quote when reconciliation is %s', async (state) => {
+    loadReconciliationStateMock.mockResolvedValue(state);
+
+    await expect(createQuote(quoteParams())).rejects.toMatchObject({ reason: 'not_reconciled' });
+    expect(buildSwapMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('createQuote fold rule', () => {
+  it('records an allowed quote as `quoted`, with the assembled message hash', async () => {
+    const result = await createQuote(quoteParams());
+
+    expect(result.verdict).toBe('allow');
+    expect(result.transaction?.txMessageHash).toBe('a'.repeat(64));
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'quoted', txMessageHash: 'a'.repeat(64) }));
+  });
+
+  it('blocks and records `blocked` when a limit is violated, and never assembles signable bytes', async () => {
+    loadWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: '480' }]);
+
+    const result = await createQuote(quoteParams());
+
+    expect(result.verdict).toBe('block');
+    expect(result.evaluations[0]!.verdict).toBe('violation');
+    expect(result.transaction).toBeNull();
+    expect(assembleSwapTransactionMock).not.toHaveBeenCalled();
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked', txMessageHash: null }));
+  });
+
+  it('blocks when a dependency leaves the trade unpriceable — unevaluable, never a silent allow', async () => {
+    lookupTokenDecimalsMock.mockResolvedValue(new Map());
+
+    const result = await createQuote(quoteParams());
+
+    expect(result.verdict).toBe('block');
+    expect(result.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'trade_unpriced' });
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked', usdValue: null }));
+  });
+
+  it('blocks when the wallet’s own history contains an unpriced trade', async () => {
+    loadWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: null }]);
+
+    const result = await createQuote(quoteParams());
+
+    expect(result.verdict).toBe('block');
+    expect(result.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'history_contains_unpriced_trade' });
+  });
+
+  it('keeps rolling_loss_usd evaluable against known window losses despite this trade’s own unknown loss', async () => {
+    selectReturns([
+      constitutionRow('active', { schemaVersion: 1, limits: [{ id: 'limit-loss', type: 'rolling_loss_usd', maxUsd: '200', windowHours: 168 }] }),
+    ]);
+    loadWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: '10', isRoundTripClose: true, realizedLossUsd: '-50' }]);
+
+    const result = await createQuote(quoteParams());
+
+    expect(result.evaluations[0]).toMatchObject({ verdict: 'allow', priorUsd: '50', totalUsd: '50' });
+    expect(result.verdict).toBe('allow');
+  });
+
+  it('blocks when the loss-matching kill switch is off, rather than reporting a vacuous $0 of losses', async () => {
+    selectReturns([
+      constitutionRow('active', { schemaVersion: 1, limits: [{ id: 'limit-loss', type: 'rolling_loss_usd', maxUsd: '200', windowHours: 168 }] }),
+    ]);
+    isFeatureEnabledMock.mockResolvedValue(false);
+
+    const result = await createQuote(quoteParams());
+
+    expect(result.evaluations[0]).toMatchObject({ verdict: 'unevaluable', reason: 'loss_matching_disabled' });
+    expect(result.verdict).toBe('block');
+  });
+
+  it('propagates a Jupiter failure rather than returning a quote with no verdict', async () => {
+    buildSwapMock.mockRejectedValue(new Error('jupiter.swap_build is disabled'));
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/jupiter.swap_build is disabled/);
+    expect(insertedValuesSpy).not.toHaveBeenCalled();
+  });
+
+  it('propagates an assembly failure rather than recording an allowed intent nothing can sign', async () => {
+    assembleSwapTransactionMock.mockRejectedValue(new Error('swap simulation failed'));
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/swap simulation failed/);
+    expect(insertedValuesSpy).not.toHaveBeenCalled();
+  });
+
+  it('still records the reached decision as a rule.pre_trade_decision event when assembly fails — finding 1', async () => {
+    assembleSwapTransactionMock.mockRejectedValue(new Error('swap simulation failed'));
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/swap simulation failed/);
+
+    expect(recordEventMock).toHaveBeenCalledTimes(1);
+    const [event] = recordEventMock.mock.calls[0]!;
+    expect(event).toMatchObject({
+      eventType: 'rule.pre_trade_decision',
+      payload: expect.objectContaining({ intentId: null, verdict: 'allow', assemblyFailed: true }),
+    });
+    // Recorded outside any transaction — there is no intent row to make it atomic with.
+    expect(recordEventMock.mock.calls[0]![1]).toBeUndefined();
+  });
+});
+
+describe('createQuote exact-in premise', () => {
+  it('blocks the quote when /build comes back exact-out, rather than pricing a leg that is not fixed', async () => {
+    buildSwapReturns({ swapMode: 'ExactOut' });
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/ExactIn/);
+    expect(lookupTokenDecimalsMock).not.toHaveBeenCalled();
+    expect(insertedValuesSpy).not.toHaveBeenCalled();
+  });
+
+  it('blocks the quote when /build returns an inAmount the request never asked for', async () => {
+    buildSwapMock.mockResolvedValue(buildResponse({ inAmount: '777' }));
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/inAmount 777/);
+    expect(lookupTokenDecimalsMock).not.toHaveBeenCalled();
+    expect(insertedValuesSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('createQuote instrumentation', () => {
+  it('writes both events inside the same transaction as the intent row', async () => {
+    await createQuote(quoteParams());
+
+    const executors = recordEventMock.mock.calls.map((call) => call[1]);
+    expect(recordEventMock).toHaveBeenCalledTimes(2);
+    expect(recordEventMock.mock.calls.map((call) => (call[0] as { eventType: string }).eventType)).toEqual([
+      'trade.intent_created',
+      'rule.pre_trade_decision',
+    ]);
+    expect(executors[0]).toBe(executors[1]);
+    expect(executors[0]).toBeDefined();
+  });
+
+  it('passes the request’s correlation id through to buildSwap — finding 3', async () => {
+    const params = quoteParams({ correlationId: 'correlation-xyz' });
+
+    await createQuote(params);
+
+    expect(buildSwapMock).toHaveBeenCalledWith(expect.objectContaining({ inputMint: params.inputMint }), 'correlation-xyz');
+  });
+
+  it('carries the verdict and the evaluations that produced it on the decision event', async () => {
+    loadWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: '480' }]);
+
+    await createQuote(quoteParams());
+
+    const decisionEvent = recordEventMock.mock.calls[1]![0] as { payload: { verdict: string; evaluations: unknown[] } };
+    expect(decisionEvent.payload.verdict).toBe('block');
+    expect(decisionEvent.payload.evaluations).toHaveLength(1);
+  });
+});
+
+/**
+ * Finding 2: `evaluateQuote` reads the wallet's quote-slot occupant and excludes it from the
+ * reservation sum *before* the network work (`/build`'s assembly/simulation) that follows. If
+ * that occupant leaves the quote slot in the gap — a concurrent submit moving it to `signed`,
+ * say — the exclusion this decision was evaluated against is stale by the time `persistIntent`
+ * commits. Enforcement is unaffected (`submit-service.ts`'s `reevaluate` re-includes it); these
+ * tests cover only that the audit trail says so.
+ */
+describe('createQuote quote-slot exclusion staleness (audit trail)', () => {
+  it('flags the decision when the excluded quote-slot intent no longer matches what the lock actually expired', async () => {
+    let quoteSlotRead = false;
+
+    selectMock.mockImplementation((projection?: Record<string, unknown>) => ({
+      from: (table: unknown) => {
+        if (table === trades) return { where: () => Promise.resolve([]) };
+        if (table !== tradeIntents) return { where: () => ({ limit: async () => [constitutionRow('active')] }) };
+
+        const isQuoteSlotLookup = !!projection && Object.keys(projection).length === 1;
+
+        return {
+          where: () => {
+            if (isQuoteSlotLookup) {
+              // Read once: the row is still occupying the quote slot at this instant...
+              quoteSlotRead = true;
+              return Promise.resolve([{ id: 'intent-prior' }]);
+            }
+
+            return Promise.resolve([]);
+          },
+        };
+      },
+    }));
+
+    transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
+      callback({
+        select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
+        // ...but by the time the lock runs, a concurrent submit has already moved it out of
+        // `QUOTE_SLOT_STATUSES` — nothing is found to expire.
+        update: () => ({ set: () => ({ where: () => ({ returning: async () => [] }) }) }),
+        insert: () => ({
+          values: (values: unknown) => {
+            insertedValuesSpy(values);
+            return { returning: async () => [{ id: 'intent-2' }] };
+          },
+        }),
+      }),
+    );
+
+    await createQuote(quoteParams());
+
+    expect(quoteSlotRead).toBe(true);
+    const decisionEvent = recordEventMock.mock.calls.find((call) => (call[0] as { eventType: string }).eventType === 'rule.pre_trade_decision')![0] as {
+      payload: Record<string, unknown>;
+    };
+    expect(decisionEvent.payload).toMatchObject({ excludedQuoteSlotIntentId: 'intent-prior', excludedQuoteSlotIntentStale: true });
+  });
+
+  it('does not flag staleness when the excluded intent is exactly what the lock expires', async () => {
+    makeLiveIntentFixture([
+      {
+        id: 'intent-quoted-1',
+        status: 'quoted',
+        usdValue: '50',
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    await createQuote(quoteParams({ amount: '100000000' }));
+
+    const decisionEvent = recordEventMock.mock.calls.find((call) => (call[0] as { eventType: string }).eventType === 'rule.pre_trade_decision')![0] as {
+      payload: Record<string, unknown>;
+    };
+    expect(decisionEvent.payload).toMatchObject({ excludedQuoteSlotIntentId: 'intent-quoted-1', excludedQuoteSlotIntentStale: false });
+  });
+
+  it('reports no exclusion at all when the wallet had no live quote slot to begin with', async () => {
+    await createQuote(quoteParams());
+
+    const decisionEvent = recordEventMock.mock.calls.find((call) => (call[0] as { eventType: string }).eventType === 'rule.pre_trade_decision')![0] as {
+      payload: Record<string, unknown>;
+    };
+    expect(decisionEvent.payload).toMatchObject({ excludedQuoteSlotIntentId: null, excludedQuoteSlotIntentStale: false });
+  });
+});
+
+describe('createQuote slippage-safe pricing', () => {
+  it('prices an acquisition off the exact sold leg, regardless of what outAmount claims', async () => {
+    buildSwapReturns({ outAmount: '999999999999', otherAmountThreshold: '1' });
+
+    const result = await createQuote(quoteParams({ amount: '250000000' }));
+
+    // 250000000 base units of 6-decimal USDC = $250 — untouched by the optimistic outAmount.
+    expect(result.quote.usdValue).toBe('250.000000');
+  });
+
+  it('prices a sale off the exact sold leg too, never the stable leg’s slippage-shrinkable threshold', async () => {
+    buildSwapReturns({ inputMint: BONK, outputMint: USDC, outAmount: '400000000', otherAmountThreshold: '300000000' });
+    lookupTokenDecimalsMock.mockResolvedValue(new Map([[BONK, 5], [USDC, 6]]));
+    getBirdeyeUsdPriceMock.mockResolvedValue('0.000002');
+
+    const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC, amount: '5000000' }));
+
+    // 5000000 base units of 5-decimal BONK = 50 BONK at $0.000002. The $300 guaranteed-minimum
+    // proceeds are the *floor*-limit figure; a ceiling limit must never be denominated in a
+    // number the request's own slippage can shrink.
+    expect(result.quote.usdValue).toBe('0.00010000000');
+    expect(getBirdeyeUsdPriceMock).toHaveBeenCalledWith(BONK, expect.any(Date));
+  });
+
+  it('blocks rather than falling back to the stable bought leg when the sold leg has no price', async () => {
+    buildSwapReturns({ inputMint: BONK, outputMint: USDC, outAmount: '400000000', otherAmountThreshold: '300000000' });
+    lookupTokenDecimalsMock.mockResolvedValue(new Map([[BONK, 5], [USDC, 6]]));
+
+    const result = await createQuote(quoteParams({ inputMint: BONK, outputMint: USDC }));
+
+    expect(result.quote.usdValue).toBeNull();
+    expect(result.verdict).toBe('block');
+  });
+
+  /**
+   * The bypass this rule exists to close: SOL→USDC is the dominant path in the terminal, and
+   * pricing it off `otherAmountThreshold` let a scripted POST discount its own recorded
+   * notional by whatever slippage it asked for.
+   */
+  it('records a SOL→USDC quote at wide slippage off the exact sold SOL, and still blocks', async () => {
+    selectReturns([constitutionRow('active', dailyNotional('145'))]);
+    buildSwapReturns({ inputMint: SOL, outputMint: USDC, outAmount: '150000000', otherAmountThreshold: '142500000', slippageBps: 500 });
+    lookupTokenDecimalsMock.mockResolvedValue(new Map([[SOL, 9], [USDC, 6]]));
+    getSolUsdPriceMock.mockResolvedValue('150');
+
+    const result = await createQuote(quoteParams({ inputMint: SOL, outputMint: USDC, slippageBps: 500, amount: '1000000000' }));
+
+    // 1 SOL at $150. Priced off the threshold this reads as $142.50, slips under the $145
+    // limit, and the trade the user forbade themselves goes through.
+    expect(result.quote.usdValue).toBe('150.000000000');
+    expect(result.verdict).toBe('block');
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ usdValue: '150.000000000', status: 'blocked' }));
+  });
+
+  it('writes the same figure to the intent row that the limits were evaluated against', async () => {
+    const result = await createQuote(quoteParams());
+
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ usdValue: result.quote.usdValue }));
+  });
+});
+
+describe('createQuote caching', () => {
+  it('reuses a fresh build for the same wallet, pair, amount and slippage', async () => {
+    const params = quoteParams();
+
+    await createQuote(params);
+    await createQuote({ ...params });
+
+    expect(buildSwapMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never serves one wallet’s assembled quote to another wallet', async () => {
+    const params = quoteParams();
+
+    await createQuote(params);
+    await createQuote({ ...params, walletId: 'wallet-2', walletAddress: 'SysvarRent111111111111111111111111111111111' });
+
+    expect(buildSwapMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The Phase 4 review's two blocking findings, reproduced end to end through `createQuote` (not
+ * just at the `intent-lifecycle.ts` unit level, which `intent-lifecycle.test.ts` already
+ * covers) — plus the plan-mandated cases the prior version of this file never wrote:
+ * reservation from a genuinely prior live intent, expiry of the wallet's quote-slot occupant on
+ * a new quote, and reaping an abandoned quote before its usd_value is summed.
+ */
+describe('createQuote live-intent reservation (Phase 4 regression)', () => {
+  it('reflects reduced headroom from a submitted live intent, and that intent survives the quote and its reaper — the allowance double-spend fix', async () => {
+    const fixture = makeLiveIntentFixture([
+      {
+        id: 'intent-submitted-1',
+        status: 'submitted',
+        usdValue: '400',
+        createdAt: new Date(),
+        // Blockhash-derived expiry already in the past — a real broadcast trade sitting in
+        // `submitted` while Phase 5 reconciliation is still pending. Must not be reaped.
+        expiresAt: new Date(Date.now() - 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    const result = await createQuote(quoteParams({ amount: '150000000' }));
+
+    // $400 already reserved + this $150 request exceeds the $500 daily limit — the reduced
+    // headroom from the prior live intent is what the fold rule blocks on.
+    expect(result.verdict).toBe('block');
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }));
+    // Never reaped (its `expires_at` is in the past, but `QUOTE_SLOT_STATUSES` excludes
+    // `submitted`) and never touched by the new quote's expire-prior-intent step either.
+    expect(fixture.rows.find((row) => row.id === 'intent-submitted-1')!.status).toBe('submitted');
+  });
+
+  it('expires the wallet’s prior quoted intent when a new quote is requested, and records trade.intent_expired — persistIntent’s expiry branch', async () => {
+    const fixture = makeLiveIntentFixture([
+      {
+        id: 'intent-quoted-1',
+        status: 'quoted',
+        usdValue: '50',
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    const result = await createQuote(quoteParams({ amount: '100000000' }));
+
+    expect(result.verdict).toBe('allow');
+    expect(fixture.rows.find((row) => row.id === 'intent-quoted-1')!.status).toBe('expired');
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'trade.intent_expired',
+        payload: expect.objectContaining({ intentId: 'intent-quoted-1', reason: 'new_quote_requested' }),
+      }),
+      expect.anything(),
+    );
+    expect(fixture.rows.filter((row) => row.status === 'quoted')).toHaveLength(1);
+  });
+
+  it('reaps an abandoned, time-expired intent before its usd_value is summed against the new quote', async () => {
+    const fixture = makeLiveIntentFixture([
+      {
+        id: 'intent-old',
+        status: 'quoted',
+        usdValue: '450',
+        createdAt: new Date(Date.now() - 3_600_000),
+        expiresAt: new Date(Date.now() - 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    const result = await createQuote(quoteParams({ amount: '100000000' }));
+
+    // Summed unreaped, $450 + $100 would exceed the $500 limit and block. Reaped first, only
+    // this $100 request counts.
+    expect(result.verdict).toBe('allow');
+    expect(fixture.rows.find((row) => row.id === 'intent-old')!.status).toBe('expired');
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'trade.intent_expired',
+        payload: expect.objectContaining({ intentId: 'intent-old', reason: 'quote_ttl_expired' }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('does not block a re-quote near headroom against its own predecessor’s reservation — the self-count fix', async () => {
+    const fixture = makeLiveIntentFixture([]);
+
+    const first = await createQuote(quoteParams({ amount: '300000000' }));
+    const second = await createQuote(quoteParams({ amount: '300000000' }));
+
+    // Summed against itself, $300 + $300 would exceed the $500 limit. The first quote's own
+    // reservation must be excluded from the second's evaluation, since this very request is
+    // what replaces it.
+    expect(first.verdict).toBe('allow');
+    expect(second.verdict).toBe('allow');
+    expect(fixture.rows.filter((row) => row.status === 'expired')).toHaveLength(1);
+    expect(fixture.rows.filter((row) => row.status === 'quoted')).toHaveLength(1);
+  });
+});

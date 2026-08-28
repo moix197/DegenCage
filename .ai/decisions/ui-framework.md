@@ -3,8 +3,9 @@
 **Decision:** `apps/web` adopts Tailwind CSS v4 (via `@tailwindcss/postcss`) and shadcn/ui
 as its component layer, initialized with `pnpm dlx shadcn@latest init` and components added
 one at a time with `pnpm dlx shadcn@latest add <name>` — `card`, `badge`, `table`,
-`separator`, `skeleton`, `alert` to start (Phase 7's dashboard), more only as a real screen
-needs them.
+`separator`, `skeleton`, `alert`, `button` for the dashboard, then `input`, `label`, `field`,
+`select`, `dialog`, `tooltip`, `sonner` for the `/trade` terminal's form; more only as a real
+screen needs them.
 
 **Why:** Every screen shipped through Phase 6 (`/`, `/connect`, `/constitution`, and the
 Phase 4–6 status page since renamed to `/dashboard`) hand-rolls its markup with inline
@@ -45,10 +46,12 @@ differentiator. The rule engine, commitment logic, and violation detection stay 
 **Constraints it creates:**
 
 - **`apps/web/src/app/layout.tsx` now imports `./globals.css`.** Required for Tailwind's
-  utility classes to resolve anywhere in the app, including on pages that don't otherwise
-  use them. The existing inline `style={{}}` on `<body>` is untouched and keeps winning on
-  specificity (inline style beats the `@layer base` rules Tailwind adds), so this import
-  causes no visible change to `/`, `/connect`, or `/constitution`.
+  utility classes to resolve anywhere in the app. `<html>` carries the `dark` class so
+  shadcn's dark-mode CSS variables drive the palette everywhere, and the previous inline
+  `style={{}}` on `<body>` is gone: `<body>` is now styled with
+  `bg-background text-foreground px-6 py-12` Tailwind utilities, sourcing color from those
+  same shadcn CSS variables and restoring the page padding the inline style used to
+  provide.
 - **Existing inline-style pages (`app/page.tsx`, `constitution/constitution-panel.tsx`) are
   left exactly as they are.** They are not
   migrated to Tailwind/shadcn as part of this change — that is a separate, opportunistic
@@ -56,6 +59,13 @@ differentiator. The rule engine, commitment logic, and violation detection stay 
   standing "port everything now" task.
 - **New screens use Tailwind + shadcn primitives; do not add new inline `style={{}}`
   screens going forward.** Phase 7's dashboard is the first to follow this.
+- **There is no `form` primitive — `field` is the equivalent.** This project's shadcn style
+  (`base-nova`, in `components.json`) ships no `form.tsx`; `shadcn add form` will not produce
+  one, and the Radix-era component on the docs site must not be pasted in as a substitute.
+- **`dialog`, `field`, `tooltip` and `sonner` are vendored but not yet imported by any screen.**
+  They were added in one CLI pass with the rest of the trade-form set. Either a screen picks
+  them up or they get deleted — vendored-and-unused is the one form of dead code this
+  copied-in-source model makes easy to accumulate.
 - **Component additions go through the shadcn CLI (`pnpm dlx shadcn@latest add <name>`),
   never hand-copied from the docs site.** Keeps `components.json`'s registry config, the
   generated file set, and dependency versions consistent with what the CLI expects to

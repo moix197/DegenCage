@@ -41,6 +41,24 @@ integrations, and this is the same reasoning that puts the constitution in `json
   fail-closed semantics.
 - **A feature ships with its flag seeded.** `apps/web/src/server/db/seed.ts` is the list;
   each phase appends its keys there rather than inserting rows by hand.
+- **The three trading-path switches, and why each is seeded `false`:**
+
+  | Key | Seeded | Gates |
+  | --- | ------ | ----- |
+  | `trade.terminal` | `false` | the `/trade` page and all of `POST /api/swap/quote`, `POST /api/swap/submit`, `GET /api/swap/intent/[id]` |
+  | `jupiter.swap_build` | `false` | `server/swap/jupiter-client.ts`'s calls to Jupiter `/swap/v2/build` |
+  | `chain.broadcast` | `false` | whether `server/chain/broadcast-transaction.ts` *sends* the signed bytes or only simulates them |
+
+  All three ship dark. Off is the *designed* state for `chain.broadcast`, not a degraded one:
+  its branch is a simulate-or-send choice at one call site precisely so the live path is a flag
+  row rather than a code change nothing has ever run. **It has never been flipped on** — Phase 1
+  shipped with Phase 6 (the dry-run pass plus one throwaway-wallet swap) deferred, so no
+  signature this system produced has reached the chain and everything downstream of send is
+  proven only by tests and review. Do not treat it as safe to flip until that pass runs.
+- **No switch may leave trading reachable with enforcement off.** `trade.terminal` removes the
+  *surface*; there is deliberately no flag that disables rule evaluation while a user can still
+  quote and sign. Removing the surface is the only safe direction, and a proposed flag that
+  would weaken a verdict instead belongs in the timelocked constitution, not here.
 - Naming is `domain.feature` (`auth.wallet_connect`, `chain.helius`, `pricing.birdeye`) so
   a whole integration can be found by prefix.
 - The decision (`resolveFeatureFlag`) is a pure function separate from the query, which is
