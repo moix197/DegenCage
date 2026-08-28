@@ -8,6 +8,7 @@ import {
   needsLotBackfill,
   ReconcileRejected,
   reconcileWallet,
+  resolveIntentOutcome,
 } from './reconcile-wallet';
 import { WSOL_MINT } from './lst-allowlist';
 import { STABLECOIN_MINTS } from './stablecoin-mints';
@@ -232,17 +233,23 @@ function fakeDatabase(
             returning: async () => {
               const { sql: renderedSql, params } = whereSql(condition);
               intentSweepWhereSqlCalls.push(renderedSql);
-              const [queryWalletId, queryStatus] = params as [string, string];
+              // `[queryWalletId, ...rest]`, not a fixed-position destructure: the sweep now
+              // guards on `inArray(status, RECONCILABLE_INTENT_STATUSES)` (WARNING 5's fix,
+              // `signed` and `submitted`), not a single `eq`, so the status literals occupy a
+              // variable number of positions ahead of the trailing interval-literal param.
+              // `rest.includes(intent.status)` is safe against that trailing param regardless
+              // — it is a duration string, never a value equal to any real intent status.
+              const [queryWalletId, ...rest] = params as string[];
               const now = new Date();
               const swept = intents.filter(
-                (intent) => intent.walletId === queryWalletId && intent.status === queryStatus && isStrandedSubmittedIntent(intent.expiresAt, now),
+                (intent) => intent.walletId === queryWalletId && rest.includes(intent.status) && isStrandedSubmittedIntent(intent.expiresAt, now),
               );
 
               for (const intent of swept) {
                 intent.status = values.status;
               }
 
-              intentSweepCalls.push({ walletId: queryWalletId, next: values.status, sweptIds: swept.map((intent) => intent.id) });
+              intentSweepCalls.push({ walletId: queryWalletId!, next: values.status, sweptIds: swept.map((intent) => intent.id) });
 
               return swept.map((intent) => ({ id: intent.id }));
             },
@@ -512,6 +519,38 @@ describe('isQuoteMint', () => {
 
   it('is false for an ordinary token mint', () => {
     expect(isQuoteMint('BONK1111111111111111111111111111111111111')).toBe(false);
+  });
+});
+
+// WARNING 4's fix: a landed-but-excluded transaction (a SOL/LST leg on both sides, a
+// wrap/unwrap self-cancel, or a missing block time) must resolve its matching intent to
+// `confirmed`, not `failed` — the signature landed and did what it was meant to. Only a
+// transaction that genuinely did not execute the intended swap (reverted, or only one side
+// registered) still resolves to `failed`.
+describe('resolveIntentOutcome', () => {
+  it('confirms a real (non-excluded) trade', () => {
+    expect(resolveIntentOutcome(null)).toBe('confirmed');
+  });
+
+  it('confirms a SOL/LST-to-SOL/LST swap — excluded from position accounting, but it landed and swapped', () => {
+    expect(resolveIntentOutcome('lst_swap')).toBe('confirmed');
+  });
+
+  it('confirms a wrap/unwrap self-cancel — it landed and did exactly what wrapping/unwrapping does', () => {
+    expect(resolveIntentOutcome('wrap_unwrap')).toBe('confirmed');
+  });
+
+  it('confirms a transaction with no block time — the matched signature itself proves it landed', () => {
+    expect(resolveIntentOutcome('missing_block_time')).toBe('confirmed');
+  });
+
+  it('fails a transaction with no net token change — it landed but the instruction reverted', () => {
+    expect(resolveIntentOutcome('no_net_change')).toBe('failed');
+  });
+
+  it('fails a transaction that only registered one side of the swap', () => {
+    expect(resolveIntentOutcome('pure_receive')).toBe('failed');
+    expect(resolveIntentOutcome('pure_send')).toBe('failed');
   });
 });
 
@@ -908,6 +947,32 @@ describe('reconcileWallet — trade_intent linkage (Phase 5)', () => {
     );
   });
 
+  it('WARNING 4: confirms (not fails) an intent whose matching signature derived to a landed-but-excluded swap', async () => {
+    const { intents, intentResolveCalls } = fakeDatabase(ALREADY_BASELINED, {
+      liveIntents: [{ id: 'intent-lst', walletId: WALLET_ID, signature: 'sig-lst', status: 'submitted', expiresAt: new Date(Date.now() + 60_000) }],
+    });
+    getTransactionsForAddressMock.mockResolvedValue([heliusTx('sig-lst', 100)]);
+    deriveSwapFromTransactionMock.mockReturnValueOnce(
+      derivedSwap('sig-lst', 100, {
+        excludedReason: 'lst_swap',
+        soldMint: WSOL_MINT,
+        boughtMint: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+      }),
+    );
+
+    await reconcileWallet('cid-link-lst');
+
+    expect(intentResolveCalls).toEqual([{ intentId: 'intent-lst', next: 'confirmed' }]);
+    expect(intents.find((intent) => intent.id === 'intent-lst')?.status).toBe('confirmed');
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'trade.intent_confirmed',
+        payload: expect.objectContaining({ intentId: 'intent-lst', stage: 'reconciliation', reason: 'lst_swap' }),
+      }),
+      expect.anything(),
+    );
+  });
+
   it('does not re-link or re-transition on a rerun — the (wallet_id, signature) dedup this phase must not disturb', async () => {
     const { intents, intentResolveCalls, persistedSignatures } = fakeDatabase(ALREADY_BASELINED, {
       liveIntents: [{ id: 'intent-rerun', walletId: WALLET_ID, signature: 'sig-rerun', status: 'submitted', expiresAt: new Date(Date.now() + 60_000) }],
@@ -957,7 +1022,7 @@ describe('isStrandedSubmittedIntent', () => {
   });
 });
 
-describe('reconcileWallet — submitted intent sweep (Phase 5, Step 5)', () => {
+describe('reconcileWallet — signed/submitted intent sweep (Phase 5, Step 5 + WARNING 5)', () => {
   it('sweeps a genuinely-stranded submitted intent to failed, with a distinct sweep-stage event', async () => {
     const { intents, intentSweepCalls } = fakeDatabase(ALREADY_BASELINED, {
       liveIntents: [
@@ -997,7 +1062,7 @@ describe('reconcileWallet — submitted intent sweep (Phase 5, Step 5)', () => {
     );
   });
 
-  it('the sweep never fires for an already-resolved intent — only submitted is ever swept', async () => {
+  it('the sweep never fires for an already-resolved intent — only signed/submitted are ever swept', async () => {
     const { intents, intentSweepCalls } = fakeDatabase(ALREADY_BASELINED, {
       liveIntents: [
         { id: 'intent-already-confirmed', walletId: WALLET_ID, signature: 'sig-already-confirmed', status: 'confirmed', expiresAt: new Date(Date.now() - 10 * 60_000) },
@@ -1009,6 +1074,47 @@ describe('reconcileWallet — submitted intent sweep (Phase 5, Step 5)', () => {
 
     expect(intentSweepCalls[0]?.sweptIds).toEqual([]);
     expect(intents.find((intent) => intent.id === 'intent-already-confirmed')?.status).toBe('confirmed');
+  });
+
+  /**
+   * WARNING 5: a crash between `submit-service.ts`'s `transitionToSigned` and
+   * `transitionFromSigned` leaves an intent stuck in `signed` forever if its transaction never
+   * actually broadcast — nothing else ever moves it, since `persistOneSwap`'s linkage only
+   * resolves a signature that landed. Same grace-period boundary and event shape as the
+   * `submitted` case above.
+   */
+  it('sweeps a genuinely-stranded signed intent to failed too', async () => {
+    const { intents, intentSweepCalls } = fakeDatabase(ALREADY_BASELINED, {
+      liveIntents: [
+        { id: 'intent-stranded-signed', walletId: WALLET_ID, signature: 'sig-never-broadcast', status: 'signed', expiresAt: new Date(Date.now() - 10 * 60_000) },
+      ],
+    });
+    getTransactionsForAddressMock.mockResolvedValue([]);
+
+    await reconcileWallet('cid-sweep-signed-1');
+
+    expect(intentSweepCalls[0]?.sweptIds).toEqual(['intent-stranded-signed']);
+    expect(intents.find((intent) => intent.id === 'intent-stranded-signed')?.status).toBe('failed');
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'trade.intent_failed',
+        payload: expect.objectContaining({ intentId: 'intent-stranded-signed', walletId: WALLET_ID, reason: 'blockhash_expired_unresolved', stage: 'sweep' }),
+      }),
+    );
+  });
+
+  it('does not sweep a signed intent still legitimately in flight — within the grace period past expiry', async () => {
+    const { intents, intentSweepCalls } = fakeDatabase(ALREADY_BASELINED, {
+      liveIntents: [
+        { id: 'intent-signed-in-flight', walletId: WALLET_ID, signature: 'sig-signed-in-flight', status: 'signed', expiresAt: new Date(Date.now() - 30_000) },
+      ],
+    });
+    getTransactionsForAddressMock.mockResolvedValue([]);
+
+    await reconcileWallet('cid-sweep-signed-2');
+
+    expect(intentSweepCalls[0]?.sweptIds).toEqual([]);
+    expect(intents.find((intent) => intent.id === 'intent-signed-in-flight')?.status).toBe('signed');
   });
 
   it('releases the swept intent from the rolling-allowance reservation set', async () => {
@@ -1032,7 +1138,7 @@ describe('reconcileWallet — submitted intent sweep (Phase 5, Step 5)', () => {
     expect(RESERVING_TRADE_INTENT_STATUSES).not.toContain(swept?.status);
   });
 
-  it('the guarded UPDATE is scoped to this wallet, the submitted status, and an expires_at-vs-now() database-clock comparison', async () => {
+  it('the guarded UPDATE is scoped to this wallet, the signed/submitted statuses, and an expires_at-vs-now() database-clock comparison', async () => {
     const { intentSweepWhereSqlCalls } = fakeDatabase(ALREADY_BASELINED, { liveIntents: [] });
     getTransactionsForAddressMock.mockResolvedValue([]);
 
@@ -1041,7 +1147,7 @@ describe('reconcileWallet — submitted intent sweep (Phase 5, Step 5)', () => {
     expect(intentSweepWhereSqlCalls).toHaveLength(1);
     const renderedSql = intentSweepWhereSqlCalls[0]!.toLowerCase();
     expect(renderedSql).toContain('"wallet_id" =');
-    expect(renderedSql).toContain('"status" =');
+    expect(renderedSql).toContain('"status" in');
     expect(renderedSql).toContain('"expires_at" <=');
     expect(renderedSql).toContain('now()');
     expect(renderedSql).toContain('interval');

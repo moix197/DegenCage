@@ -100,6 +100,37 @@ The route (`app/api/swap/submit/route.ts`) is thin like the quote route: shape v
 `resolveSession()` and status codes only — `403` for `wallet_mismatch` (an authorization
 failure), `409` for every other rejection, `503` for anything unexpected.
 
+## The status poll
+
+```
+GET /api/swap/intent/[id] ──> loadIntentStatusForWallet()     intent-lifecycle.ts
+  runtime='nodejs'              resolveSession() ← the only source of wallet identity
+  flag: trade.terminal
+   │
+   ▼  scoped by (id, wallet_id) in the query itself — a foreign intent is a 404,
+   │  never a 403, so the response can't be used to probe other users' intent ids
+   │
+   ▼  submitted/signed AND past isStrandedSubmittedIntent's blockhash-grace boundary?
+   │    yes → attemptStaleIntentResolution()                  route.ts
+   │            chain.helius_reconcile off → skip
+   │            per-wallet rate limit hit → skip
+   │            else: recordEvent trade.intent_poll_resolve_attempted, then reconcileWallet()
+   │          re-read loadIntentStatusForWallet() and answer with whatever it says now
+   │    no  → answer with the status just read
+```
+
+`/trade` polls this on a 15s cadence (matching the dashboard's own poll pattern) until the
+intent reaches a terminal status. `chain/reconcile-wallet.ts`'s stranded-intent sweep
+(`sweepStrandedSubmittedIntents`) is otherwise only reachable from `/dashboard` and
+`/constitution/edit` page loads — a user who never navigates there would poll `submitted`
+forever with nothing ever resolving it. This route closes that gap by driving a best-effort
+`reconcileWallet()` call itself, reusing the sweep and the signature-linkage path wholesale
+rather than reimplementing either. The attempt is best-effort throughout (a failure only ever
+leaves the poll showing a stale status) and throttled per wallet
+(`assertWithinConstitutionActionRateLimit`, the same generic per-`(userId, eventType)` budget
+`server/feedback/feedback.ts` reuses for an unrelated action) so a fast poll loop parked on a
+genuinely stuck intent cannot turn into an unbounded Helius-call generator.
+
 ## Public surface
 
 | Export | From | What it is |
@@ -111,6 +142,8 @@ failure), `409` for every other rejection, `503` for anything unexpected.
 | `assembleSwapTransaction(build, taker)` | `assemble-transaction.ts` | compiled message + its hash |
 | `submitSignedSwap(params)` | `submit-service.ts` | verifies the signed bytes, then broadcasts or simulates; throws `SubmitRejectedError` for every refusal |
 | `SubmitRejectedError` | `submit-service.ts` | the refusal, carrying the `reason` the route turns into a status code |
+| `loadIntentStatusForWallet(intentId, walletId)` | `intent-lifecycle.ts` | the status poll's one read — `status`/`signature`/`expiresAt`, scoped to the wallet, or `null` |
+| `resolveIntentOutcome(excludedReason)` | `chain/reconcile-wallet.ts` | pure: which terminal status a matched signature's excluded reason resolves an intent to |
 
 ## Invariants a change must not break
 
@@ -180,6 +213,10 @@ ceiling limit to a block.
 | `trade.intent_signed` | the guarded `→ signed` transition matched — signature and hash recorded before anything is broadcast |
 | `trade.intent_submitted` | the submit completed; carries `dryRun` and the network signature, and is the record a later replay reads its answer back from |
 | `trade.intent_failed` | any refusal, including one that never reached the intent row (unreadable bytes, fee-payer mismatch) — a submit that failed must be visible in telemetry, not only in an HTTP status |
+| `trade.intent_confirmed` | reconciliation's linkage matched this intent's signature to a landed, non-excluded trade (or one of `LANDED_BUT_EXCLUDED_REASONS`) — `payload.stage: 'reconciliation'` |
+| `trade.intent_failed` (reconcile path) | reconciliation's linkage matched this intent's signature to a transaction that did not execute the intended swap — same event type as the submit-time refusal above, `payload.stage: 'reconciliation'` distinguishes it; `payload.reason` carries the excluded reason |
+| `trade.intent_failed` (sweep) | `chain/reconcile-wallet.ts`'s `sweepStrandedSubmittedIntents` guarded-transitioned a `signed`/`submitted` intent whose blockhash window expired with no signature ever matching it — `payload.stage: 'sweep'`, `payload.reason: 'blockhash_expired_unresolved'` |
+| `trade.intent_poll_resolve_attempted` | `GET /api/swap/intent/[id]` is about to trigger a best-effort `reconcileWallet()` call for a stranded intent it just read — exists only to back that route's own per-wallet rate limit, not a decision in its own right |
 
 Neither `trade.intent_signed` nor `trade.intent_submitted` is recorded on the replay branch: a
 call that did nothing must leave the audit trail saying exactly that.
@@ -196,6 +233,7 @@ merely *scored*.
 | `jupiter.swap_build` | `buildSwap` throws; no quote is produced, so nothing can be evaluated or signed |
 | `chain.helius` | (existing) lookup-table resolution and the compute-unit simulation throw, blocking the quote |
 | `chain.broadcast` | seeded **off**: a verified submit is simulated instead of sent (`dryRun: true`), and the user is told so. Owned by `server/chain/broadcast-transaction.ts` — nothing here branches on it |
+| `chain.helius_reconcile` | (existing) `GET /api/swap/intent/[id]` skips its stale-intent resolution attempt and answers with whatever status is already on the row — the plain status read is unaffected |
 
 No flag can disable rule *enforcement* while trading is live: turning the terminal off
 removes the ability to quote, it never turns a quote into an unchecked one.

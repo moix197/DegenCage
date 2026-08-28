@@ -60,8 +60,37 @@ would fail if the sets were conflated again.
   behaviour from the real predicate/status-set under test, not reimplement the filter as a
   parallel hardcoded list — see the mutation-testing finding above.
 
-**Known gap, not yet built:** a `submitted` intent whose transaction never lands on chain at
-all (not confirmed, not failed — just never resolved) is currently unresolvable: it keeps
-reserving allowance indefinitely, because reconciliation only ever resolves a signature that
-*did* land. Phase 5 as planned does not cover this. The plan now carries a required step for a
-blockhash-expiry-driven `submitted → failed` sweep to close it — not implemented yet.
+**Resolved (Phase 5): the stranded-intent gap above is closed, on two paths.**
+
+- **Linkage.** `reconcile-wallet.ts`'s `persistOneSwap` matches a newly-derived swap's
+  `(wallet_id, signature)` against a live (`signed`/`submitted`) `trade_intents` row
+  (`findMatchingLiveIntentId`) and guarded-transitions it to `confirmed`/`failed`
+  (`resolveMatchedIntent`), in the same transaction as the `trades` insert. `resolveIntentOutcome`
+  decides which: `confirmed` for a real (non-excluded) trade *or* one of
+  `LANDED_BUT_EXCLUDED_REASONS` (`lst_swap`, `wrap_unwrap`, `missing_block_time`) — the signature
+  landed and did what it was meant to, just outside what `trades` tracks for position accounting
+  — `failed` only for a transaction that genuinely did not execute the intended swap
+  (`no_net_change`, `pure_receive`, `pure_send`: reverted on-chain, or only one side registered).
+  Folding every excluded reason to `failed` (the original Phase 5 shape) told the user a trade
+  that had actually landed "never happened" — a review finding, fixed by this split.
+- **The sweep.** `sweepStrandedSubmittedIntents`, run at the end of every `reconcileWallet()`
+  call, guarded-transitions a `signed` or `submitted` intent to `failed` once its blockhash
+  deadline (`expires_at`) plus a fixed grace period (`SWEEP_GRACE_PERIOD_MS`, 2 minutes — long
+  enough to absorb Helius' own finalized-commitment indexing lag) has passed with no linkage
+  ever having resolved it — the case the linkage above cannot reach because nothing ever landed
+  to match against. Originally `submitted`-only; a later review found `signed` was exposed to
+  the identical gap (a crash between `submit-service.ts`'s `transitionToSigned` and
+  `transitionFromSigned` — the transaction may never have actually broadcast) and had no path
+  back to a terminal status either, so the sweep now covers both statuses in
+  `RECONCILABLE_INTENT_STATUSES`.
+- **Reachability.** Both paths only ever run *inside* a `reconcileWallet()` call, and that call
+  was originally reachable only from `/dashboard` and `/constitution/edit` page loads (plus the
+  callerless `POST /api/wallet/reconcile`) — a user who stays on `/trade` never triggered either
+  one, so a stranded `submitted` intent on that page alone would poll "submitted" forever
+  regardless of the sweep existing. `GET /api/swap/intent/[id]` (the terminal's own status poll)
+  now drives a best-effort `reconcileWallet()` call itself once an intent it reads back is
+  `submitted`/`signed` and past `isStrandedSubmittedIntent`'s own grace boundary — gated by the
+  same `chain.helius_reconcile` kill switch every other reconciliation trigger checks, and
+  throttled per wallet (`assertWithinConstitutionActionRateLimit`) so a fast poll loop parked on
+  a genuinely stuck intent cannot turn into an unbounded Helius-call generator. A failure on this
+  path only ever leaves the poll showing a stale status, never a broken response.

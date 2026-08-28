@@ -12,6 +12,7 @@ import {
   expireAndReserveLiveIntent,
   findLiveQuoteSlotIntentId,
   loadEvaluableWindowedTrades,
+  loadIntentStatusForWallet,
   loadLiveIntentUsd,
   reapExpiredIntents,
 } from './intent-lifecycle';
@@ -141,7 +142,12 @@ function makeExecutor(options: { tradeIntentsRows?: unknown[]; tradesRows?: unkn
         return {
           where: (predicate: unknown) => {
             selectWhereCalls.push({ table, where: predicate });
-            return Promise.resolve(table === trades ? tradesRows : tradeIntentsRows);
+            const rows = table === trades ? tradesRows : tradeIntentsRows;
+            // Some callers (`loadIntentStatusForWallet`) chain `.limit(n)` off `.where(...)`;
+            // others (`findLiveQuoteSlotIntentId` et al.) await the `.where(...)` result
+            // directly. Assigning `.limit` onto the resolved promise itself supports both
+            // shapes without a second mock branch.
+            return Object.assign(Promise.resolve(rows), { limit: async (n: number) => rows.slice(0, n) });
           },
         };
       },
@@ -537,5 +543,28 @@ describe('findLiveQuoteSlotIntentId', () => {
     const executor = makeExecutor({ tradeIntentsRows: [] });
 
     await expect(findLiveQuoteSlotIntentId('wallet-1', executor as never)).resolves.toBeNull();
+  });
+});
+
+// BLOCKING 1: `expiresAt` rides alongside `status`/`signature` so the poll route can decide,
+// without a second query, whether a stranded submitted/signed intent is worth an inline
+// resolution attempt.
+describe('loadIntentStatusForWallet', () => {
+  it('reads status, signature, and expiresAt scoped to the intent id and wallet id', async () => {
+    const expiresAt = new Date('2026-08-28T00:00:00Z');
+    const executor = makeExecutor({ tradeIntentsRows: [{ status: 'submitted', signature: 'sig-1', expiresAt }] });
+
+    const result = await loadIntentStatusForWallet('intent-1', 'wallet-1', executor as never);
+
+    expect(result).toEqual({ status: 'submitted', signature: 'sig-1', expiresAt });
+    const call = executor.selectWhereCalls.find((candidate) => candidate.table === tradeIntents);
+    const { params } = whereSql(call!.where);
+    expect(params).toEqual(['intent-1', 'wallet-1']);
+  });
+
+  it('returns null for an intent belonging to a different wallet — indistinguishable from one that does not exist', async () => {
+    const executor = makeExecutor({ tradeIntentsRows: [] });
+
+    await expect(loadIntentStatusForWallet('intent-1', 'wallet-1', executor as never)).resolves.toBeNull();
   });
 });

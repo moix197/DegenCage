@@ -278,14 +278,19 @@ export async function loadEvaluableWindowedTrades(
  * belonging to another wallet is indistinguishable from one that does not exist — the caller
  * cannot use a 404-vs-403 difference to probe for other users' intent ids. Decision 13's
  * wallet-binding, applied to the read path.
+ *
+ * `expiresAt` rides alongside `status`/`signature` (BLOCKING 1's fix) so the route can decide,
+ * without a second query, whether a `submitted`/`signed` intent it just read is stranded past
+ * its own blockhash grace period (`reconcile-wallet.ts`'s `isStrandedSubmittedIntent`) and
+ * worth an inline resolution attempt before answering the poll.
  */
 export async function loadIntentStatusForWallet(
   intentId: string,
   walletId: string,
   executor: DatabaseExecutor = getDb(),
-): Promise<{ status: string; signature: string | null } | null> {
+): Promise<{ status: string; signature: string | null; expiresAt: Date } | null> {
   const [row] = await executor
-    .select({ status: tradeIntents.status, signature: tradeIntents.signature })
+    .select({ status: tradeIntents.status, signature: tradeIntents.signature, expiresAt: tradeIntents.expiresAt })
     .from(tradeIntents)
     .where(and(eq(tradeIntents.id, intentId), eq(tradeIntents.walletId, walletId)))
     .limit(1);
