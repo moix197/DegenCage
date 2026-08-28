@@ -390,6 +390,30 @@ describe('submitSignedSwap idempotency', () => {
     expect(result.replayed).toBe(true);
     expect(eventTypes()).toEqual(['trade.intent_signed']);
   });
+
+  /**
+   * Code-review nit: `chain/reconcile-wallet.ts`'s stranded-intent sweep can now move a
+   * still-`signed` row straight to `failed` while this exact call is mid-`verifyAndBroadcast`
+   * for it — the same zero-row outcome the test above exercises for a concurrent *submit*, but
+   * for a different underlying reason. Reporting a hardcoded `'submitted'` here would tell the
+   * caller their trade is still in flight when the row already reads `failed`; the branch must
+   * re-read and answer with whatever the row genuinely holds now.
+   */
+  it('reports the real terminal status when the sweep failed a still-signed intent mid-verify, not a hardcoded "submitted"', async () => {
+    updateMock.mockImplementation((values: { status: string }) => {
+      if (values.status === 'signed') return [intentRow({ status: 'signed' })];
+      // The `signed → submitted` guard matches nothing: the sweep already failed this row.
+      return [];
+    });
+    selectMock.mockImplementation((table: unknown) =>
+      table === constitutions ? [CONSTITUTION] : [intentRow({ status: 'failed', signature: FIXTURE.signature })],
+    );
+
+    const result = await submitSignedSwap(submitParams());
+
+    expect(result).toMatchObject({ status: 'failed', replayed: true, signature: FIXTURE.signature });
+    expect(eventTypes()).toEqual(['trade.intent_signed']);
+  });
 });
 
 describe('submitSignedSwap re-evaluation', () => {

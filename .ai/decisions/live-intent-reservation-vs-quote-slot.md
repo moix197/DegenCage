@@ -94,3 +94,37 @@ would fail if the sets were conflated again.
   throttled per wallet (`assertWithinConstitutionActionRateLimit`) so a fast poll loop parked on
   a genuinely stuck intent cannot turn into an unbounded Helius-call generator. A failure on this
   path only ever leaves the poll showing a stale status, never a broken response.
+  - **Bounded, not just throttled (code-review nit).** The rate limit above stops a *poll loop*
+    from re-triggering `reconcileWallet()` too often; it does nothing to bound how long any
+    *single* call is allowed to take, and `helius-client.ts`'s own `MAX_PAGES` (50, ~15s each)
+    puts a single call's worst case at several minutes — worse, a wallet whose baseline has
+    never completed would have that call trigger the full 90-day backfill from inside a status
+    poll. The route now (1) skips the attempt entirely while `hasCompletedBaseline(walletId)` is
+    false — that backfill belongs to the dashboard/`/constitution/edit` path, which the user
+    reaches deliberately — and (2) races the remaining attempt against
+    `POLL_RECONCILE_TIMEOUT_MS` (`route.ts`), recording `trade.intent_poll_resolve_timed_out`
+    rather than silently letting the GET hang if it's hit. The underlying `reconcileWallet()`
+    call is never cancelled on a timeout — Node has no way to abort it from the caller — it is
+    left to finish in the background and its eventual outcome is picked up by the next
+    poll/reconcile the normal way.
+  - **The sweep can now race a still-`signed` row's own submit (code-review nit).** Because the
+    sweep above covers `signed`, not only `submitted`, it can move a row straight to `failed`
+    while `submit-service.ts`'s `submitSignedSwap` is still mid-`verifyAndBroadcast` for that
+    same intent — its own `signed → submitted` guarded update then matches zero rows for a
+    reason the code only used to attribute to a concurrent *submit* winning the race. The
+    zero-row branch now re-reads the row and reports whatever status it actually holds (`failed`
+    included) rather than assuming `'submitted'`. This is a narrow window in practice — the sweep
+    only fires `SWEEP_GRACE_PERIOD_MS` (2 minutes) past the intent's own blockhash expiry, while
+    `verifyAndBroadcast` is a single re-evaluation plus one broadcast call — but it is not zero,
+    and the reported status must never lie about it.
+    **Known accepted gap:** if the broadcast underneath that race genuinely lands on chain
+    *after* the sweep has already failed the intent, it cannot currently relink — reconciliation's
+    `findMatchingLiveIntentId` only matches `RECONCILABLE_INTENT_STATUSES` (`signed`/`submitted`),
+    which a swept row has already left. Widening that set to include `failed` was considered and
+    rejected here: it would also let a transaction that failed for an unrelated, legitimate reason
+    (`reevaluation` blocking it, a genuine `broadcast_failed`) get silently reconfirmed if its
+    bytes ever reached the network by some other means later, which is a materially different and
+    riskier behavior change than this nit's scope. The trade is caught by the dashboard's plain
+    reconciliation view regardless (it still lands and appears in `trades`, just without the
+    `trade_intents` linkage/event trail) — this is a display-only gap, not a lost trade or a
+    double-spent allowance.

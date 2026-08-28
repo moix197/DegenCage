@@ -405,7 +405,18 @@ export async function submitSignedSwap(params: SubmitRequestParams): Promise<Sub
   if (!submitted) {
     // Someone else moved this row past `signed` while we were verifying. Their events tell the
     // story; adding ours would double-count one submit.
-    return { intentId: signed.id, status: 'submitted', signature: presented.signature, dryRun: broadcast.dryRun, replayed: true };
+    //
+    // "Someone else" is no longer only a concurrent submit winning the `signed → submitted`
+    // race: `reconcile-wallet.ts`'s stranded-intent sweep can now also move a still-`signed`
+    // row straight to `failed` out from under an in-flight submit whose broadcast is taking
+    // long enough to outlast the blockhash's own grace period. Reporting a hardcoded
+    // `'submitted'` here would tell the caller that when the row is actually `failed` — read
+    // the row back and answer with whatever it genuinely holds now, same principle as
+    // `resolveZeroRowOutcome`'s re-read. `signed.id` is still safe to use as the intent id
+    // (the guarded update above already proved this exact row exists).
+    const current = await loadIntent(params.intentId);
+
+    return { intentId: signed.id, status: current?.status ?? 'submitted', signature: presented.signature, dryRun: broadcast.dryRun, replayed: true };
   }
 
   await recordEvent({

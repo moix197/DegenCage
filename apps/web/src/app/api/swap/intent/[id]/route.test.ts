@@ -23,6 +23,7 @@ const {
   captureErrorMock,
   reconcileWalletMock,
   isStrandedSubmittedIntentMock,
+  hasCompletedBaselineMock,
   assertRateLimitMock,
   recordEventMock,
 } = vi.hoisted(() => ({
@@ -32,6 +33,7 @@ const {
   captureErrorMock: vi.fn(),
   reconcileWalletMock: vi.fn(),
   isStrandedSubmittedIntentMock: vi.fn(),
+  hasCompletedBaselineMock: vi.fn(),
   assertRateLimitMock: vi.fn(),
   recordEventMock: vi.fn(),
 }));
@@ -44,6 +46,7 @@ vi.mock('@/server/swap/intent-lifecycle', () => ({ loadIntentStatusForWallet: lo
 vi.mock('@/server/chain/reconcile-wallet', () => ({
   reconcileWallet: reconcileWalletMock,
   isStrandedSubmittedIntent: isStrandedSubmittedIntentMock,
+  hasCompletedBaseline: hasCompletedBaselineMock,
   CHAIN_HELIUS_RECONCILE_FLAG: 'chain.helius_reconcile',
 }));
 vi.mock('@/server/constitution/rate-limit', async (importOriginal) => {
@@ -71,6 +74,7 @@ describe('GET /api/swap/intent/[id]', () => {
     resolveSessionMock.mockResolvedValue(SESSION);
     loadIntentStatusForWalletMock.mockResolvedValue({ status: 'submitted', signature: 'sig-1', expiresAt: FAR_FUTURE });
     isStrandedSubmittedIntentMock.mockReturnValue(false);
+    hasCompletedBaselineMock.mockResolvedValue(true);
     assertRateLimitMock.mockResolvedValue(undefined);
     reconcileWalletMock.mockResolvedValue({ walletId: 'wallet-1', isBaseline: false, tradesPersisted: 0, excludedPersisted: 0, reconciledThroughSlot: null });
   });
@@ -189,6 +193,30 @@ describe('GET /api/swap/intent/[id]', () => {
       await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
     });
 
+    it('skips the resolution attempt entirely when this wallet has not completed its 90-day baseline, still returning the stale status', async () => {
+      isStrandedSubmittedIntentMock.mockReturnValue(true);
+      hasCompletedBaselineMock.mockResolvedValue(false);
+      loadIntentStatusForWalletMock.mockResolvedValue({ status: 'submitted', signature: 'sig-1', expiresAt: new Date(Date.now() - 5 * 60_000) });
+
+      const response = await GET(statusRequest(), paramsFor(INTENT_ID));
+
+      expect(hasCompletedBaselineMock).toHaveBeenCalledWith(SESSION.walletId);
+      expect(assertRateLimitMock).not.toHaveBeenCalled();
+      expect(reconcileWalletMock).not.toHaveBeenCalled();
+      expect(recordEventMock).not.toHaveBeenCalled();
+      await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
+    });
+
+    it('does not check baseline completion before the reconcile kill switch itself', async () => {
+      isFeatureEnabledMock.mockImplementation((flag: string) => Promise.resolve(flag === 'trade.terminal'));
+      isStrandedSubmittedIntentMock.mockReturnValue(true);
+      loadIntentStatusForWalletMock.mockResolvedValue({ status: 'submitted', signature: 'sig-1', expiresAt: new Date(Date.now() - 5 * 60_000) });
+
+      await GET(statusRequest(), paramsFor(INTENT_ID));
+
+      expect(hasCompletedBaselineMock).not.toHaveBeenCalled();
+    });
+
     it('skips the resolution attempt once this wallet has hit the poll-resolve rate limit', async () => {
       isStrandedSubmittedIntentMock.mockReturnValue(true);
       loadIntentStatusForWalletMock.mockResolvedValue({ status: 'submitted', signature: 'sig-1', expiresAt: new Date(Date.now() - 5 * 60_000) });
@@ -211,6 +239,32 @@ describe('GET /api/swap/intent/[id]', () => {
       expect(response.status).toBe(200);
       await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
       expect(captureErrorMock).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ operation: 'swap.intent_status.resolve' }));
+    });
+
+    // Nit fix: `reconcileWallet()` has no aggregate deadline of its own (`helius-client.ts`'s
+    // MAX_PAGES=50 pagination could take minutes) — the route must bound its own wait and
+    // still answer promptly, visibly recording the degradation rather than swallowing it.
+    it('bounds the reconcile attempt with a deadline: times out, records it, and still returns the stale status promptly', async () => {
+      vi.useFakeTimers();
+
+      try {
+        isStrandedSubmittedIntentMock.mockReturnValue(true);
+        loadIntentStatusForWalletMock.mockResolvedValue({ status: 'submitted', signature: 'sig-1', expiresAt: new Date(Date.now() - 5 * 60_000) });
+        // Never settles within the test — stands in for a reconcile that outlives the poll's
+        // own deadline (a large baseline pull, a slow Helius page).
+        reconcileWalletMock.mockReturnValue(new Promise(() => {}));
+
+        const responsePromise = GET(statusRequest(), paramsFor(INTENT_ID));
+        await vi.advanceTimersByTimeAsync(8_000);
+        const response = await responsePromise;
+
+        expect(response.status).toBe(200);
+        await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
+        expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'trade.intent_poll_resolve_timed_out' }));
+        expect(captureErrorMock).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('propagates this request\'s own correlationId into the resolution attempt, never minting a second one', async () => {

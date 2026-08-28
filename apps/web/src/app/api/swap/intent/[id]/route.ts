@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { recordEvent } from '@/observability/events';
 import { captureError } from '@/observability/error-tracking';
 import { resolveSession } from '@/server/auth/session';
-import { CHAIN_HELIUS_RECONCILE_FLAG, isStrandedSubmittedIntent, reconcileWallet } from '@/server/chain/reconcile-wallet';
+import { CHAIN_HELIUS_RECONCILE_FLAG, hasCompletedBaseline, isStrandedSubmittedIntent, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { assertWithinConstitutionActionRateLimit, ConstitutionActionRateLimited } from '@/server/constitution/rate-limit';
 import { isFeatureEnabled, TRADE_TERMINAL_FLAG } from '@/server/flags/feature-flags';
 import { loadIntentStatusForWallet } from '@/server/swap/intent-lifecycle';
@@ -26,6 +26,11 @@ export const dynamic = 'force-dynamic';
  * stranded-intent sweep (`reconcile-wallet.ts`'s `sweepStrandedSubmittedIntents`) is unreachable
  * from this flow. This route now drives that resolution itself, once an intent it reads back is
  * past its own blockhash grace period: see `attemptStaleIntentResolution` below.
+ *
+ * That attempt is bounded on two sides, so this GET can never become the unbounded operation a
+ * naive read of `reconcileWallet()` would suggest: it never runs at all while this wallet's own
+ * 90-day baseline backfill hasn't completed yet (that pull belongs to the dashboard path, not a
+ * poll), and it always races against `POLL_RECONCILE_TIMEOUT_MS` even once baseline is done.
  */
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -43,6 +48,51 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 const POLL_RESOLVE_EVENT_TYPE = 'trade.intent_poll_resolve_attempted';
 
 /**
+ * Aggregate deadline on the reconcile attempt below, comfortably under `/trade`'s own ~15s
+ * poll cadence (`server/swap/README.md`) so a slow or hung Helius round trip never itself
+ * becomes the reason this GET stalls. `helius-client.ts`'s own per-page `REQUEST_TIMEOUT_MS`
+ * (15s) times `MAX_PAGES` (50) bounds a single `reconcileWallet()` call at several minutes in
+ * the worst case — nowhere close to a status poll's own budget — so this route needs its own,
+ * tighter ceiling rather than trusting that one.
+ */
+const POLL_RECONCILE_TIMEOUT_MS = 8_000;
+
+/** Recorded when `POLL_RECONCILE_TIMEOUT_MS` is hit — the visible half of degrading rather than silently swallowing a reconcile that ran long (CLAUDE.md → no silent failures). */
+const POLL_RESOLVE_TIMEOUT_EVENT_TYPE = 'trade.intent_poll_resolve_timed_out';
+
+/** Thrown by `withDeadline` below to distinguish "still running, past our budget" from a genuine `reconcileWallet()` failure — the two are reported differently. */
+class PollReconcileTimeoutError extends Error {
+  constructor() {
+    super(`reconcile did not settle within ${POLL_RECONCILE_TIMEOUT_MS}ms`);
+    this.name = 'PollReconcileTimeoutError';
+  }
+}
+
+/**
+ * Races `promise` against `ms`. `promise` itself is never cancelled — Node has no way to
+ * abort an in-flight `reconcileWallet()` call from here — it is left to finish (or fail) in
+ * the background; `.then(resolve, reject)` below keeps that eventual settlement from ever
+ * surfacing as an unhandled rejection, it just no longer has anyone waiting on it once the
+ * deadline has already won the race.
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new PollReconcileTimeoutError()), ms);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
  * Best-effort, same shape as `api/wallet/reconcile/route.ts`'s
  * `applyDuePendingChangesBestEffort`: a failure here must never turn a status read into a
  * broken response, it can only ever leave the poll showing a possibly-stale status. Reuses
@@ -51,9 +101,20 @@ const POLL_RESOLVE_EVENT_TYPE = 'trade.intent_poll_resolve_attempted';
  * insert path) and the guarded stranded-intent sweep (nothing landed, so it resolves to
  * `failed`) — and gated by the same kill switch (`CHAIN_HELIUS_RECONCILE_FLAG`) every other
  * route that triggers reconciliation checks.
+ *
+ * Two guards keep this bounded, on top of the per-wallet rate limit below:
+ *  - **Baseline not yet completed → skip entirely.** A wallet mid-baseline (or one that has
+ *    never reconciled at all) would have this call trigger the full 90-day backfill inside a
+ *    status poll — that pull belongs to the dashboard/`/constitution/edit` path, not here.
+ *  - **`POLL_RECONCILE_TIMEOUT_MS` deadline.** Bounds even a legitimate incremental reconcile
+ *    so this GET always returns promptly; a deadline hit is recorded, never swallowed.
  */
-async function attemptStaleIntentResolution(userId: string, correlationId: string): Promise<void> {
+async function attemptStaleIntentResolution(userId: string, walletId: string, correlationId: string): Promise<void> {
   if (!(await isFeatureEnabled(CHAIN_HELIUS_RECONCILE_FLAG))) {
+    return;
+  }
+
+  if (!(await hasCompletedBaseline(walletId))) {
     return;
   }
 
@@ -73,8 +134,13 @@ async function attemptStaleIntentResolution(userId: string, correlationId: strin
   await recordEvent({ eventType: POLL_RESOLVE_EVENT_TYPE, occurredAt: now, correlationId, userId, payload: {} });
 
   try {
-    await reconcileWallet(correlationId);
+    await withDeadline(reconcileWallet(correlationId), POLL_RECONCILE_TIMEOUT_MS);
   } catch (error) {
+    if (error instanceof PollReconcileTimeoutError) {
+      await recordEvent({ eventType: POLL_RESOLVE_TIMEOUT_EVENT_TYPE, occurredAt: new Date(), correlationId, userId, payload: {} });
+      return;
+    }
+
     captureError(error, { correlationId, operation: 'swap.intent_status.resolve', failedClosed: false });
   }
 }
@@ -111,7 +177,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
       return Response.json({ status: intent.status, signature: intent.signature, correlationId });
     }
 
-    await attemptStaleIntentResolution(session.userId, correlationId);
+    await attemptStaleIntentResolution(session.userId, session.walletId, correlationId);
 
     // Re-read rather than infer the outcome: `attemptStaleIntentResolution` is best-effort and
     // may have done nothing (flag off, rate limited, or itself failed), so the honest answer is

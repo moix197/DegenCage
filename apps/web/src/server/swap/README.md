@@ -88,6 +88,12 @@ POST /api/swap/submit ──> submitSignedSwap()                 submit-service.
   is read back from the recorded `trade.intent_submitted` event, never from the flag as it
   stands now — once Phase 6 turns broadcasting on, re-reading the flag would tell a replayed
   caller no funds moved when they had. Everything else is a named rejection.
+- **The `signed → submitted` guard can also match zero rows mid-submit**, not only on a
+  separate replay call: `chain/reconcile-wallet.ts`'s stranded-intent sweep can move a
+  still-`signed` row straight to `failed` while this same call is mid-`verifyAndBroadcast`. That
+  branch re-reads the row and reports its real current status rather than assuming `'submitted'`
+  — see the "Bounded, not just throttled" / sweep-race note in
+  [live-intent-reservation-vs-quote-slot](../../../../../.ai/decisions/live-intent-reservation-vs-quote-slot.md).
 - **Three checks, none derivable from the others:** `intent.wallet_id == session.walletId`
   (decision 13), the message hash, and the compiled message's fee payer read out of the message
   itself. See
@@ -113,8 +119,11 @@ GET /api/swap/intent/[id] ──> loadIntentStatusForWallet()     intent-lifecyc
    ▼  submitted/signed AND past isStrandedSubmittedIntent's blockhash-grace boundary?
    │    yes → attemptStaleIntentResolution()                  route.ts
    │            chain.helius_reconcile off → skip
+   │            wallet's 90-day baseline not completed yet → skip
    │            per-wallet rate limit hit → skip
-   │            else: recordEvent trade.intent_poll_resolve_attempted, then reconcileWallet()
+   │            else: recordEvent trade.intent_poll_resolve_attempted, then
+   │                  reconcileWallet() raced against POLL_RECONCILE_TIMEOUT_MS
+   │                  (deadline hit → recordEvent trade.intent_poll_resolve_timed_out)
    │          re-read loadIntentStatusForWallet() and answer with whatever it says now
    │    no  → answer with the status just read
 ```
@@ -130,6 +139,16 @@ leaves the poll showing a stale status) and throttled per wallet
 (`assertWithinConstitutionActionRateLimit`, the same generic per-`(userId, eventType)` budget
 `server/feedback/feedback.ts` reuses for an unrelated action) so a fast poll loop parked on a
 genuinely stuck intent cannot turn into an unbounded Helius-call generator.
+
+It is also *bounded*, not just throttled: a wallet whose baseline has never completed skips the
+attempt entirely (`hasCompletedBaseline`) rather than triggering the full 90-day pull from
+inside a status poll — that pull belongs to the dashboard/`/constitution/edit` path — and the
+remaining attempt races against `POLL_RECONCILE_TIMEOUT_MS` so a slow or hung Helius round trip
+can never make this GET itself hang. The underlying `reconcileWallet()` call is never cancelled
+on a timeout, only abandoned by the caller; its eventual outcome is picked up by whichever later
+reconcile call runs next. See
+[live-intent-reservation-vs-quote-slot](../../../../../.ai/decisions/live-intent-reservation-vs-quote-slot.md)'s
+"Bounded, not just throttled" note.
 
 ## Public surface
 
@@ -217,6 +236,7 @@ ceiling limit to a block.
 | `trade.intent_failed` (reconcile path) | reconciliation's linkage matched this intent's signature to a transaction that did not execute the intended swap — same event type as the submit-time refusal above, `payload.stage: 'reconciliation'` distinguishes it; `payload.reason` carries the excluded reason |
 | `trade.intent_failed` (sweep) | `chain/reconcile-wallet.ts`'s `sweepStrandedSubmittedIntents` guarded-transitioned a `signed`/`submitted` intent whose blockhash window expired with no signature ever matching it — `payload.stage: 'sweep'`, `payload.reason: 'blockhash_expired_unresolved'` |
 | `trade.intent_poll_resolve_attempted` | `GET /api/swap/intent/[id]` is about to trigger a best-effort `reconcileWallet()` call for a stranded intent it just read — exists only to back that route's own per-wallet rate limit, not a decision in its own right |
+| `trade.intent_poll_resolve_timed_out` | that same `reconcileWallet()` call did not settle within `POLL_RECONCILE_TIMEOUT_MS` — the call is abandoned, not cancelled, and the poll answers with whatever status is already on the row |
 
 Neither `trade.intent_signed` nor `trade.intent_submitted` is recorded on the replay branch: a
 call that did nothing must leave the audit trail saying exactly that.

@@ -2,6 +2,7 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  hasCompletedBaseline,
   isAfterLotWatermark,
   isQuoteMint,
   isStrandedSubmittedIntent,
@@ -551,6 +552,23 @@ describe('resolveIntentOutcome', () => {
   it('fails a transaction that only registered one side of the swap', () => {
     expect(resolveIntentOutcome('pure_receive')).toBe('failed');
     expect(resolveIntentOutcome('pure_send')).toBe('failed');
+  });
+});
+
+describe('hasCompletedBaseline', () => {
+  // Code-review nit: `app/api/swap/intent/[id]/route.ts`'s poll-path resolution attempt must
+  // skip entirely for a wallet whose 90-day baseline has never finished, rather than paying for
+  // a full `reconcileWallet()` call (and triggering that very backfill) just to find out.
+  it('is false for a wallet that has never completed its baseline', async () => {
+    fakeDatabase(NEVER_RECONCILED);
+
+    await expect(hasCompletedBaseline(WALLET_ID)).resolves.toBe(false);
+  });
+
+  it('is true once the baseline has completed', async () => {
+    fakeDatabase(ALREADY_BASELINED);
+
+    await expect(hasCompletedBaseline(WALLET_ID)).resolves.toBe(true);
   });
 });
 

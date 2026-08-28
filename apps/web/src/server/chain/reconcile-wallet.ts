@@ -168,6 +168,23 @@ async function markBaselineCompleted(walletId: string, completedAt: Date): Promi
   await getDb().update(wallets).set({ baselineCompletedAt: completedAt }).where(eq(wallets.id, walletId));
 }
 
+/**
+ * Cheap pre-check for `app/api/swap/intent/[id]/route.ts`'s poll-path resolution attempt:
+ * has this wallet's 90-day baseline ever finished, without paying for a full
+ * `reconcileWallet()` call (and the Helius round trip inside it) just to find out.
+ *
+ * A wallet whose baseline has never completed triggers the full 90-day pull on its very
+ * next `reconcileWallet()` call — exactly what `runReconciliation`'s `isBaseline` branch
+ * does above. That backfill belongs to the dashboard/`/constitution/edit` path, which the
+ * user reaches deliberately and which isn't racing a ~15s poll's own response budget; a
+ * status poll must never be the thing that triggers it.
+ */
+export async function hasCompletedBaseline(walletId: string): Promise<boolean> {
+  const info = await loadWalletReconciliationInfo(walletId);
+
+  return info.baselineCompletedAt !== null;
+}
+
 async function failReconciliation(walletId: string, userId: string, correlationId: string, error: unknown): Promise<void> {
   captureError(error, { correlationId, operation: 'reconcileWallet', walletId, failedClosed: true });
 
