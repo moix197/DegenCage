@@ -545,7 +545,7 @@ export async function createQuote(params: QuoteRequestParams): Promise<QuoteResu
 
   if (evaluated.verdict === 'allow') {
     try {
-      assembled = await assembleSwapTransaction(build, params.walletAddress);
+      assembled = await assembleSwapTransaction(build, params.walletAddress, params.correlationId);
     } catch (error) {
       // The evaluation still happened and still reached a verdict — that decision must not
       // vanish just because assembly failed after it (finding 1). No intent row is written:
