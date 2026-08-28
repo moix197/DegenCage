@@ -207,6 +207,20 @@ describe('GET /api/swap/intent/[id]', () => {
       await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
     });
 
+    it('degrades to the pre-attempt status when hasCompletedBaseline itself throws, without breaking the poll', async () => {
+      isStrandedSubmittedIntentMock.mockReturnValue(true);
+      loadIntentStatusForWalletMock.mockResolvedValue({ status: 'submitted', signature: 'sig-1', expiresAt: new Date(Date.now() - 5 * 60_000) });
+      hasCompletedBaselineMock.mockRejectedValueOnce(new Error('db down'));
+
+      const response = await GET(statusRequest(), paramsFor(INTENT_ID));
+
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
+      expect(assertRateLimitMock).not.toHaveBeenCalled();
+      expect(reconcileWalletMock).not.toHaveBeenCalled();
+      expect(captureErrorMock).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ operation: 'swap.intent_status.resolve_baseline_check' }));
+    });
+
     it('does not check baseline completion before the reconcile kill switch itself', async () => {
       isFeatureEnabledMock.mockImplementation((flag: string) => Promise.resolve(flag === 'trade.terminal'));
       isStrandedSubmittedIntentMock.mockReturnValue(true);
@@ -260,7 +274,12 @@ describe('GET /api/swap/intent/[id]', () => {
 
         expect(response.status).toBe(200);
         await expect(response.json()).resolves.toMatchObject({ status: 'submitted' });
-        expect(recordEventMock).toHaveBeenCalledWith(expect.objectContaining({ eventType: 'trade.intent_poll_resolve_timed_out' }));
+        expect(recordEventMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            eventType: 'trade.intent_poll_resolve_timed_out',
+            payload: { walletId: SESSION.walletId, timeoutMs: 8_000 },
+          }),
+        );
         expect(captureErrorMock).not.toHaveBeenCalled();
       } finally {
         vi.useRealTimers();

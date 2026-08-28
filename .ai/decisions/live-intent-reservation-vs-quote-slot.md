@@ -104,9 +104,14 @@ would fail if the sets were conflated again.
     reaches deliberately — and (2) races the remaining attempt against
     `POLL_RECONCILE_TIMEOUT_MS` (`route.ts`), recording `trade.intent_poll_resolve_timed_out`
     rather than silently letting the GET hang if it's hit. The underlying `reconcileWallet()`
-    call is never cancelled on a timeout — Node has no way to abort it from the caller — it is
-    left to finish in the background and its eventual outcome is picked up by the next
-    poll/reconcile the normal way.
+    call is never cancelled on a timeout — Node has no way to abort it from the caller — but on
+    this project's hosting (Vercel, [hosting-and-growth-path](hosting-and-growth-path.md)) that
+    is not the same as it finishing in the background: the serverless invocation is frozen once
+    this GET responds, so an abandoned call is frozen with it, mid-work, not completed later. If
+    the freeze lands after `reconcileWallet()` set the wallet's `reconciliation_state` to
+    `in_progress` but before it reached `current`, the wallet is stuck `in_progress` — which
+    `quote-service.ts` fails closed on (`not_reconciled`) — until a `/dashboard` or
+    `/constitution/edit` visit runs `reconcileWallet()` to completion.
   - **The sweep can now race a still-`signed` row's own submit (code-review nit).** Because the
     sweep above covers `signed`, not only `submitted`, it can move a row straight to `failed`
     while `submit-service.ts`'s `submitSignedSwap` is still mid-`verifyAndBroadcast` for that
@@ -124,7 +129,11 @@ would fail if the sets were conflated again.
     rejected here: it would also let a transaction that failed for an unrelated, legitimate reason
     (`reevaluation` blocking it, a genuine `broadcast_failed`) get silently reconfirmed if its
     bytes ever reached the network by some other means later, which is a materially different and
-    riskier behavior change than this nit's scope. The trade is caught by the dashboard's plain
-    reconciliation view regardless (it still lands and appears in `trades`, just without the
-    `trade_intents` linkage/event trail) — this is a display-only gap, not a lost trade or a
-    double-spent allowance.
+    riskier behavior change than this nit's scope. On allowance the gap is harmless — the trade
+    is still caught by the dashboard's plain reconciliation view, still lands in `trades`, and is
+    counted once, never double-spent. But it is not merely cosmetic: without the `trade_intents`
+    linkage a trade the user actually routed through us renders on the dashboard as "Observed
+    elsewhere" — the same label used for a trade placed on another app entirely. For a product
+    whose accountability pitch is telling the user what they did outside our own rails, reporting
+    our own enforced trade back to them as an external one is a real, if narrow, miss — not just
+    a display quirk.

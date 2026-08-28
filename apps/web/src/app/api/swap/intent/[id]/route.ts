@@ -105,7 +105,9 @@ function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
  * Two guards keep this bounded, on top of the per-wallet rate limit below:
  *  - **Baseline not yet completed → skip entirely.** A wallet mid-baseline (or one that has
  *    never reconciled at all) would have this call trigger the full 90-day backfill inside a
- *    status poll — that pull belongs to the dashboard/`/constitution/edit` path, not here.
+ *    status poll — that pull belongs to the dashboard/`/constitution/edit` path, not here. The
+ *    check itself is guarded the same as everything below it: a throw here (e.g. a DB blip)
+ *    degrades to leaving the poll on its current status, never a broken response.
  *  - **`POLL_RECONCILE_TIMEOUT_MS` deadline.** Bounds even a legitimate incremental reconcile
  *    so this GET always returns promptly; a deadline hit is recorded, never swallowed.
  */
@@ -114,7 +116,16 @@ async function attemptStaleIntentResolution(userId: string, walletId: string, co
     return;
   }
 
-  if (!(await hasCompletedBaseline(walletId))) {
+  let baselineCompleted: boolean;
+
+  try {
+    baselineCompleted = await hasCompletedBaseline(walletId);
+  } catch (error) {
+    captureError(error, { correlationId, operation: 'swap.intent_status.resolve_baseline_check', failedClosed: false });
+    return;
+  }
+
+  if (!baselineCompleted) {
     return;
   }
 
@@ -137,7 +148,13 @@ async function attemptStaleIntentResolution(userId: string, walletId: string, co
     await withDeadline(reconcileWallet(correlationId), POLL_RECONCILE_TIMEOUT_MS);
   } catch (error) {
     if (error instanceof PollReconcileTimeoutError) {
-      await recordEvent({ eventType: POLL_RESOLVE_TIMEOUT_EVENT_TYPE, occurredAt: new Date(), correlationId, userId, payload: {} });
+      await recordEvent({
+        eventType: POLL_RESOLVE_TIMEOUT_EVENT_TYPE,
+        occurredAt: new Date(),
+        correlationId,
+        userId,
+        payload: { walletId, timeoutMs: POLL_RECONCILE_TIMEOUT_MS },
+      });
       return;
     }
 

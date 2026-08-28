@@ -145,8 +145,13 @@ attempt entirely (`hasCompletedBaseline`) rather than triggering the full 90-day
 inside a status poll — that pull belongs to the dashboard/`/constitution/edit` path — and the
 remaining attempt races against `POLL_RECONCILE_TIMEOUT_MS` so a slow or hung Helius round trip
 can never make this GET itself hang. The underlying `reconcileWallet()` call is never cancelled
-on a timeout, only abandoned by the caller; its eventual outcome is picked up by whichever later
-reconcile call runs next. See
+on a timeout — it is only abandoned by the caller. On Vercel (`.ai/decisions/hosting-and-growth-path.md`)
+an abandoned call does not keep running "in the background": the serverless invocation is frozen
+once this GET responds, so the call is frozen with it, mid-work, rather than finishing later. If
+that happened after `reconcileWallet()` had already flipped the wallet's `reconciliation_state` to
+`in_progress` but before it reached `current`, the wallet is left in `in_progress` — which
+`quote-service.ts` fails closed on (`not_reconciled`) — until a `/dashboard` or
+`/constitution/edit` visit runs `reconcileWallet()` to completion. See
 [live-intent-reservation-vs-quote-slot](../../../../../.ai/decisions/live-intent-reservation-vs-quote-slot.md)'s
 "Bounded, not just throttled" note.
 
