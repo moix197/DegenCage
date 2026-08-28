@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { logger } from '../../observability/logger';
 import { broadcastSignedTransaction, BroadcastError, CHAIN_BROADCAST_FLAG } from './broadcast-transaction';
 
 /**
@@ -57,14 +58,14 @@ describe('broadcastSignedTransaction with chain.broadcast off', () => {
     const result = await broadcastSignedTransaction(SIGNED_TX);
 
     expect(result).toEqual({ dryRun: true, networkSignature: null, logs: ['Program log: ok'] });
-    expect(simulateTransactionMock).toHaveBeenCalledWith(SIGNED_TX, { replaceRecentBlockhash: false });
+    expect(simulateTransactionMock).toHaveBeenCalledWith(SIGNED_TX, { replaceRecentBlockhash: false }, undefined);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('keeps the transaction’s own blockhash rather than replacing it — the point is to verify what was signed', async () => {
     await broadcastSignedTransaction(SIGNED_TX);
 
-    expect(simulateTransactionMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ replaceRecentBlockhash: false }));
+    expect(simulateTransactionMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ replaceRecentBlockhash: false }), undefined);
   });
 
   it('treats a simulation error as a failure, never a warning', async () => {
@@ -79,6 +80,16 @@ describe('broadcastSignedTransaction with chain.broadcast off', () => {
 
     await expect(broadcastSignedTransaction(SIGNED_TX)).rejects.toThrow();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('threads the caller’s correlation id into the simulate call and the disabled-broadcast log line — finding 3', async () => {
+    await broadcastSignedTransaction(SIGNED_TX, 'correlation-1');
+
+    expect(simulateTransactionMock).toHaveBeenCalledWith(SIGNED_TX, { replaceRecentBlockhash: false }, 'correlation-1');
+    expect(logger.info).toHaveBeenCalledWith(
+      'broadcast disabled — simulating signed transaction instead',
+      expect.objectContaining({ correlationId: 'correlation-1' }),
+    );
   });
 });
 
@@ -112,6 +123,19 @@ describe('broadcastSignedTransaction with chain.broadcast on', () => {
 
     await expect(broadcastSignedTransaction(SIGNED_TX)).rejects.toBeInstanceOf(BroadcastError);
     expect(captureErrorMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ failedClosed: true }));
+  });
+
+  it('threads the caller’s correlation id onto the sent-transaction log line and a captured send failure — finding 3', async () => {
+    rpcResponds({ jsonrpc: '2.0', id: 1, result: SIGNATURE });
+
+    await broadcastSignedTransaction(SIGNED_TX, 'correlation-2');
+
+    expect(logger.info).toHaveBeenCalledWith('signed transaction broadcast', expect.objectContaining({ correlationId: 'correlation-2' }));
+
+    rpcResponds({}, false, 503);
+
+    await expect(broadcastSignedTransaction(SIGNED_TX, 'correlation-3')).rejects.toBeInstanceOf(BroadcastError);
+    expect(captureErrorMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ correlationId: 'correlation-3' }));
   });
 
   it('throws on an RPC-level error body', async () => {

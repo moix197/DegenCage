@@ -47,8 +47,13 @@ interface HeliusRpcEnvelope<TResult> {
  * One JSON-RPC round trip. Flag-gated and timeout-bounded, with no retries — every caller
  * here runs inside a user-facing quote request, where a retry only turns a slow block into a
  * slower one.
+ *
+ * @param correlationId - The caller's trade-intent correlation id, carried on a captured
+ *   failure so this integration boundary does not break the UI → rule engine → Jupiter → chain
+ *   chain (CLAUDE.md → Observability). Optional only because a handful of call sites this plan
+ *   does not own yet have none to pass.
  */
-async function heliusRpc<TResult>(method: string, params: unknown[]): Promise<TResult> {
+async function heliusRpc<TResult>(method: string, params: unknown[], correlationId?: string): Promise<TResult> {
   if (!(await isFeatureEnabled(CHAIN_HELIUS_FLAG))) {
     throw new HeliusRpcError('chain.helius is disabled');
   }
@@ -80,7 +85,7 @@ async function heliusRpc<TResult>(method: string, params: unknown[]): Promise<TR
 
     return json.result;
   } catch (error) {
-    captureError(error, { operation: 'heliusRpc', method, failedClosed: true });
+    captureError(error, { operation: 'heliusRpc', method, ...(correlationId !== undefined ? { correlationId } : {}), failedClosed: true });
 
     throw error instanceof HeliusRpcError ? error : new HeliusRpcError(`helius ${method} request failed`, error);
   } finally {
@@ -113,11 +118,13 @@ export interface SimulateTransactionOptions {
 export async function simulateTransaction(
   base64WireTransaction: string,
   { replaceRecentBlockhash = true }: SimulateTransactionOptions = {},
+  correlationId?: string,
 ): Promise<SimulationResult> {
-  const result = await heliusRpc<{ value: { err: unknown; unitsConsumed?: number | null; logs?: string[] | null } }>('simulateTransaction', [
-    base64WireTransaction,
-    { encoding: 'base64', commitment: 'confirmed', sigVerify: false, replaceRecentBlockhash },
-  ]);
+  const result = await heliusRpc<{ value: { err: unknown; unitsConsumed?: number | null; logs?: string[] | null } }>(
+    'simulateTransaction',
+    [base64WireTransaction, { encoding: 'base64', commitment: 'confirmed', sigVerify: false, replaceRecentBlockhash }],
+    correlationId,
+  );
 
   return {
     err: result.value.err,
@@ -136,11 +143,12 @@ export interface HeliusAccount {
  * Reads `addresses` in one round trip. A `null` entry means the account does not exist —
  * returned as-is so the caller can decide (for a lookup table, that is a hard block).
  */
-export async function getMultipleAccounts(addresses: string[]): Promise<(HeliusAccount | null)[]> {
-  const result = await heliusRpc<{ value: (HeliusAccount | null)[] }>('getMultipleAccounts', [
-    addresses,
-    { encoding: 'base64', commitment: 'confirmed' },
-  ]);
+export async function getMultipleAccounts(addresses: string[], correlationId?: string): Promise<(HeliusAccount | null)[]> {
+  const result = await heliusRpc<{ value: (HeliusAccount | null)[] }>(
+    'getMultipleAccounts',
+    [addresses, { encoding: 'base64', commitment: 'confirmed' }],
+    correlationId,
+  );
 
   return result.value;
 }

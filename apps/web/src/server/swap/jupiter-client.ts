@@ -150,8 +150,13 @@ function buildUrl(params: BuildSwapParams): string {
  * never a partial or permissive result. No retries: this runs inside a user-facing quote
  * request against a 1 RPS shared bucket, so a retry storm would only turn a slow call into a
  * rate-limited one.
+ *
+ * @param correlationId - The caller's trade-intent correlation id, carried on a captured
+ *   failure so this integration boundary does not break the id's UI → rule engine → Jupiter →
+ *   chain chain (CLAUDE.md → Observability). Optional only because a handful of call sites this
+ *   plan does not own yet have none to pass.
  */
-export async function buildSwap(params: BuildSwapParams): Promise<JupiterBuildResponse> {
+export async function buildSwap(params: BuildSwapParams, correlationId?: string): Promise<JupiterBuildResponse> {
   if (!(await isFeatureEnabled(JUPITER_SWAP_BUILD_FLAG))) {
     throw new JupiterBuildError('jupiter.swap_build is disabled');
   }
@@ -175,6 +180,7 @@ export async function buildSwap(params: BuildSwapParams): Promise<JupiterBuildRe
       operation: 'buildSwap',
       inputMint: params.inputMint,
       outputMint: params.outputMint,
+      ...(correlationId !== undefined ? { correlationId } : {}),
       failedClosed: true,
     });
 

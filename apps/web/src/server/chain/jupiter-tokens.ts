@@ -47,6 +47,15 @@ interface CacheEntry extends TokenFacts {
 
 const tokenCache = new Map<string, CacheEntry>();
 
+/**
+ * One shared fetch per mint currently in flight, so two concurrent callers for the same mint —
+ * `quote-service.ts`'s `lookupTokenDecimals` and `classifyToken`'s `lookupTokenMcaps` run via
+ * `Promise.all` for the same output mint, chief among them — coalesce into a single Jupiter
+ * round trip instead of both racing the Free tier's 1 RPS org-wide bucket. Cleared as soon as
+ * the fetch it points at settles, so it never outlives the request it represents.
+ */
+const inFlightRefreshes = new Map<string, Promise<void>>();
+
 interface JupiterTokenSearchItem {
   id: string;
   mcap?: number | null;
@@ -107,11 +116,33 @@ async function fetchTokenFacts(mints: string[]): Promise<Map<string, TokenFacts>
   }
 }
 
+/** The actual fetch-and-cache work, factored out so `refreshTokenFacts` can share one call of it across concurrent callers via `inFlightRefreshes`. */
+async function fetchAndCacheTokenFacts(mints: string[], now: number): Promise<void> {
+  try {
+    const fetched = await fetchTokenFacts(mints);
+
+    for (const mint of mints) {
+      const facts = fetched.get(mint);
+      tokenCache.set(mint, { mcap: facts?.mcap ?? null, decimals: facts?.decimals ?? null, expiresAt: now + CACHE_TTL_MS });
+    }
+
+    evictIfOversized(now);
+  } catch (error) {
+    captureError(error, { operation: 'refreshTokenFacts', mintCount: mints.length, failedClosed: true });
+  }
+}
+
 /**
  * Populates `tokenCache` for whatever in `mints` is not already cached and fresh, in one
  * comma-joined request. Never throws: a failure leaves those mints absent from the cache, so
  * every caller below reads them as "no entry" and fails closed exactly as an unlisted mint
  * would.
+ *
+ * Coalesces with any refresh already in flight for the same mint (`inFlightRefreshes`) rather
+ * than issuing a second request: `lookupTokenDecimals` and `lookupTokenMcaps` are called
+ * concurrently for the same output mint on every quote (`quote-service.ts`'s `evaluateQuote`),
+ * and without this each would fetch that mint independently against the Free tier's shared
+ * 1 RPS budget.
  */
 async function refreshTokenFacts(mints: string[], now: number): Promise<void> {
   const uncached = [...new Set(mints)].filter((mint) => !isFresh(tokenCache.get(mint), now));
@@ -120,18 +151,21 @@ async function refreshTokenFacts(mints: string[], now: number): Promise<void> {
     return;
   }
 
-  try {
-    const fetched = await fetchTokenFacts(uncached);
+  const toFetch = uncached.filter((mint) => !inFlightRefreshes.has(mint));
 
-    for (const mint of uncached) {
-      const facts = fetched.get(mint);
-      tokenCache.set(mint, { mcap: facts?.mcap ?? null, decimals: facts?.decimals ?? null, expiresAt: now + CACHE_TTL_MS });
+  if (toFetch.length > 0) {
+    const fetchPromise = fetchAndCacheTokenFacts(toFetch, now).finally(() => {
+      for (const mint of toFetch) {
+        if (inFlightRefreshes.get(mint) === fetchPromise) inFlightRefreshes.delete(mint);
+      }
+    });
+
+    for (const mint of toFetch) {
+      inFlightRefreshes.set(mint, fetchPromise);
     }
-
-    evictIfOversized(now);
-  } catch (error) {
-    captureError(error, { operation: 'refreshTokenFacts', mintCount: uncached.length, failedClosed: true });
   }
+
+  await Promise.all(uncached.map((mint) => inFlightRefreshes.get(mint)).filter((pending): pending is Promise<void> => pending !== undefined));
 }
 
 /**

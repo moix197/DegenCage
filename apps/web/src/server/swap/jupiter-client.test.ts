@@ -108,4 +108,11 @@ describe('buildSwap', () => {
     await expect(buildSwap(PARAMS)).rejects.toBeInstanceOf(JupiterBuildError);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it('carries the caller’s correlation id onto a captured failure — finding 3', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: false, status: 500, text: async () => '' } as unknown as Response);
+
+    await expect(buildSwap(PARAMS, 'correlation-1')).rejects.toBeInstanceOf(JupiterBuildError);
+    expect(captureErrorMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ correlationId: 'correlation-1' }));
+  });
 });

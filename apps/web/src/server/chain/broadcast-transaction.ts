@@ -72,7 +72,7 @@ function requireApiKey(): string {
  * unbounded retry against an external API is exactly what CLAUDE.md forbids, and a
  * rebroadcast we did not ask for is a rebroadcast our audit trail cannot explain.
  */
-async function sendToNetwork(base64WireTransaction: string): Promise<string> {
+async function sendToNetwork(base64WireTransaction: string, correlationId?: string): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
@@ -105,7 +105,7 @@ async function sendToNetwork(base64WireTransaction: string): Promise<string> {
 
     return json.result;
   } catch (error) {
-    captureError(error, { operation: 'sendTransaction', failedClosed: true });
+    captureError(error, { operation: 'sendTransaction', ...(correlationId !== undefined ? { correlationId } : {}), failedClosed: true });
 
     throw error instanceof BroadcastError ? error : new BroadcastError('helius sendTransaction request failed', error);
   } finally {
@@ -121,8 +121,8 @@ async function sendToNetwork(base64WireTransaction: string): Promise<string> {
  * actually signed — including the blockhash it is bound to — still executes. Swapping in a
  * fresh blockhash would simulate a transaction that does not exist.
  */
-async function simulateOnly(base64WireTransaction: string): Promise<BroadcastResult> {
-  const simulation = await simulateTransaction(base64WireTransaction, { replaceRecentBlockhash: false });
+async function simulateOnly(base64WireTransaction: string, correlationId?: string): Promise<BroadcastResult> {
+  const simulation = await simulateTransaction(base64WireTransaction, { replaceRecentBlockhash: false }, correlationId);
 
   if (simulation.err !== null && simulation.err !== undefined) {
     throw new BroadcastError(`signed transaction failed simulation: ${JSON.stringify(simulation.err)}`);
@@ -135,18 +135,25 @@ async function simulateOnly(base64WireTransaction: string): Promise<BroadcastRes
  * Broadcast a signed transaction — or, with `chain.broadcast` off, verify it by simulation and
  * say so.
  *
+ * @param correlationId - The caller's trade-intent correlation id, carried on every log line
+ *   this function emits (including the simulate/send call it makes) so the id keeps flowing
+ *   UI → rule engine → Jupiter → chain (CLAUDE.md → Observability). Optional only because a
+ *   handful of call sites this plan does not own yet have none to pass.
  * @throws BroadcastError when the flag is on but `chain.helius` is off (the integration this
  *   rides on is itself killed), when the simulation reports an error, or when the send fails.
  *   Never resolves permissively: `submit-service.ts` turns any throw here into a `failed`
  *   intent, and there is no outcome where an unverified transaction reads as submitted.
  */
-export async function broadcastSignedTransaction(base64WireTransaction: string): Promise<BroadcastResult> {
+export async function broadcastSignedTransaction(base64WireTransaction: string, correlationId?: string): Promise<BroadcastResult> {
   const broadcastEnabled = await isFeatureEnabled(CHAIN_BROADCAST_FLAG);
 
   if (!broadcastEnabled) {
-    logger.info('broadcast disabled — simulating signed transaction instead', { flagKey: CHAIN_BROADCAST_FLAG });
+    logger.info('broadcast disabled — simulating signed transaction instead', {
+      flagKey: CHAIN_BROADCAST_FLAG,
+      ...(correlationId !== undefined ? { correlationId } : {}),
+    });
 
-    return simulateOnly(base64WireTransaction);
+    return simulateOnly(base64WireTransaction, correlationId);
   }
 
   // The read wrapper checks this for itself; the send path has to check it explicitly, or
@@ -155,9 +162,9 @@ export async function broadcastSignedTransaction(base64WireTransaction: string):
     throw new BroadcastError('chain.helius is disabled');
   }
 
-  const networkSignature = await sendToNetwork(base64WireTransaction);
+  const networkSignature = await sendToNetwork(base64WireTransaction, correlationId);
 
-  logger.info('signed transaction broadcast', { networkSignature });
+  logger.info('signed transaction broadcast', { networkSignature, ...(correlationId !== undefined ? { correlationId } : {}) });
 
   return { dryRun: false, networkSignature, logs: null };
 }

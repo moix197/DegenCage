@@ -448,6 +448,21 @@ describe('createQuote fold rule', () => {
     await expect(createQuote(quoteParams())).rejects.toThrow(/swap simulation failed/);
     expect(insertedValuesSpy).not.toHaveBeenCalled();
   });
+
+  it('still records the reached decision as a rule.pre_trade_decision event when assembly fails — finding 1', async () => {
+    assembleSwapTransactionMock.mockRejectedValue(new Error('swap simulation failed'));
+
+    await expect(createQuote(quoteParams())).rejects.toThrow(/swap simulation failed/);
+
+    expect(recordEventMock).toHaveBeenCalledTimes(1);
+    const [event] = recordEventMock.mock.calls[0]!;
+    expect(event).toMatchObject({
+      eventType: 'rule.pre_trade_decision',
+      payload: expect.objectContaining({ intentId: null, verdict: 'allow', assemblyFailed: true }),
+    });
+    // Recorded outside any transaction — there is no intent row to make it atomic with.
+    expect(recordEventMock.mock.calls[0]![1]).toBeUndefined();
+  });
 });
 
 describe('createQuote exact-in premise', () => {
@@ -482,6 +497,14 @@ describe('createQuote instrumentation', () => {
     expect(executors[0]).toBeDefined();
   });
 
+  it('passes the request’s correlation id through to buildSwap — finding 3', async () => {
+    const params = quoteParams({ correlationId: 'correlation-xyz' });
+
+    await createQuote(params);
+
+    expect(buildSwapMock).toHaveBeenCalledWith(expect.objectContaining({ inputMint: params.inputMint }), 'correlation-xyz');
+  });
+
   it('carries the verdict and the evaluations that produced it on the decision event', async () => {
     loadWindowedTradesMock.mockResolvedValue([{ occurredAt: new Date(), usdValue: '480' }]);
 
@@ -490,6 +513,94 @@ describe('createQuote instrumentation', () => {
     const decisionEvent = recordEventMock.mock.calls[1]![0] as { payload: { verdict: string; evaluations: unknown[] } };
     expect(decisionEvent.payload.verdict).toBe('block');
     expect(decisionEvent.payload.evaluations).toHaveLength(1);
+  });
+});
+
+/**
+ * Finding 2: `evaluateQuote` reads the wallet's quote-slot occupant and excludes it from the
+ * reservation sum *before* the network work (`/build`'s assembly/simulation) that follows. If
+ * that occupant leaves the quote slot in the gap — a concurrent submit moving it to `signed`,
+ * say — the exclusion this decision was evaluated against is stale by the time `persistIntent`
+ * commits. Enforcement is unaffected (`submit-service.ts`'s `reevaluate` re-includes it); these
+ * tests cover only that the audit trail says so.
+ */
+describe('createQuote quote-slot exclusion staleness (audit trail)', () => {
+  it('flags the decision when the excluded quote-slot intent no longer matches what the lock actually expired', async () => {
+    let quoteSlotRead = false;
+
+    selectMock.mockImplementation((projection?: Record<string, unknown>) => ({
+      from: (table: unknown) => {
+        if (table === trades) return { where: () => Promise.resolve([]) };
+        if (table !== tradeIntents) return { where: () => ({ limit: async () => [constitutionRow('active')] }) };
+
+        const isQuoteSlotLookup = !!projection && Object.keys(projection).length === 1;
+
+        return {
+          where: () => {
+            if (isQuoteSlotLookup) {
+              // Read once: the row is still occupying the quote slot at this instant...
+              quoteSlotRead = true;
+              return Promise.resolve([{ id: 'intent-prior' }]);
+            }
+
+            return Promise.resolve([]);
+          },
+        };
+      },
+    }));
+
+    transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
+      callback({
+        select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
+        // ...but by the time the lock runs, a concurrent submit has already moved it out of
+        // `QUOTE_SLOT_STATUSES` — nothing is found to expire.
+        update: () => ({ set: () => ({ where: () => ({ returning: async () => [] }) }) }),
+        insert: () => ({
+          values: (values: unknown) => {
+            insertedValuesSpy(values);
+            return { returning: async () => [{ id: 'intent-2' }] };
+          },
+        }),
+      }),
+    );
+
+    await createQuote(quoteParams());
+
+    expect(quoteSlotRead).toBe(true);
+    const decisionEvent = recordEventMock.mock.calls.find((call) => (call[0] as { eventType: string }).eventType === 'rule.pre_trade_decision')![0] as {
+      payload: Record<string, unknown>;
+    };
+    expect(decisionEvent.payload).toMatchObject({ excludedQuoteSlotIntentId: 'intent-prior', excludedQuoteSlotIntentStale: true });
+  });
+
+  it('does not flag staleness when the excluded intent is exactly what the lock expires', async () => {
+    makeLiveIntentFixture([
+      {
+        id: 'intent-quoted-1',
+        status: 'quoted',
+        usdValue: '50',
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    await createQuote(quoteParams({ amount: '100000000' }));
+
+    const decisionEvent = recordEventMock.mock.calls.find((call) => (call[0] as { eventType: string }).eventType === 'rule.pre_trade_decision')![0] as {
+      payload: Record<string, unknown>;
+    };
+    expect(decisionEvent.payload).toMatchObject({ excludedQuoteSlotIntentId: 'intent-quoted-1', excludedQuoteSlotIntentStale: false });
+  });
+
+  it('reports no exclusion at all when the wallet had no live quote slot to begin with', async () => {
+    await createQuote(quoteParams());
+
+    const decisionEvent = recordEventMock.mock.calls.find((call) => (call[0] as { eventType: string }).eventType === 'rule.pre_trade_decision')![0] as {
+      payload: Record<string, unknown>;
+    };
+    expect(decisionEvent.payload).toMatchObject({ excludedQuoteSlotIntentId: null, excludedQuoteSlotIntentStale: false });
   });
 });
 

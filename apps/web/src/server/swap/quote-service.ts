@@ -2,6 +2,7 @@ import { evaluateTrade, migrateConstitution, type AssetTier, type Constitution, 
 import { eq } from 'drizzle-orm';
 
 import { recordEvent } from '../../observability/events';
+import { logger } from '../../observability/logger';
 import { classifyToken } from '../chain/classify-token';
 import { lookupTokenDecimals } from '../chain/jupiter-tokens';
 import { LOSS_LIMIT_ENABLED_FLAG } from '../chain/reconcile-wallet';
@@ -89,13 +90,16 @@ async function buildOrReuseQuote(params: QuoteRequestParams): Promise<JupiterBui
     return cached.build;
   }
 
-  const build = await buildSwap({
-    inputMint: params.inputMint,
-    outputMint: params.outputMint,
-    amount: params.amount,
-    taker: params.walletAddress,
-    slippageBps: params.slippageBps,
-  });
+  const build = await buildSwap(
+    {
+      inputMint: params.inputMint,
+      outputMint: params.outputMint,
+      amount: params.amount,
+      taker: params.walletAddress,
+      slippageBps: params.slippageBps,
+    },
+    params.correlationId,
+  );
 
   buildCache.set(key, { build, expiresAt: now + QUOTE_CACHE_TTL_MS });
   evictStaleBuilds(now);
@@ -150,8 +154,13 @@ export function foldVerdict(evaluations: LimitEvaluation[]): 'allow' | 'block' {
  * blocked it (`.ai/decisions/pre-trade-slippage-pricing.md`). `otherAmountThreshold` is still
  * carried on the trade as the bought leg, because that is the right — worst-case — figure
  * for the floor-type direction (`rolling_loss_usd` proceeds).
+ *
+ * Returns only `usdValue`: `priceTrade` also reports `priceSource` (`'stablecoin' | 'binance' |
+ * 'birdeye'`), but `trade_intents` has no column to persist it on — unlike `trades`, which does
+ * (`reconcile-wallet.ts`) — and adding one is a migration out of this fix's scope. Dropped
+ * rather than computed and discarded.
  */
-async function priceCeilingLimits(build: JupiterBuildResponse, occurredAt: Date): Promise<{ usdValue: string | null; priceSource: string | null }> {
+async function priceCeilingLimits(build: JupiterBuildResponse, occurredAt: Date): Promise<string | null> {
   const decimals = await lookupTokenDecimals([build.inputMint, build.outputMint]);
   const soldDecimals = decimals.get(build.inputMint);
   const boughtDecimals = decimals.get(build.outputMint);
@@ -159,10 +168,10 @@ async function priceCeilingLimits(build: JupiterBuildResponse, occurredAt: Date)
   // A guessed decimal scale misprices by orders of magnitude, so an unresolved one is
   // `usd_value: null` — unpriced, never `$0` — which folds every ceiling limit to a block.
   if (soldDecimals === undefined || boughtDecimals === undefined) {
-    return { usdValue: null, priceSource: null };
+    return null;
   }
 
-  return priceTrade({
+  const priced = await priceTrade({
     soldMint: build.inputMint,
     boughtMint: build.outputMint,
     soldAmountBaseUnits: build.inAmount,
@@ -172,6 +181,8 @@ async function priceCeilingLimits(build: JupiterBuildResponse, occurredAt: Date)
     occurredAt,
     leg: 'sold',
   });
+
+  return priced.usdValue;
 }
 
 /**
@@ -264,6 +275,12 @@ interface EvaluatedQuote {
   evaluations: LimitEvaluation[];
   verdict: 'allow' | 'block';
   occurredAt: Date;
+  /**
+   * The wallet's quote-slot occupant excluded from this evaluation's reservation sum, `null`
+   * when there was none. Carried through so `persistIntent` can tell, once inside its own lock,
+   * whether that exclusion still held true at commit time (finding 2's fix).
+   */
+  priorQuoteSlotId: string | null;
 }
 
 /**
@@ -278,7 +295,7 @@ interface EvaluatedQuote {
 async function evaluateQuote(params: QuoteRequestParams, constitution: Constitution, build: JupiterBuildResponse): Promise<EvaluatedQuote> {
   // Server clock at build time (decision 15) — never a client-supplied instant.
   const occurredAt = new Date();
-  const [{ usdValue }, classification, lossLimitEnabled] = await Promise.all([
+  const [usdValue, classification, lossLimitEnabled] = await Promise.all([
     priceCeilingLimits(build, occurredAt),
     classifyToken(build.outputMint),
     isFeatureEnabled(LOSS_LIMIT_ENABLED_FLAG),
@@ -318,6 +335,7 @@ async function evaluateQuote(params: QuoteRequestParams, constitution: Constitut
     evaluations: decision.evaluations,
     verdict: foldVerdict(decision.evaluations),
     occurredAt,
+    priorQuoteSlotId,
   };
 }
 
@@ -372,6 +390,25 @@ async function persistIntent(
       );
     }
 
+    // Finding 2's fix: `evaluated.priorQuoteSlotId` was read (and excluded from the reservation
+    // sum) before the network work above ran. `expiredIntentId` is what this same lock just
+    // found actually occupying the quote slot right now. A mismatch means the exclusion this
+    // decision was evaluated against had already gone stale by commit time — e.g. a concurrent
+    // submit moved that intent to `signed` in between, so it kept reserving allowance this
+    // evaluation never counted. Enforcement still catches it (`submit-service.ts`'s `reevaluate`
+    // re-includes it and can return `rules_now_block`); this only makes the audit trail honest
+    // about which case actually happened, without touching the lock or the verdict.
+    const staleQuoteSlotExclusion = evaluated.priorQuoteSlotId !== null && evaluated.priorQuoteSlotId !== expiredIntentId;
+
+    if (staleQuoteSlotExclusion) {
+      logger.warn('quote-time exclusion no longer matched the wallet’s live quote slot at persist time', {
+        correlationId: params.correlationId,
+        walletId: params.walletId,
+        excludedIntentId: evaluated.priorQuoteSlotId,
+        actualExpiredIntentId: expiredIntentId,
+      });
+    }
+
     const inserted = await tx
       .insert(tradeIntents)
       .values({
@@ -424,12 +461,57 @@ async function persistIntent(
         occurredAt: evaluated.occurredAt,
         correlationId: params.correlationId,
         userId: params.userId,
-        payload: { ...payload, verdict: evaluated.verdict, evaluations: evaluated.evaluations },
+        payload: {
+          ...payload,
+          verdict: evaluated.verdict,
+          evaluations: evaluated.evaluations,
+          excludedQuoteSlotIntentId: evaluated.priorQuoteSlotId,
+          excludedQuoteSlotIntentStale: staleQuoteSlotExclusion,
+        },
       },
       tx,
     );
 
     return intentId;
+  });
+}
+
+/**
+ * Finding 1's fix: makes the evaluation durable even when assembly throws right after it.
+ *
+ * Without this, a completed rule evaluation that happened to be `allow` vanished the instant
+ * `assembleSwapTransaction` failed — `persistIntent` never ran, so neither the intent row nor
+ * `rule.pre_trade_decision` were ever written, leaving only `captureError`'s side channel
+ * (CLAUDE.md → Observability: every rule evaluation must emit a structured event carrying the
+ * inputs that produced it).
+ *
+ * Deliberately does **not** insert a `trade_intents` row: nothing was assembled, so there is no
+ * signable transaction, no `tx_message_hash`, and inserting one would say an intent exists when
+ * none does. Reusing `rule.pre_trade_decision` (rather than a new event type) fits the taxonomy
+ * already documented on `persistIntent` below — "a decision made *before* the trade" — since
+ * the decision was in fact reached; `intentId: null` in the payload is what keeps the event
+ * from claiming otherwise.
+ */
+async function recordDecisionWithoutIntent(params: QuoteRequestParams, evaluated: EvaluatedQuote): Promise<void> {
+  await recordEvent({
+    eventType: 'rule.pre_trade_decision',
+    occurredAt: evaluated.occurredAt,
+    correlationId: params.correlationId,
+    userId: params.userId,
+    payload: {
+      intentId: null,
+      inputMint: evaluated.build.inputMint,
+      outputMint: evaluated.build.outputMint,
+      inAmount: evaluated.build.inAmount,
+      outAmount: evaluated.build.outAmount,
+      otherAmountThreshold: evaluated.build.otherAmountThreshold,
+      slippageBps: evaluated.build.slippageBps,
+      usdValue: evaluated.usdValue,
+      acquiredTier: evaluated.acquiredTier,
+      verdict: evaluated.verdict,
+      evaluations: evaluated.evaluations,
+      assemblyFailed: true,
+    },
   });
 }
 
@@ -459,7 +541,20 @@ export async function createQuote(params: QuoteRequestParams): Promise<QuoteResu
   // Only an allowed quote is turned into signable bytes: assembling a blocked one would spend
   // a Helius simulation on a trade that must never be signed, and would hand the browser a
   // message it has no business holding.
-  const assembled = evaluated.verdict === 'allow' ? await assembleSwapTransaction(build, params.walletAddress) : null;
+  let assembled: AssembledTransaction | null = null;
+
+  if (evaluated.verdict === 'allow') {
+    try {
+      assembled = await assembleSwapTransaction(build, params.walletAddress);
+    } catch (error) {
+      // The evaluation still happened and still reached a verdict — that decision must not
+      // vanish just because assembly failed after it (finding 1). No intent row is written:
+      // there is nothing signable to record as live.
+      await recordDecisionWithoutIntent(params, evaluated);
+      throw error;
+    }
+  }
+
   const expiresAt = deriveExpiresAt(build, requestedAt);
   const intentId = await persistIntent(params, constitution.id, evaluated, assembled, expiresAt);
 
