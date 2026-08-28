@@ -330,6 +330,9 @@ export function TradePanel() {
       }
     }
 
+    // Fires once immediately — a just-submitted intent should never sit on a stale status for a
+    // full interval before its first real check — then continues on the same cadence.
+    void poll();
     const id = setInterval(() => void poll(), STATUS_POLL_INTERVAL_MS);
 
     return () => {

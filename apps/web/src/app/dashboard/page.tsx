@@ -1,6 +1,7 @@
 import { desc, eq } from 'drizzle-orm';
 
 import type { AssetTier } from '@degencage/rules';
+import { Badge } from '@/components/ui/badge';
 import { resolveSession } from '@/server/auth/session';
 import { CHAIN_HELIUS_RECONCILE_FLAG, LOSS_LIMIT_ENABLED_FLAG, ReconcileRejected, reconcileWallet } from '@/server/chain/reconcile-wallet';
 import { applyDuePendingChanges } from '@/server/constitution/pending-changes';
@@ -41,6 +42,7 @@ interface TradeRowView {
   classification: TokenClassificationQuality | null;
   isRoundTripClose: boolean;
   realizedLossUsd: string | null;
+  tradeIntentId: string | null;
 }
 
 async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
@@ -57,6 +59,7 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
       classification: trades.classification,
       isRoundTripClose: trades.isRoundTripClose,
       realizedLossUsd: trades.realizedLossUsd,
+      tradeIntentId: trades.tradeIntentId,
     })
     .from(trades)
     .where(eq(trades.walletId, walletId))
@@ -73,6 +76,16 @@ async function loadRecentTrades(walletId: string): Promise<TradeRowView[]> {
 function formatTierBadge(tier: AssetTier | null, classification: TokenClassificationQuality | null): string | null {
   if (tier === null) return null;
   return classification === 'unknown' ? `${tier} — counted as micro cap` : tier;
+}
+
+/**
+ * BLOCKING 3: a trade with a `tradeIntentId` was routed through us — resolved from the
+ * `trade_intents` row Phase 5's `reconcile-wallet.ts` linked it to; `null` means it was observed
+ * on another app entirely (or predates the terminal). Distinguished by text label, not color
+ * alone — a colorblind reader must be able to tell the two apart.
+ */
+function TradeOriginBadge({ tradeIntentId }: { tradeIntentId: string | null }) {
+  return tradeIntentId ? <Badge variant="secondary">Routed through us</Badge> : <Badge variant="outline">Observed elsewhere</Badge>;
 }
 
 function formatMint(mint: string | null): string {
@@ -187,6 +200,7 @@ export default async function DashboardPage() {
           {tradesList.map((trade) => (
             <li key={trade.signature}>
               <span>{trade.isBaseline ? '[pre-commitment activity — private]' : '[live]'}</span>{' '}
+              <TradeOriginBadge tradeIntentId={trade.tradeIntentId} />{' '}
               {trade.excludedReason ? (
                 <span>
                   excluded ({trade.excludedReason}) — {formatMint(trade.soldMint)} → {formatMint(trade.boughtMint)}
