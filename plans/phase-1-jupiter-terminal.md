@@ -497,17 +497,24 @@ No automated tests beyond what Phases 2-5 already cover — justified because: t
 - No path falls through to "allow" on a dependency failure anywhere in the quote or submit pipeline.
 - Every kill switch (`trade.terminal`, `jupiter.swap_build`, `chain.broadcast`) is flippable at runtime with no deploy and defaults to the state specified in its phase — confirmed by construction, since `isFeatureEnabled` reads the `feature_flags` table (existing Phase 0 infra), never an env var or compiled constant.
 
+**Final verification record (automated half, 2026-08-28):**
+
+- `pnpm test` — 672 passing, 44 files. `pnpm typecheck` — clean, both packages. `pnpm build` — exit 0, all routes compile.
+- End-to-end code review of the full branch diff vs `main`: **no blocking findings**. All eight focus areas PASS — guarded transitions (all six `update(tradeIntents)` carry `status IN (...)`, no `DELETE`s), fail-closed externals, no float money-math, allowance UNION with signature dedupe, account-switch reaching the server, `resolveSession()`-only wallet identity, runtime-flippable kill switches seeded `false`, `packages/rules` still zero-I/O.
+- Six non-blocking findings were fixed rather than deferred (`4da03d4`, `197edc2`, `41038db`, `acef5a8`, `54eff31`). The one that mattered: pre-trade pricing was caching the *in-progress* minute candle into `token_prices` as though it were a settled close, silently corrupting data Phase 0 depends on. Also fixed: a rule evaluation could emit no `rule.pre_trade_decision` if assembly threw; the correlation id stopped at the Jupiter/Helius boundary.
+- Knowledge base synced (`3dfb009`, `964e92d`, `41a66c0`, `66cda6b`). Three rows of the Knowledge Base Impact table below turned out NOT to match shipped code and were documented as-shipped instead: intent expiry derives from `blockhashSlotsToExpiry=150` (`fetchedAt + 150x400ms`), not from `lastValidBlockHeight`; `pre-trade-slippage-pricing.md` was factually wrong — pre-trade prices exactly one number, the sold leg, and nothing prices the bought leg or `otherAmountThreshold`; the flags doc had no flag inventory to extend.
+
 **Steps:**
 
 - [ ] Every preceding phase's Steps/Verification/Phase review checkboxes are ticked in this plan file
-- [ ] Reviewer handoff prompt emitted, scoped to the entire Phase 1 change end-to-end
-- [ ] Code-reviewer agent reviews the entire change end-to-end — explicit focus: guarded-state-transition correctness on every `trade_intents` transition, fail-closed behavior on every external dependency (Jupiter build, Helius simulate/broadcast, pricing, classification), no float money-math, allowance reservation correctly UNIONs persisted trades and live intents with no double count, account-switch invalidation actually reaches the server side (not just client display)
-- [ ] Any changes from the final review reflected back into this plan file
-- [ ] `pnpm test` passes workspace-wide
-- [ ] `pnpm typecheck` passes workspace-wide
-- [ ] No CLAUDE.md invariants violated (packages/rules stays zero-I/O; every kill switch/flag/instrumentation present per feature; rule state append-only)
-- [ ] Feature tested manually end-to-end on a real wallet: golden path, blocked-attempt path, account-switch mid-quote, Helius-outage fail-closed check, expired-quote resubmission attempt
-- [ ] Overall success criteria met
+- [x] Reviewer handoff prompt emitted, scoped to the entire Phase 1 change end-to-end
+- [x] Code-reviewer agent reviews the entire change end-to-end — explicit focus: guarded-state-transition correctness on every `trade_intents` transition, fail-closed behavior on every external dependency (Jupiter build, Helius simulate/broadcast, pricing, classification), no float money-math, allowance reservation correctly UNIONs persisted trades and live intents with no double count, account-switch invalidation actually reaches the server side (not just client display)
+- [x] Any changes from the final review reflected back into this plan file
+- [x] `pnpm test` passes workspace-wide
+- [x] `pnpm typecheck` passes workspace-wide
+- [x] No CLAUDE.md invariants violated (packages/rules stays zero-I/O; every kill switch/flag/instrumentation present per feature; rule state append-only)
+- [ ] Feature tested manually end-to-end on a real wallet: golden path, blocked-attempt path, account-switch mid-quote, Helius-outage fail-closed check, expired-quote resubmission attempt — _**NOT VERIFIED**: requires a funded wallet and a browser. Several of these cannot be exercised at all while Phase 6 is deferred and `chain.broadcast` is seeded `false`._
+- [ ] Overall success criteria met — _**PARTIAL**: the automated half is met (see the review record below). The on-chain half — broadcast, confirm, reconcile against a real signature — is unmet by construction while Phase 6 is deferred._
 - [ ] All phase checkboxes above are ticked
 
 ## Documentation
