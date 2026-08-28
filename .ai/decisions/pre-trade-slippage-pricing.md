@@ -1,20 +1,28 @@
-# Pre-trade pricing names its leg: ceilings off the sold leg, floors off the guaranteed minimum
+# Pre-trade pricing names its leg, and the leg is always the sold one
 
 **Decision:** A *pre-trade* quote never lets `priceTrade` infer which leg to price. The caller
-names it (`PriceableTrade.leg`, `apps/web/src/server/pricing/price-trade.ts`), and which one it
-names follows from the *shape* of the limit being evaluated:
+names it (`PriceableTrade.leg`, `apps/web/src/server/pricing/price-trade.ts`), and the one
+pre-trade call site — `priceCeilingLimits()` in `apps/web/src/server/swap/quote-service.ts` —
+names `'sold'`: Jupiter's `inAmount`, which for an exact-in swap is the amount we hand the
+aggregator, fixed before execution and unchanged by how the route fills. That single figure is
+the `usd_value` written to the `trade_intents` row and the only USD number the rule engine sees
+pre-trade.
 
-- **Ceiling limits** — `daily_notional_usd`, `asset_tier_acquisition_usd`, anything where a
-  larger number must be *more* likely to block — price the **sold leg**, off Jupiter's
-  `inAmount`. For an exact-in swap that is the amount we hand the aggregator: fixed before
-  execution, unchanged by how the route fills. This is what `quote-service.ts`'s
-  `priceCeilingLimits()` does, and its result is the `usd_value` written to the
-  `trade_intents` row.
-- **Floor limits** — `rolling_loss_usd`, where *smaller* proceeds are what blocks — price the
-  **bought leg** off `otherAmountThreshold`, the guaranteed minimum output. Worst-case
-  proceeds maximise the estimated loss, which is the conservative direction for a floor.
-- **`outAmount` is never used, in either direction.** It is the aggregator's optimistic
-  estimate with no documented upper bound.
+Per limit, as shipped:
+
+- **`daily_notional_usd` and `asset_tier_acquisition_usd`** — the ceiling limits, where a
+  larger number must be *more* likely to block — are the limits that consume it.
+- **`rolling_loss_usd` consumes no quote pricing at all.** It sums `realized_loss_usd` over
+  closed round trips, and pre-trade there is no lot matching: `isRoundTripClose` is left unset,
+  so the proposed trade contributes nothing to its own loss total and the limit is evaluated
+  against the window's already-realized losses (or `unevaluable` → block with the flag off).
+- **`outAmount` is never priced,** in either direction: the aggregator's optimistic estimate,
+  with no documented upper bound.
+- **`otherAmountThreshold` is never priced either.** It is passed to `priceTrade` as
+  `boughtAmountBaseUnits` and it reaches the quote view and the intent events, but `leg:
+  'sold'` returns before it is read. `leg: 'bought'` exists on the type and has no production
+  call site — worst-case-proceeds pricing is a shape reserved for a future floor-type limit,
+  not behaviour that shipped.
 
 Reconciliation (`chain/reconcile-wallet.ts`) passes no `leg` and keeps the inferred
 liquidity-ordered behaviour: post-execution both amounts are real on-chain facts, so pricing
@@ -68,8 +76,10 @@ estimate is a gate input, never the historical record.
 
 - Every new pre-trade pricing call site must name its `leg`. Omitting it is the reconciliation
   behaviour, which is wrong for a gate.
-- A new ceiling-type limit prices off the sold leg; a new floor-type limit prices off the
-  guaranteed minimum. Classify the limit before wiring its pricing.
+- A new ceiling-type limit prices off the sold leg. A floor-type limit — one where a *smaller*
+  figure is what blocks — would price the bought leg off `otherAmountThreshold`, the guaranteed
+  minimum, because worst-case proceeds maximise the estimated loss; no shipped limit does this
+  yet, so the first one that needs it is introducing the pattern, not following it.
 - Raising `MAX_SLIPPAGE_BPS` widens the gap between the quoted and executed trade for every
   limit computed from a quote — it is a rule-engine change, not a UX knob.
 - Exact-in is the premise: `inAmount` is only fixed because `swapMode` is `ExactIn` and the
