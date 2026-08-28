@@ -425,6 +425,20 @@ Initial review of `770ccb0` returned **red**; re-review after fixes returned **g
 
 ### Phase 6: Dry-run pass, then one live tiny swap
 
+> **DEFERRED — 2026-08-28, by orchestrator decision.** Not run. Skipped until the terminal has a
+> usable UI worth exercising with real funds. Nothing in this phase is blocked or broken; it is
+> waiting on product readiness, not on a defect.
+>
+> **What this leaves unproven:** `chain.broadcast` has never been flipped on, so no signature has
+> ever reached the chain. Everything Phases 3-5 built downstream of broadcast — submit, on-chain
+> confirmation, Phase 5's reconcile → link → confirm/failed path, tier classification and
+> lot-matching against a real trade — has automated tests and code review as its only proof. The
+> first real `/build` response shape, real ALT accounts, and real CU consumption are still
+> unexercised; the plan itself expects that list of surprises to be non-empty.
+>
+> **Consequence for the merge:** Phase 1 ships to `main` with the live path unverified on chain.
+> Do not treat `chain.broadcast` as safe to flip until this phase actually runs.
+
 **Risk:** high (real funds)
 **Mode:** hil
 **Type:** security
