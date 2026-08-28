@@ -373,11 +373,11 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Steps:**
 
-- [ ] Add `trade_intent_id` column + migration
-- [ ] Extend `reconcile-wallet.ts`'s insert path to look up and link the originating intent, guarded-transitioning it
-- [ ] Record `trade.intent_confirmed` / `trade.intent_failed` from the reconcile path
-- [ ] Add status polling to the trade page
-- [ ] **Required:** a blockhash-expiry-driven `submitted → failed` sweep (guarded `UPDATE`, same append-only convention as `reapExpiredIntents`) for a `submitted` intent whose transaction never lands on chain at all — rationale: without this, a broadcast that silently never confirms keeps reserving allowance forever, since reconciliation only ever resolves a signature that *did* land (see `.ai/decisions/live-intent-reservation-vs-quote-slot.md`)
+- [x] Add `trade_intent_id` column + migration
+- [x] Extend `reconcile-wallet.ts`'s insert path to look up and link the originating intent, guarded-transitioning it
+- [x] Record `trade.intent_confirmed` / `trade.intent_failed` from the reconcile path
+- [x] Add status polling to the trade page
+- [x] **Required:** a blockhash-expiry-driven `submitted → failed` sweep (guarded `UPDATE`, same append-only convention as `reapExpiredIntents`) for a `submitted` intent whose transaction never lands on chain at all — rationale: without this, a broadcast that silently never confirms keeps reserving allowance forever, since reconciliation only ever resolves a signature that *did* land (see `.ai/decisions/live-intent-reservation-vs-quote-slot.md`)
 
 **Tests:**
 
@@ -387,25 +387,38 @@ _Note added during revision:_ the single-live-intent invariant is enforced at th
 
 **Verification:**
 
-- [ ] `pnpm test` passes
-- [ ] `pnpm typecheck` passes
-- [ ] Manual: after Phase 3's dry-run submit completes for a real signature (if one was actually sent — otherwise defer this specific check to Phase 6), confirm the reconcile job links it and the terminal shows the status flip
+- [x] `pnpm test` passes
+- [x] `pnpm typecheck` passes
+- [ ] Manual: after Phase 3's dry-run submit completes for a real signature (if one was actually sent — otherwise defer this specific check to Phase 6), confirm the reconcile job links it and the terminal shows the status flip — _**NOT VERIFIED**: no real signature was ever broadcast (Phase 3 left broadcast gated off), so there is nothing on chain to reconcile. Deferred to Phase 6 as the phase itself anticipated. Automated tests + code review are the only proof._
 
 **Kill switch / flag / instrumentation:**
 
 - No new flag — rides on `chain.helius_reconcile` (existing) and `trade.terminal`
 - Events: `trade.intent_confirmed`, `trade.intent_failed` (from the reconcile path, distinct from Phase 3's submit-time `trade.intent_failed` on verification failure — same event type, different `payload.stage`)
 
+**Review follow-ups (post-review additions):**
+
+Initial review of `770ccb0` returned **red**; re-review after fixes returned **green**. Landed beyond the original plan:
+
+- `GET /api/swap/intent/[id]` (new route) — drives resolution for the polled intent, since `reconcileWallet()` was otherwise unreachable from `/trade` and the required sweep would never have fired for a user who stays on the terminal. Baseline-incomplete wallets skip the attempt; the rest is bounded by an 8s deadline emitting `trade.intent_poll_resolve_timed_out`.
+- `resolveIntentOutcome()` — separates landed-but-excluded-from-accounting (`lst_swap` / `wrap_unwrap` / `missing_block_time` → `confirmed`) from genuine on-chain failure (`no_net_change` / `pure_receive` / `pure_send` → `failed`). No new intent status was introduced.
+- The sweep covers stranded `signed` intents too, not just `submitted` (a crash between `transitionToSigned` and `transitionFromSigned` otherwise reserved allowance permanently).
+- Dashboard trades are badged "Routed through us" / "Observed elsewhere" off `trade_intent_id`.
+
+**Accepted gap (documented in `.ai/decisions/live-intent-reservation-vs-quote-slot.md`):** a transaction landing *after* its intent was swept to `failed` cannot relink, so it renders as "Observed elsewhere" — a self-routed trade misreported as external. Allowance is unaffected (counted once, no double-spend). Widening `RECONCILABLE_INTENT_STATUSES` to include `failed` was rejected as riskier than the gap.
+
+**Open, deferred by the orchestrator:** `/trade`'s terminal-failure copy is a hedge ("either it never landed on chain, or it landed without completing the swap") because the poll response carries no `reason` field to distinguish the two cases.
+
 **Phase review:**
 
 - [ ] All Steps and Verification checkboxes ticked
-- [ ] Reviewer handoff prompt emitted
-- [ ] Code-reviewer agent has verified this phase
-- [ ] Review follow-ups reflected back into this plan file
-- [ ] Tests written and passing
-- [ ] Documentation updated
+- [x] Reviewer handoff prompt emitted
+- [x] Code-reviewer agent has verified this phase
+- [x] Review follow-ups reflected back into this plan file
+- [x] Tests written and passing
+- [x] Documentation updated
 - [ ] Orchestrator (user) has verified and approved this phase
-- [ ] Changes committed: `feat(web): link reconciled trades back to their originating trade intent`
+- [x] Changes committed: `feat(web): link reconciled trades back to their originating trade intent`
 - [ ] Phase marked complete
 
 ---
