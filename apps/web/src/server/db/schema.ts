@@ -535,20 +535,34 @@ export const TRADE_INTENT_STATUSES = [
 export type TradeIntentStatus = (typeof TRADE_INTENT_STATUSES)[number];
 
 /**
- * Statuses in which a `trade_intents` row is "live" — it reserves allowance against the
- * wallet's rolling limits and is the one row the partial unique index below allows per wallet.
- * `quoted` is included deliberately: nothing writes `approved` yet (it exists in the schema for
- * a later explicit-approval step — `.ai/decisions/swap-signing-and-submit.md`), so a `quoted`
- * intent *is* the wallet's live reservation between `quote-service.ts` writing it and either an
- * approval, a signature, or expiry. Excluding it here would make Phase 4's whole concurrency
- * guarantee protect nothing, since every intent sits in `quoted` for its entire unsigned life.
+ * Two distinct jobs a single "live" concept used to conflate, until a Phase 4 review found the
+ * conflation let a broadcast trade's allowance reservation get silently released before it was
+ * reconciled (a `submitted` intent's `expires_at` is only a ~60-90s blockhash-derived estimate,
+ * not a real deadline — Phase 5's reconciliation is what actually resolves it):
  *
- * Kept in sync **by hand** with the partial unique index's `.where()` predicate immediately
- * below — Postgres requires a partial-index predicate to be immutable, so this array cannot be
- * interpolated into it at migration-generation time. `server/swap/intent-lifecycle.ts`'s
- * `intent-lifecycle.test.ts` asserts the two stay identical.
+ * - `QUOTE_SLOT_STATUSES` — which statuses occupy the wallet's single live-intent slot: the
+ *   partial unique index's predicate below, and what `intent-lifecycle.ts`'s `expireAllLive`
+ *   (run on every new quote, and unconditionally on account switch) and `reapExpiredIntents`
+ *   operate over. `signed`/`submitted` are deliberately excluded — a new quote (or its reaper)
+ *   must never expire a trade that already left the building.
+ * - `RESERVING_TRADE_INTENT_STATUSES` — which statuses consume rolling allowance
+ *   (`intent-lifecycle.ts`'s `loadLiveIntentUsd`), so `signed`/`submitted` keep reserving until
+ *   reconciliation resolves them (their signature lands in `trades`), long after they have left
+ *   the quote slot. `quoted` is included even though decision 3's literal text names only
+ *   `approved`/`signed`/`submitted`: nothing writes `approved` yet (it exists in the schema for
+ *   a later explicit-approval step — `.ai/decisions/swap-signing-and-submit.md`), so a `quoted`
+ *   intent *is* the wallet's live reservation between `quote-service.ts` writing it and either a
+ *   signature or expiry. Excluding it here would make Phase 4's whole concurrency guarantee
+ *   protect nothing, since every intent sits in `quoted` for its entire unsigned life.
+ *
+ * `QUOTE_SLOT_STATUSES` is kept in sync **by hand** with the partial unique index's `.where()`
+ * predicate immediately below — Postgres requires a partial-index predicate to be immutable, so
+ * this array cannot be interpolated into it at migration-generation time.
+ * `server/swap/intent-lifecycle.test.ts` asserts the two stay identical.
  */
-export const LIVE_TRADE_INTENT_STATUSES = ['quoted', 'approved', 'signed', 'submitted'] as const satisfies readonly TradeIntentStatus[];
+export const QUOTE_SLOT_STATUSES = ['quoted', 'approved'] as const satisfies readonly TradeIntentStatus[];
+
+export const RESERVING_TRADE_INTENT_STATUSES = ['quoted', 'approved', 'signed', 'submitted'] as const satisfies readonly TradeIntentStatus[];
 
 /**
  * One pre-trade intent: a Jupiter quote, the rule-engine verdict computed against it before
@@ -607,15 +621,16 @@ export const tradeIntents = pgTable(
     // The live-intent lookup Phase 4's reservation and expiry reaping both run.
     index('trade_intents_wallet_id_status_idx').on(table.walletId, table.status),
     // Belt-and-braces DB-level backstop (`.ai/patterns/guarded-state-transition.md`): at most
-    // one live row per wallet, full stop — a `SELECT` then `INSERT` in application code cannot
-    // close the race between two concurrent quote requests on its own (see the plan's
-    // "Single-live-intent concurrency guarantee"). The predicate can reference only `status`
-    // (Postgres partial-index predicates must be immutable, so `expires_at > now()` cannot
-    // appear here) — keep this literal list in sync by hand with `LIVE_TRADE_INTENT_STATUSES`
-    // above.
+    // one row occupying the wallet's quote slot, full stop — a `SELECT` then `INSERT` in
+    // application code cannot close the race between two concurrent quote requests on its own
+    // (see the plan's "Single-live-intent concurrency guarantee"). The predicate can reference
+    // only `status` (Postgres partial-index predicates must be immutable, so `expires_at > now()`
+    // cannot appear here) — keep this literal list in sync by hand with `QUOTE_SLOT_STATUSES`
+    // above. Deliberately excludes `signed`/`submitted` so a new quote can still be inserted
+    // while a submitted trade for the same wallet awaits Phase 5 reconciliation.
     uniqueIndex('trade_intents_wallet_live_idx')
       .on(table.walletId)
-      .where(sql`status in ('quoted','approved','signed','submitted')`),
+      .where(sql`status in ('quoted','approved')`),
   ],
 );
 

@@ -1,4 +1,5 @@
 import type { Constitution } from '@degencage/rules';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { tradeIntents, trades } from '../db/schema';
@@ -109,6 +110,124 @@ function selectReturns(constitutionRows: unknown[]): void {
       return { where: () => ({ limit: async () => constitutionRows }) };
     },
   }));
+}
+
+const pgDialect = new PgDialect();
+
+function whereSql(node: unknown): { sql: string; params: unknown[] } {
+  return pgDialect.sqlToQuery(node as Parameters<PgDialect['sqlToQuery']>[0]);
+}
+
+interface FakeIntentRow {
+  id: string;
+  status: string;
+  usdValue: string | null;
+  createdAt: Date;
+  expiresAt: Date;
+  signature: string | null;
+  acquiredTier: string | null;
+}
+
+/**
+ * A tiny in-memory `trade_intents` fake for `wallet-1`, faithful enough to exercise
+ * `createQuote`'s real live-intent reservation and expiry lifecycle across two or more
+ * sequential calls — unlike `selectReturns` above, whose `tradeIntents`/`trades` rows are
+ * always empty. Backs the Phase 4 review's blocking-fix regression tests below.
+ *
+ * `findLiveQuoteSlotIntentId`'s `select({id})` (one projected column) and `loadLiveIntentUsd`'s
+ * `select({id, usdValue, createdAt, signature, acquiredTier})` (five) are the two different
+ * `tradeIntents` reads `createQuote` issues per call — distinguished here by projection key
+ * count, since both otherwise query the same table through the same mocked `selectMock`.
+ */
+function makeLiveIntentFixture(initialRows: FakeIntentRow[] = []): { rows: FakeIntentRow[] } {
+  const rows = [...initialRows];
+  let insertCounter = 0;
+
+  /** `reapExpiredIntents`: quote-slot rows only, guarded by the database clock. */
+  function reapQuoteSlotByClock(): { id: string }[] {
+    const now = Date.now();
+    const reaped = rows.filter((row) => (row.status === 'quoted' || row.status === 'approved') && row.expiresAt.getTime() <= now);
+    reaped.forEach((row) => {
+      row.status = 'expired';
+    });
+    return reaped.map((row) => ({ id: row.id }));
+  }
+
+  /** `expireAllLive` inside `expireAndReserveLiveIntent`: quote-slot rows, unconditional. */
+  function expireQuoteSlotUnconditionally(): { id: string }[] {
+    const expired = rows.filter((row) => row.status === 'quoted' || row.status === 'approved');
+    expired.forEach((row) => {
+      row.status = 'expired';
+    });
+    return expired.map((row) => ({ id: row.id }));
+  }
+
+  selectMock.mockImplementation((projection?: Record<string, unknown>) => ({
+    from: (table: unknown) => {
+      if (table === trades) {
+        return { where: () => Promise.resolve([]) };
+      }
+
+      if (table !== tradeIntents) {
+        return { where: () => ({ limit: async () => [constitutionRow('active')] }) };
+      }
+
+      const isQuoteSlotLookup = !!projection && Object.keys(projection).length === 1;
+
+      return {
+        where: (predicate: unknown) => {
+          if (isQuoteSlotLookup) {
+            return Promise.resolve(rows.filter((row) => row.status === 'quoted' || row.status === 'approved').map((row) => ({ id: row.id })));
+          }
+
+          // `loadLiveIntentUsd`'s query: [walletId, ...RESERVING_TRADE_INTENT_STATUSES,
+          // windowStart, asOf, excludeIntentId?] — the exclusion, when present, is always the
+          // last param (drizzle's `and()` drops the `undefined` condition entirely otherwise).
+          const { params } = whereSql(predicate);
+          const excludeId = params.length === 8 ? (params[7] as string) : undefined;
+
+          return Promise.resolve(
+            rows
+              .filter((row) => ['quoted', 'approved', 'signed', 'submitted'].includes(row.status))
+              .filter((row) => row.id !== excludeId)
+              .map((row) => ({ id: row.id, usdValue: row.usdValue, createdAt: row.createdAt, signature: row.signature, acquiredTier: row.acquiredTier })),
+          );
+        },
+      };
+    },
+  }));
+
+  updateMock.mockImplementation((table: unknown) => ({
+    set: () => ({
+      where: () => ({ returning: async () => (table === tradeIntents ? reapQuoteSlotByClock() : []) }),
+    }),
+  }));
+
+  transactionMock.mockImplementation(async (callback: (tx: unknown) => Promise<string>) =>
+    callback({
+      select: () => ({ from: () => ({ where: () => ({ for: () => ({ limit: async () => [{ id: 'wallet-1' }] }) }) }) }),
+      update: () => ({ set: () => ({ where: () => ({ returning: async () => expireQuoteSlotUnconditionally() }) }) }),
+      insert: () => ({
+        values: (values: Record<string, unknown>) => {
+          insertedValuesSpy(values);
+          insertCounter += 1;
+          const id = `intent-${insertCounter}`;
+          rows.push({
+            id,
+            status: values.status as string,
+            usdValue: (values.usdValue as string | null) ?? null,
+            createdAt: new Date(),
+            expiresAt: values.expiresAt as Date,
+            signature: null,
+            acquiredTier: (values.acquiredTier as string | null) ?? null,
+          });
+          return { returning: async () => [{ id }] };
+        },
+      }),
+    }),
+  );
+
+  return { rows };
 }
 
 function buildResponse(overrides: Partial<JupiterBuildResponse> = {}): JupiterBuildResponse {
@@ -440,5 +559,110 @@ describe('createQuote caching', () => {
     await createQuote({ ...params, walletId: 'wallet-2', walletAddress: 'SysvarRent111111111111111111111111111111111' });
 
     expect(buildSwapMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The Phase 4 review's two blocking findings, reproduced end to end through `createQuote` (not
+ * just at the `intent-lifecycle.ts` unit level, which `intent-lifecycle.test.ts` already
+ * covers) — plus the plan-mandated cases the prior version of this file never wrote:
+ * reservation from a genuinely prior live intent, expiry of the wallet's quote-slot occupant on
+ * a new quote, and reaping an abandoned quote before its usd_value is summed.
+ */
+describe('createQuote live-intent reservation (Phase 4 regression)', () => {
+  it('reflects reduced headroom from a submitted live intent, and that intent survives the quote and its reaper — the allowance double-spend fix', async () => {
+    const fixture = makeLiveIntentFixture([
+      {
+        id: 'intent-submitted-1',
+        status: 'submitted',
+        usdValue: '400',
+        createdAt: new Date(),
+        // Blockhash-derived expiry already in the past — a real broadcast trade sitting in
+        // `submitted` while Phase 5 reconciliation is still pending. Must not be reaped.
+        expiresAt: new Date(Date.now() - 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    const result = await createQuote(quoteParams({ amount: '150000000' }));
+
+    // $400 already reserved + this $150 request exceeds the $500 daily limit — the reduced
+    // headroom from the prior live intent is what the fold rule blocks on.
+    expect(result.verdict).toBe('block');
+    expect(insertedValuesSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'blocked' }));
+    // Never reaped (its `expires_at` is in the past, but `QUOTE_SLOT_STATUSES` excludes
+    // `submitted`) and never touched by the new quote's expire-prior-intent step either.
+    expect(fixture.rows.find((row) => row.id === 'intent-submitted-1')!.status).toBe('submitted');
+  });
+
+  it('expires the wallet’s prior quoted intent when a new quote is requested, and records trade.intent_expired — persistIntent’s expiry branch', async () => {
+    const fixture = makeLiveIntentFixture([
+      {
+        id: 'intent-quoted-1',
+        status: 'quoted',
+        usdValue: '50',
+        createdAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    const result = await createQuote(quoteParams({ amount: '100000000' }));
+
+    expect(result.verdict).toBe('allow');
+    expect(fixture.rows.find((row) => row.id === 'intent-quoted-1')!.status).toBe('expired');
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'trade.intent_expired',
+        payload: expect.objectContaining({ intentId: 'intent-quoted-1', reason: 'new_quote_requested' }),
+      }),
+      expect.anything(),
+    );
+    expect(fixture.rows.filter((row) => row.status === 'quoted')).toHaveLength(1);
+  });
+
+  it('reaps an abandoned, time-expired intent before its usd_value is summed against the new quote', async () => {
+    const fixture = makeLiveIntentFixture([
+      {
+        id: 'intent-old',
+        status: 'quoted',
+        usdValue: '450',
+        createdAt: new Date(Date.now() - 3_600_000),
+        expiresAt: new Date(Date.now() - 60_000),
+        signature: null,
+        acquiredTier: 'MICRO_CAP',
+      },
+    ]);
+
+    const result = await createQuote(quoteParams({ amount: '100000000' }));
+
+    // Summed unreaped, $450 + $100 would exceed the $500 limit and block. Reaped first, only
+    // this $100 request counts.
+    expect(result.verdict).toBe('allow');
+    expect(fixture.rows.find((row) => row.id === 'intent-old')!.status).toBe('expired');
+    expect(recordEventMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'trade.intent_expired',
+        payload: expect.objectContaining({ intentId: 'intent-old', reason: 'quote_ttl_expired' }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('does not block a re-quote near headroom against its own predecessor’s reservation — the self-count fix', async () => {
+    const fixture = makeLiveIntentFixture([]);
+
+    const first = await createQuote(quoteParams({ amount: '300000000' }));
+    const second = await createQuote(quoteParams({ amount: '300000000' }));
+
+    // Summed against itself, $300 + $300 would exceed the $500 limit. The first quote's own
+    // reservation must be excluded from the second's evaluation, since this very request is
+    // what replaces it.
+    expect(first.verdict).toBe('allow');
+    expect(second.verdict).toBe('allow');
+    expect(fixture.rows.filter((row) => row.status === 'expired')).toHaveLength(1);
+    expect(fixture.rows.filter((row) => row.status === 'quoted')).toHaveLength(1);
   });
 });

@@ -11,7 +11,7 @@ import { constitutions, tradeIntents, type TradeIntentStatus } from '../db/schem
 import { isFeatureEnabled } from '../flags/feature-flags';
 import { priceTrade } from '../pricing/price-trade';
 import { assembleSwapTransaction, type AssembledTransaction } from './assemble-transaction';
-import { expireAndReserveLiveIntent, loadEvaluableWindowedTrades, reapExpiredIntents } from './intent-lifecycle';
+import { expireAndReserveLiveIntent, findLiveQuoteSlotIntentId, loadEvaluableWindowedTrades, reapExpiredIntents } from './intent-lifecycle';
 import { buildSwap, BLOCKHASH_SLOTS_TO_EXPIRY, JupiterBuildError, type JupiterBuildResponse } from './jupiter-client';
 
 /**
@@ -285,9 +285,23 @@ async function evaluateQuote(params: QuoteRequestParams, constitution: Constitut
   ]);
 
   // Decision 3's allowance union: persisted `trades` plus any other live intent for this
-  // wallet (the prior quote a second concurrent request must see reserved). No exclusion id —
-  // this intent has not been inserted yet, so it cannot appear in its own history.
-  const windowedHistory = await loadEvaluableWindowedTrades(params.walletId, maxWindowHours(constitution), occurredAt);
+  // wallet (the prior quote a second concurrent request must see reserved). This intent has
+  // not been inserted yet, so it cannot appear in its own history — but the wallet's *current*
+  // quote-slot occupant, if any, is the row `persistIntent` is about to expire and replace as
+  // part of this very request, so it is excluded here too. Without this exclusion a debounced
+  // re-quote would be judged against the reservation it is itself destroying (Phase 4 review's
+  // blocking finding) — `signed`/`submitted` intents are never returned by
+  // `findLiveQuoteSlotIntentId`, so they are never excluded and keep reserving as they should.
+  const priorQuoteSlotId = await findLiveQuoteSlotIntentId(params.walletId);
+  const windowedHistory = await loadEvaluableWindowedTrades(
+    params.walletId,
+    maxWindowHours(constitution),
+    occurredAt,
+    params.correlationId,
+    params.userId,
+    getDb(),
+    priorQuoteSlotId ?? undefined,
+  );
 
   const decision = evaluateTrade(constitution, windowedHistory, {
     occurredAt,
@@ -433,7 +447,7 @@ export async function createQuote(params: QuoteRequestParams): Promise<QuoteResu
   // so a wallet whose only live intent silently timed out is never mistaken for one this quote
   // needs to expire, and so `evaluateQuote`'s live-intent sum below never counts a
   // wall-clock-expired row.
-  await reapExpiredIntents(params.walletId);
+  await reapExpiredIntents(params.walletId, params.correlationId, params.userId);
   // Read before `/build`, not after: this is the fallback for a response that carries no
   // `fetchedAt`, and a clock read once the call has already returned dates the blockhash
   // later than it was fetched — which would push `expires_at` past the real lifetime.

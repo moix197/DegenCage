@@ -419,7 +419,15 @@ describe('submitSignedSwap re-evaluation', () => {
     const result = await submitSignedSwap(submitParams());
 
     expect(result.status).toBe('submitted');
-    expect(loadEvaluableWindowedTradesMock).toHaveBeenCalledWith('wallet-1', expect.any(Number), expect.any(Date), expect.anything(), INTENT_ID);
+    expect(loadEvaluableWindowedTradesMock).toHaveBeenCalledWith(
+      'wallet-1',
+      expect.any(Number),
+      expect.any(Date),
+      'correlation-1',
+      'user-1',
+      expect.anything(),
+      INTENT_ID,
+    );
   });
 
   it('blocks when the constitution is no longer active', async () => {

@@ -300,7 +300,7 @@ function maxWindowHours(constitution: Constitution): number {
  * notional and self-block a signed, legitimate trade (the hazard the Phase 3 code review
  * flagged).
  */
-async function reevaluate(intent: TradeIntentRow, userId: string): Promise<void> {
+async function reevaluate(intent: TradeIntentRow, userId: string, correlationId: string): Promise<void> {
   const rows = await getDb().select().from(constitutions).where(eq(constitutions.userId, userId)).limit(1);
   const row = rows[0];
 
@@ -314,7 +314,7 @@ async function reevaluate(intent: TradeIntentRow, userId: string): Promise<void>
 
   const constitution = migrateConstitution(row.document);
   const occurredAt = new Date();
-  const windowedHistory = await loadEvaluableWindowedTrades(intent.walletId, maxWindowHours(constitution), occurredAt, getDb(), intent.id);
+  const windowedHistory = await loadEvaluableWindowedTrades(intent.walletId, maxWindowHours(constitution), occurredAt, correlationId, userId, getDb(), intent.id);
   const decision = evaluateTrade(constitution, windowedHistory, {
     occurredAt,
     usdValue: intent.usdValue,
@@ -338,7 +338,7 @@ async function failSignedIntent(params: SubmitRequestParams, reason: SubmitRejec
 
 async function verifyAndBroadcast(params: SubmitRequestParams, intent: TradeIntentRow): Promise<BroadcastResult> {
   try {
-    await reevaluate(intent, params.userId);
+    await reevaluate(intent, params.userId, params.correlationId);
   } catch (error) {
     return failSignedIntent(params, error instanceof SubmitRejectedError ? error.reason : 'rules_now_block', 'reevaluation', error);
   }

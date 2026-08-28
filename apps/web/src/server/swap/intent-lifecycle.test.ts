@@ -1,11 +1,16 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { getTableConfig, PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { LIVE_TRADE_INTENT_STATUSES, tradeIntents, trades } from '../db/schema';
+import { QUOTE_SLOT_STATUSES, RESERVING_TRADE_INTENT_STATUSES, tradeIntents, trades } from '../db/schema';
 import type { Database } from '../db/client';
 import {
   expireAllLiveIntentsForWallet,
   expireAndReserveLiveIntent,
+  findLiveQuoteSlotIntentId,
   loadEvaluableWindowedTrades,
   loadLiveIntentUsd,
   reapExpiredIntents,
@@ -26,11 +31,16 @@ import {
  *   the guarantee, not a real Postgres exercising it.
  */
 
-const { loadWindowedTradesMock } = vi.hoisted(() => ({ loadWindowedTradesMock: vi.fn() }));
+const { loadWindowedTradesMock, recordEventMock } = vi.hoisted(() => ({ loadWindowedTradesMock: vi.fn(), recordEventMock: vi.fn() }));
 
 vi.mock('../rules/rolling-allowance', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../rules/rolling-allowance')>();
   return { ...actual, loadWindowedTrades: loadWindowedTradesMock };
+});
+
+vi.mock('../../observability/events', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../observability/events')>();
+  return { ...actual, recordEvent: recordEventMock };
 });
 
 const pgDialect = new PgDialect();
@@ -39,13 +49,56 @@ function whereSql(node: unknown): { sql: string; params: unknown[] } {
   return pgDialect.sqlToQuery(node as Parameters<PgDialect['sqlToQuery']>[0]);
 }
 
+/** Every single-quoted literal in a SQL fragment, in order — how the tests read `status in (...)` back out. */
+function quotedLiterals(sql: string): string[] {
+  return [...sql.matchAll(/'([^']+)'/g)].map((match) => match[1]!);
+}
+
+const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '../db/migrations');
+
+/**
+ * Replays every migration file in order and returns the final `trade_intents_wallet_live_idx`
+ * predicate they leave in place — a `DROP INDEX` clears it, a `CREATE UNIQUE INDEX` sets it, so
+ * whichever migration touched the index most recently wins. This is what makes the assertion
+ * below a real check on the migrations directory (nit: the prior version of this test never
+ * read a migration file at all) rather than a check on `schema.ts` alone, which could drift
+ * from what has actually shipped.
+ */
+function liveIndexPredicateFromMigrations(): string {
+  const files = readdirSync(MIGRATIONS_DIR)
+    .filter((file) => file.endsWith('.sql'))
+    .sort();
+
+  let predicate: string | null = null;
+
+  for (const file of files) {
+    const content = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
+
+    if (content.includes('DROP INDEX "trade_intents_wallet_live_idx"')) {
+      predicate = null;
+    }
+
+    const created = content.match(/CREATE UNIQUE INDEX "trade_intents_wallet_live_idx"[^;]*WHERE ([^;]+);/);
+    if (created) {
+      predicate = created[1]!.trim();
+    }
+  }
+
+  if (predicate === null) {
+    throw new Error('no migration in ' + MIGRATIONS_DIR + ' leaves trade_intents_wallet_live_idx in place');
+  }
+
+  return predicate;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   loadWindowedTradesMock.mockResolvedValue([]);
+  recordEventMock.mockResolvedValue(undefined);
 });
 
 describe('trade_intents_wallet_live_idx (schema)', () => {
-  it('is a unique index on wallet_id, predicated on exactly LIVE_TRADE_INTENT_STATUSES', () => {
+  it('is a unique index on wallet_id, predicated on exactly QUOTE_SLOT_STATUSES — not signed/submitted', () => {
     const config = getTableConfig(tradeIntents);
     const liveIndex = config.indexes.find((index) => index.config.name === 'trade_intents_wallet_live_idx');
 
@@ -55,14 +108,19 @@ describe('trade_intents_wallet_live_idx (schema)', () => {
 
     const { sql } = whereSql(liveIndex!.config.where);
 
-    // The predicate is asserted against the literal statuses, not against
-    // `LIVE_TRADE_INTENT_STATUSES` echoed back — Postgres partial-index predicates must be
-    // immutable, so the two can only ever be kept in sync by hand (see the doc comment on
-    // `LIVE_TRADE_INTENT_STATUSES`). This test is the tripwire for that drifting.
-    for (const status of LIVE_TRADE_INTENT_STATUSES) {
-      expect(sql).toContain(`'${status}'`);
-    }
-    expect(LIVE_TRADE_INTENT_STATUSES).toEqual(['quoted', 'approved', 'signed', 'submitted']);
+    // Exact match, not `toContain` per status: an extra status left in the predicate (e.g. a
+    // stale `signed`/`submitted`) must fail this test even though every `QUOTE_SLOT_STATUSES`
+    // entry is still present — the bug the prior version of this test could not catch.
+    expect(quotedLiterals(sql)).toEqual([...QUOTE_SLOT_STATUSES]);
+    expect(QUOTE_SLOT_STATUSES).toEqual(['quoted', 'approved']);
+  });
+
+  it('matches what the migrations directory actually ships, not just what schema.ts declares', () => {
+    const config = getTableConfig(tradeIntents);
+    const liveIndex = config.indexes.find((index) => index.config.name === 'trade_intents_wallet_live_idx');
+    const { sql } = whereSql(liveIndex!.config.where);
+
+    expect(quotedLiterals(liveIndexPredicateFromMigrations())).toEqual(quotedLiterals(sql));
   });
 });
 
@@ -100,10 +158,10 @@ function makeExecutor(options: { tradeIntentsRows?: unknown[]; tradesRows?: unkn
 }
 
 describe('reapExpiredIntents', () => {
-  it('guards on wallet, live status and expiry against the database clock — never a DELETE', async () => {
+  it('guards on wallet, quote-slot status and expiry against the database clock — never a DELETE', async () => {
     const executor = makeExecutor({ updateReturns: [{ id: 'expired-1' }] });
 
-    const reaped = await reapExpiredIntents('wallet-1', executor as never);
+    const reaped = await reapExpiredIntents('wallet-1', 'correlation-1', 'user-1', executor as never);
 
     expect(reaped).toEqual(['expired-1']);
     expect(executor.updateCalls).toHaveLength(1);
@@ -116,15 +174,42 @@ describe('reapExpiredIntents', () => {
     expect(sql).toContain('"expires_at" <=');
     expect(sql).toContain('now()');
     expect(params).toContain('wallet-1');
-    for (const status of LIVE_TRADE_INTENT_STATUSES) {
-      expect(params).toContain(status);
-    }
+    // Exactly QUOTE_SLOT_STATUSES, not RESERVING_TRADE_INTENT_STATUSES — a `signed`/`submitted`
+    // intent must never be reaped just because its blockhash-derived `expires_at` looks stale;
+    // only Phase 5 reconciliation resolves those (the blocking bug this guards against).
+    expect(params.filter((param) => typeof param === 'string' && param !== 'wallet-1')).toEqual([...QUOTE_SLOT_STATUSES]);
+    expect(params).not.toContain('signed');
+    expect(params).not.toContain('submitted');
   });
 
-  it('is a no-op when nothing qualifies — an already-terminal or not-yet-expired row is left alone', async () => {
+  it('records a trade.intent_expired event for every reaped intent', async () => {
+    const executor = makeExecutor({ updateReturns: [{ id: 'expired-1' }, { id: 'expired-2' }] });
+
+    await reapExpiredIntents('wallet-1', 'correlation-1', 'user-1', executor as never);
+
+    expect(recordEventMock).toHaveBeenCalledTimes(2);
+    expect(recordEventMock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        eventType: 'trade.intent_expired',
+        correlationId: 'correlation-1',
+        userId: 'user-1',
+        payload: expect.objectContaining({ intentId: 'expired-1', walletId: 'wallet-1' }),
+      }),
+      executor,
+    );
+    expect(recordEventMock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ payload: expect.objectContaining({ intentId: 'expired-2', walletId: 'wallet-1' }) }),
+      executor,
+    );
+  });
+
+  it('is a no-op when nothing qualifies — an already-terminal or not-yet-expired row is left alone, and records no event', async () => {
     const executor = makeExecutor({ updateReturns: [] });
 
-    await expect(reapExpiredIntents('wallet-1', executor as never)).resolves.toEqual([]);
+    await expect(reapExpiredIntents('wallet-1', 'correlation-1', 'user-1', executor as never)).resolves.toEqual([]);
+    expect(recordEventMock).not.toHaveBeenCalled();
   });
 });
 
@@ -334,7 +419,7 @@ describe('loadLiveIntentUsd', () => {
       }),
     };
 
-    await loadLiveIntentUsd('wallet-1', 24, new Date(), executor as never);
+    await loadLiveIntentUsd('wallet-1', 24, new Date(), 'correlation-1', 'user-1', executor as never);
 
     expect(order).toEqual(['reap', 'read']);
   });
@@ -350,10 +435,33 @@ describe('loadLiveIntentUsd', () => {
       tradesRows: [{ signature: 'sig-reconciled' }],
     });
 
-    const result = await loadLiveIntentUsd('wallet-1', 24, now, executor as never);
+    const result = await loadLiveIntentUsd('wallet-1', 24, now, 'correlation-1', 'user-1', executor as never);
 
     expect(result.entries.map((entry) => entry.usdValue)).toEqual(['100', '25']);
     expect(result.totalUsd).toBe('125');
+  });
+
+  it('queries RESERVING_TRADE_INTENT_STATUSES — signed and submitted intents reserve too, not just quoted/approved', async () => {
+    const executor = makeExecutor();
+
+    await loadLiveIntentUsd('wallet-1', 24, new Date(), 'correlation-1', 'user-1', executor as never);
+
+    const tradeIntentsSelect = executor.selectWhereCalls.find((call) => call.table === tradeIntents);
+    const { params } = whereSql(tradeIntentsSelect!.where);
+    for (const status of RESERVING_TRADE_INTENT_STATUSES) {
+      expect(params).toContain(status);
+    }
+  });
+
+  it('carries isAcquisition and acquiredTier through onto every entry — tier limits must see live reservations', async () => {
+    const now = new Date();
+    const executor = makeExecutor({
+      tradeIntentsRows: [{ id: 'live-a', usdValue: '100', createdAt: now, signature: null, acquiredTier: 'MICRO_CAP' }],
+    });
+
+    const result = await loadLiveIntentUsd('wallet-1', 24, now, 'correlation-1', 'user-1', executor as never);
+
+    expect(result.entries).toEqual([{ occurredAt: now, usdValue: '100', isAcquisition: true, acquiredTier: 'MICRO_CAP' }]);
   });
 
   it('fails closed: totalUsd is null the moment any counted entry is unpriced', async () => {
@@ -365,7 +473,7 @@ describe('loadLiveIntentUsd', () => {
       ],
     });
 
-    const result = await loadLiveIntentUsd('wallet-1', 24, now, executor as never);
+    const result = await loadLiveIntentUsd('wallet-1', 24, now, 'correlation-1', 'user-1', executor as never);
 
     expect(result.totalUsd).toBeNull();
   });
@@ -379,7 +487,7 @@ describe('loadLiveIntentUsd', () => {
       tradeIntentsRows: [{ id: 'other-live', usdValue: '25', createdAt: now, signature: null }],
     });
 
-    const result = await loadLiveIntentUsd('wallet-1', 24, now, executor as never, 'self');
+    const result = await loadLiveIntentUsd('wallet-1', 24, now, 'correlation-1', 'user-1', executor as never, 'self');
 
     expect(result.totalUsd).toBe('25');
     const tradeIntentsSelect = executor.selectWhereCalls.find((call) => call.table === tradeIntents);
@@ -395,11 +503,32 @@ describe('loadEvaluableWindowedTrades', () => {
     loadWindowedTradesMock.mockResolvedValue([{ occurredAt: now, usdValue: '10' }]);
     const executor = makeExecutor({ tradeIntentsRows: [{ id: 'live-a', usdValue: '5', createdAt: now, signature: null }] });
 
-    const result = await loadEvaluableWindowedTrades('wallet-1', 24, now, executor as never);
+    const result = await loadEvaluableWindowedTrades('wallet-1', 24, now, 'correlation-1', 'user-1', executor as never);
 
     expect(result).toEqual([
       { occurredAt: now, usdValue: '10' },
-      { occurredAt: now, usdValue: '5' },
+      { occurredAt: now, usdValue: '5', isAcquisition: true, acquiredTier: undefined },
     ]);
+  });
+});
+
+describe('findLiveQuoteSlotIntentId', () => {
+  it('returns the id of the wallet\'s current quote-slot occupant', async () => {
+    const executor = makeExecutor({ tradeIntentsRows: [{ id: 'quoted-1' }] });
+
+    const id = await findLiveQuoteSlotIntentId('wallet-1', executor as never);
+
+    expect(id).toBe('quoted-1');
+    const tradeIntentsSelect = executor.selectWhereCalls.find((call) => call.table === tradeIntents);
+    const { params } = whereSql(tradeIntentsSelect!.where);
+    expect(params).toEqual(expect.arrayContaining(['wallet-1', ...QUOTE_SLOT_STATUSES]));
+    expect(params).not.toContain('signed');
+    expect(params).not.toContain('submitted');
+  });
+
+  it('returns null when the wallet has no live quote-slot intent', async () => {
+    const executor = makeExecutor({ tradeIntentsRows: [] });
+
+    await expect(findLiveQuoteSlotIntentId('wallet-1', executor as never)).resolves.toBeNull();
   });
 });
